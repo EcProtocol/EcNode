@@ -12,84 +12,6 @@ use crate::ec_interface::{
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use crate::ec_interface::{EcBlocks, EcTokens, BlockTime};
-    use std::collections::HashMap;
-
-    struct MockEcBlocks {
-        blocks: HashMap<BlockId, Block>,
-    }
-
-    impl EcBlocks for MockEcBlocks {
-        fn lookup(&self, block: &BlockId) -> Option<Block> {
-            self.blocks.get(block).cloned()
-        }
-
-        fn save(&mut self, block: &Block) {
-            self.blocks.insert(block.id, *block);
-        }
-
-        fn remove(&mut self, _block: &BlockId) {
-            // Not needed for this test
-        }
-    }
-
-    struct MockEcTokens {
-        tokens: HashMap<TokenId, BlockTime>,
-    }
-
-    impl EcTokens for MockEcTokens {
-        fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
-            self.tokens.get(token)
-        }
-
-        fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-            self.tokens.insert(*token, BlockTime { block: *block, time });
-        }
-
-        fn tokens_signature(&self, _token: &TokenId, _key: &PeerId) -> Option<Message> {
-            // Not needed for this test
-            None
-        }
-    }
-
-    #[test]
-    fn test_query() {
-        let block_id = 1;
-        let block = Block {
-            id: block_id,
-            time: 0,
-            used: 0,
-            parts: [Default::default(); TOKENS_PER_BLOCK],
-            signatures: [None; TOKENS_PER_BLOCK],
-        };
-
-        let blocks = Rc::new(RefCell::new(MockEcBlocks {
-            blocks: HashMap::new(),
-        }));
-
-        let tokens = Rc::new(RefCell::new(MockEcTokens {
-            tokens: HashMap::new(),
-        }));
-
-        let mut mem_pool = EcMemPool::new(tokens.clone(), blocks.clone());
-
-        // Test that querying a non-existent block returns None
-        assert!(mem_pool.query(&block_id).is_none());
-
-        // Save the block and test that it can be queried
-        blocks.borrow_mut().save(&block);
-        assert_eq!(mem_pool.query(&block_id), Some(block));
-
-        // Test that querying a block in the mempool also works
-        mem_pool.block(&block, 0);
-        assert_eq!(mem_pool.query(&block_id), Some(block));
-    }
-}
 #[derive(PartialEq)]
 pub enum BlockState {
     Pending,
@@ -249,7 +171,7 @@ impl EcMemPool {
             .and_then(|b| b.block)
             .or_else(|| self.blocks.borrow().lookup(block));
     }
-    
+
     pub(crate) fn validate_with(&mut self, parent: &Block, block_id: &BlockId) {
         if let Some(state) = self.pool.get_mut(block_id) {
             if let (Some(block), Pending) = (state.block, state.state) {
@@ -404,5 +326,90 @@ impl EcMemPool {
         }
 
         return requests;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, TokenId};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    struct MockEcBlocks {
+        blocks: HashMap<BlockId, Block>,
+    }
+
+    impl EcBlocks for MockEcBlocks {
+        fn lookup(&self, block: &BlockId) -> Option<Block> {
+            self.blocks.get(block).cloned()
+        }
+
+        fn save(&mut self, block: &Block) {
+            self.blocks.insert(block.id, *block);
+        }
+
+        fn remove(&mut self, _block: &BlockId) {
+            // Not needed for this test
+        }
+    }
+
+    struct MockEcTokens {
+        tokens: HashMap<TokenId, BlockTime>,
+    }
+
+    impl EcTokens for MockEcTokens {
+        fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
+            self.tokens.get(token)
+        }
+
+        fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+            self.tokens.insert(
+                *token,
+                BlockTime {
+                    block: *block,
+                    time,
+                },
+            );
+        }
+
+        fn tokens_signature(&self, _token: &TokenId, _key: &PeerId) -> Option<Message> {
+            // Not needed for this test
+            None
+        }
+    }
+
+    #[test]
+    fn test_query() {
+        let block_id = 1;
+        let block = Block {
+            id: block_id,
+            time: 0,
+            used: 0,
+            parts: [Default::default(); TOKENS_PER_BLOCK],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+
+        let blocks = Rc::new(RefCell::new(MockEcBlocks {
+            blocks: HashMap::new(),
+        }));
+
+        let tokens = Rc::new(RefCell::new(MockEcTokens {
+            tokens: HashMap::new(),
+        }));
+
+        let mut mem_pool = EcMemPool::new(tokens.clone(), blocks.clone());
+
+        // Test that querying a non-existent block returns None
+        assert!(mem_pool.query(&block_id).is_none());
+
+        // Save the block and test that it can be queried
+        blocks.borrow_mut().save(&block);
+        assert_eq!(mem_pool.query(&block_id), Some(block));
+
+        // Test that querying a block in the mempool also works
+        mem_pool.block(&block, 0);
+        assert_eq!(mem_pool.query(&block_id), Some(block));
     }
 }
