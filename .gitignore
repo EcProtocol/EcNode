@@ -1,0 +1,5 @@
+/target
+.aider*
+.idea/
+*.iml
+.vscode/

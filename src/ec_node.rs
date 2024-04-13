@@ -1,0 +1,177 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::ec_interface::{
+    Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, PeerId,
+};
+use crate::ec_mempool::{BlockState, EcMemPool};
+use crate::ec_peers::EcPeers;
+
+pub struct EcNode {
+    tokens: Rc<RefCell<dyn EcTokens>>,
+    blocks: Rc<RefCell<dyn EcBlocks>>,
+    peers: EcPeers,
+    mem_pool: EcMemPool,
+    peer_id: PeerId,
+    time: EcTime,
+}
+
+impl EcNode {
+    pub fn new(
+        tokens: Rc<RefCell<dyn EcTokens>>,
+        blocks: Rc<RefCell<dyn EcBlocks>>,
+        id: PeerId,
+        time: EcTime,
+    ) -> Self {
+        Self {
+            tokens: tokens.clone(),
+            blocks: blocks.clone(),
+            peers: EcPeers::new(id),
+            mem_pool: EcMemPool::new(tokens.clone(), blocks.clone()),
+            peer_id: id,
+            time,
+        }
+    }
+
+    pub fn get_peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    pub fn seed_peer(&mut self, peer: &PeerId) {
+        self.peers.update_peer(peer, self.time);
+    }
+
+    pub fn block(&mut self, block: &Block) {
+        self.mem_pool.block(block, self.time);
+    }
+
+    pub fn committed_block(&self, block_id: &BlockId) -> Option<Block> {
+        self.blocks.borrow().lookup(block_id)
+    }
+
+    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
+        self.time += 1;
+        for submit in self.mem_pool.tick(&self.peers, self.time) {
+            // TODO pack messages
+            let target = self.peers.for_index(submit.0).unwrap();
+            responses.push(MessageEnvelope {
+                sender: self.peer_id,
+                receiver: target,
+                ticket: 0,
+                time: self.time,
+                message: Message::Vote {
+                    block: submit.1,
+                    vote: submit.2,
+                    reply: true,
+                },
+            })
+        }
+    }
+
+    /*
+    Vote cases:
+
+        Block in mem-pool (or previously committed)
+            IF block is blocked -> reply negative vote
+            ELSE IF block is committed -> reply positive vote
+            ELSE IF trusted peer -> vote
+
+        Block not in mem-pool
+            IF trusted peer - start voting AND request block
+            ELSE IF subscribed peer -> request block
+    */
+    pub fn handle_message(&mut self, msg: &MessageEnvelope, responses: &mut Vec<MessageEnvelope>) {
+        match &msg.message {
+            Message::Vote { block, vote, reply } => {
+                match (
+                    self.mem_pool.status(block),
+                    self.peers.trusted_peer(&msg.sender),
+                ) {
+                    (Some(BlockState::Pending), Some(_)) => {
+                        self.mem_pool.vote(block, *vote, &msg.sender, msg.time);
+                    }
+                    (Some(BlockState::Commit), _) => {
+                        if *reply {
+                            responses.push(self.reply_direct(&msg.sender, block, false));
+                        }
+                    }
+                    (Some(BlockState::Blocked), _) => {
+                        if *reply {
+                            responses.push(self.reply_direct(&msg.sender, block, true));
+                        }
+                    }
+                    (None, Some(_)) => {
+                        // TODO DOS-protection
+                        self.mem_pool.vote(block, *vote, &msg.sender, msg.time);
+                        responses.push(self.request_block(&msg.sender, block))
+                    }
+                    (None, None) => {
+                        // TODO test ticket is from subscribed client + DOS protection
+                        if msg.ticket > 0 {
+                            responses.push(self.request_block(&msg.sender, block))
+                        }
+                    }
+                    _ => {} // discard - do nothing
+                }
+            }
+            Message::Query {
+                token,
+                target,
+                ticket,
+            } => {
+                // TODO also for me ? And forwarding
+                if let Some(me) = self.mem_pool.query(token).map(|block| MessageEnvelope {
+                    sender: self.peer_id,
+                    receiver: if *target == 0 { msg.sender } else { *target },
+                    ticket: *ticket,
+                    time: self.time,
+                    message: Message::Block { block },
+                }) {
+                    responses.push(me)
+                } else {
+                    // TODO P(forwarding)
+                    // self.peers.peers_for(token, 1)
+                }
+            }
+            Message::Answer { .. } => {}
+            Message::Block { block } => {
+                // TODO a ticket pointing to a request done by this node
+                if msg.ticket == 2 {
+                    // TODO DOS-protection
+                    self.mem_pool.block(block, self.time)
+                } else {
+                    // else other req for blocks - or discard
+                    self.mem_pool.validate_with(block, &msg.ticket)
+                }
+            }
+        }
+    }
+
+    fn reply_direct(&mut self, sender: &PeerId, block: &BlockId, blocked: bool) -> MessageEnvelope {
+        MessageEnvelope {
+            sender: self.peer_id,
+            receiver: *sender,
+            ticket: 0,
+            time: self.time,
+            message: Message::Vote {
+                block: *block,
+                vote: if blocked { 0 } else { 0xFF },
+                reply: false,
+            },
+        }
+    }
+
+    fn request_block(&mut self, sender: &PeerId, block: &BlockId) -> MessageEnvelope {
+        MessageEnvelope {
+            sender: self.peer_id,
+            receiver: *sender,
+            ticket: 2, // TODO calc ticket
+            time: self.time,
+            message: Message::Query {
+                token: *block,
+                target: 0,
+                ticket: 2,
+            },
+        }
+    }
+}
