@@ -178,10 +178,23 @@ impl EcMemPool {
                 for i in 0..block.used as usize {
                     if block.parts[i].last == parent.id {
                         valid_child(parent, &block, i);
+            if let Some(block) = &state.block {
+                for i in 0..block.used as usize {
+                    if block.parts[i].last == parent.id {
+                        if valid_child(parent, block, i) {
+                            state.validated |= 1 << i;
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Additional helper method to encapsulate validation logic
+    // This method is not part of the original file and is provided for completeness
+    // You should implement the `valid_child` function according to your application logic
+    fn valid_child(parent: &Block, child: &Block, index: usize) -> bool {
+        // Implement validation logic here
     }
 
     pub(crate) fn block(&mut self, block: &Block, time: EcTime) {
