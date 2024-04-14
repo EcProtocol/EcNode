@@ -17,14 +17,14 @@ pub const TOKENS_SIGNATURE_SIZE: usize = 8;
 pub const SOME_STEPS_INTO_THE_FUTURE: EcTime = 100;
 
 // TODO bad name
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Debug, Default)]
 pub struct TokenBlock {
     pub token: TokenId,
     pub last: BlockId,
     pub key: PublicKeyReference,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Block {
     pub id: BlockId,
     pub time: EcTime,

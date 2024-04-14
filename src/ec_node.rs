@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, PeerId,
+    Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, MessageTicket, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
 use crate::ec_peers::EcPeers;
@@ -14,6 +14,7 @@ pub struct EcNode {
     mem_pool: EcMemPool,
     peer_id: PeerId,
     time: EcTime,
+    block_req_ticket: MessageTicket,
 }
 
 impl EcNode {
@@ -30,6 +31,7 @@ impl EcNode {
             mem_pool: EcMemPool::new(tokens.clone(), blocks.clone()),
             peer_id: id,
             time,
+            block_req_ticket: 2, // TODO shuffle
         }
     }
 
@@ -97,6 +99,7 @@ impl EcNode {
                     }
                     (Some(BlockState::Blocked), _) => {
                         if *reply {
+                            // TODO send linked blockers with this one
                             responses.push(self.reply_direct(&msg.sender, block, true));
                         }
                     }
@@ -135,8 +138,7 @@ impl EcNode {
             }
             Message::Answer { .. } => {}
             Message::Block { block } => {
-                // TODO a ticket pointing to a request done by this node
-                if msg.ticket == 2 {
+                if msg.ticket == self.block_req_ticket ^ block.id {
                     // TODO DOS-protection
                     self.mem_pool.block(block, self.time)
                 } else {
@@ -165,12 +167,12 @@ impl EcNode {
         MessageEnvelope {
             sender: self.peer_id,
             receiver: *sender,
-            ticket: 2, // TODO calc ticket
+            ticket: 0,
             time: self.time,
             message: Message::Query {
                 token: *block,
                 target: 0,
-                ticket: 2,
+                ticket: self.block_req_ticket ^ block, // TODO calc ticket with SHA
             },
         }
     }

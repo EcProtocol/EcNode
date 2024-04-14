@@ -6,7 +6,7 @@ use std::rc::Rc;
 use hashbrown::HashMap;
 
 use crate::ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, PeerId, PublicKeyReference, Signature,
+    Block, BlockId, EcBlocks, EcTime, EcTokens, PeerId, PublicKeyReference, Signature, TokenId,
     SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK,
 };
 use crate::ec_mempool::BlockState::Pending;
@@ -17,6 +17,12 @@ pub enum BlockState {
     Pending,
     Commit,
     Blocked,
+}
+
+pub trait MessageSink {
+    fn vote(&mut self, block_id: &BlockId, token_id: &TokenId, vote: u8, extends: bool);
+    fn block(&mut self, block_id: &BlockId);
+    fn parent(&mut self, block_id: &BlockId, parent_id: &BlockId);
 }
 
 struct PoolVote {
@@ -31,9 +37,9 @@ struct PoolBlockState {
     time: EcTime,
     updated: bool,
     // for each bit: was the token ref validated
-    validated: u8,
+    validate: u8,
     // for each bit: is the back ref matching
-    matching: u8,
+    vote: u8,
     // for each bit: are we done collecting votes?
     remaining: u8,
 }
@@ -46,8 +52,8 @@ impl PoolBlockState {
             block: None,
             time,
             updated: false,
-            validated: 0,
-            matching: 0,
+            validate: 0xFF,
+            vote: 0,
             remaining: 0,
         }
     }
@@ -78,12 +84,12 @@ impl PoolBlockState {
         if self.block.is_none() {
             let (valid, matching, validated) = validate();
 
-            // if not - a "better" block could show up (correct signature etc)
+            // TODO if not - a "better" block could show up (correct signature etc) ?
             if valid {
                 self.updated = true;
                 self.block = Some(*block);
-                self.matching = matching;
-                self.validated = validated;
+                self.vote = matching;
+                self.validate = validated;
             } else {
                 // TODO check
                 self.state = BlockState::Blocked
@@ -104,7 +110,7 @@ fn validate_signature(key: &PublicKeyReference, signature: &Signature) -> bool {
     key == signature
 }
 
-fn valid_child(parent: &Block, block: &Block, i: usize) -> bool {
+fn validate_with_parent(parent: &Block, block: &Block, i: usize) -> bool {
     let mut valid = true;
     if parent.time >= block.time {
         // block MUST come after parents
@@ -175,26 +181,17 @@ impl EcMemPool {
     pub(crate) fn validate_with(&mut self, parent: &Block, block_id: &BlockId) {
         if let Some(state) = self.pool.get_mut(block_id) {
             if let (Some(block), Pending) = (state.block, state.state) {
+                // TODO check that block-id is SHA of parent ("true parent")
                 for i in 0..block.used as usize {
                     if block.parts[i].last == parent.id {
-                        valid_child(parent, &block, i);
-            if let Some(block) = &state.block {
-                for i in 0..block.used as usize {
-                    if block.parts[i].last == parent.id {
-                        if valid_child(parent, block, i) {
-                            state.validated |= 1 << i;
+                        if validate_with_parent(parent, &block, i) {
+                            state.validate ^= 1 << i;
                         }
+                        break;
                     }
                 }
             }
         }
-    }
-
-    // Additional helper method to encapsulate validation logic
-    // This method is not part of the original file and is provided for completeness
-    // You should implement the `valid_child` function according to your application logic
-    fn valid_child(parent: &Block, child: &Block, index: usize) -> bool {
-        // Implement validation logic here
     }
 
     pub(crate) fn block(&mut self, block: &Block, time: EcTime) {
@@ -202,29 +199,30 @@ impl EcMemPool {
             .entry(block.id)
             .or_insert_with(|| PoolBlockState::new(time))
             .put_block(block, || {
-                let mut vote: u8 = 0;
-                let mut validated: u8 = 0;
-
                 // out-of-bounds or too-far-into-the-future
                 if block.used as usize >= TOKENS_PER_BLOCK
                     || block.time > time + SOME_STEPS_INTO_THE_FUTURE
                 {
-                    return (false, 0, 0);
+                    return (false, 0, 1);
                 }
 
                 // TODO same token only once
+                // TODO same parent/last only once
 
                 // TODO verify that block-id is the SHA of block content (INCL (?) /not(?) signatures)
 
+                let mut validated: u8 = 0;
+                let mut vote: u8 = 0;
                 let tokens = self.tokens.borrow();
                 for i in 0..block.used as usize {
                     if let Some(parent) = self.query(&block.parts[i].last) {
-                        if valid_child(&parent, block, i) {
-                            validated |= 1 << i;
-                        } else {
+                        if !validate_with_parent(&parent, block, i) {
                             // break now - this block is invalid
-                            return (false, 0, 0);
+                            return (false, 0, 1);
                         }
+                    } else {
+                        // still missing validation
+                        validated |= 1 << i;
                     }
 
                     if tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block)
@@ -238,13 +236,7 @@ impl EcMemPool {
             });
     }
 
-    pub(crate) fn tick(
-        &mut self,
-        peers: &EcPeers,
-        time: EcTime,
-    ) -> Vec<(usize, BlockId, [bool; TOKENS_PER_BLOCK])> {
-        let mut requests = Vec::new();
-
+    pub(crate) fn tick(&mut self, peers: &EcPeers, time: EcTime, messages: &dyn MessageSink) {
         // TODO clean out expired elements - how old?
         self.pool.retain(|_, s| time - s.time < 20);
 
@@ -300,52 +292,55 @@ impl EcMemPool {
                         }
                     }
 
-                    // if no remaining votes - commit
-                    if block_state.remaining == 0 {
-                        // TODO should it be kept in mempool for a while - can it be rolled back ever?
-
-                        // commit / update
-                        for i in 0..block.used as usize {
-                            // TODO announce for next iteration to update vote
-                            tokens.set(&block.parts[i].token, &block.id, block.time);
-                        }
-
-                        // save block in permanent store
-                        self.blocks.borrow_mut().save(&block);
-
-                        block_state.state = BlockState::Commit
-                    }
-
-                    block_state.updated = false
+                    block_state.updated = false;
                 }
 
-                if block_state.state == Pending {
-                    for i in 0..block.used as usize {
-                        if (block_state.validated & 1 << i) == 0 {
-                            // fetch
-                            block.parts[i].last;
-                        }
+                // if no remaining votes AND all is validated - commit
+                if block_state.remaining == 0 && block_state.validate == 0 {
+                    // TODO should it be kept in mempool for a while - can it be rolled back ever?
 
-                        if (block_state.remaining & 1 << i) != 0 {
-                            // request vote
-                            block.parts[i].token;
-                        }
+                    // commit / update
+                    for i in 0..block.used as usize {
+                        // TODO announce for next iteration to update vote
+                        tokens.set(&block.parts[i].token, &block.id, block.time);
+                    }
+
+                    // save block in permanent store
+                    self.blocks.borrow_mut().save(&block);
+
+                    block_state.state = BlockState::Commit;
+
+                    continue;
+                }
+
+                for i in 0..block.used as usize {
+                    if (block_state.validate & 1 << i) != 0 {
+                        // fetch a parent
+                        messages.parent(block_id, &block.parts[i].last);
+                    }
+
+                    if (block_state.remaining & 1 << i) != 0 {
+                        // request vote
+                        messages.vote(
+                            block_id,
+                            &block.parts[i].token,
+                            block_state.vote,
+                            block_state.vote & 1 << i != 0,
+                        )
                     }
                 }
             } else {
-                // fetch
-                block_id;
+                // request block
+                messages.block(block_id);
             }
         }
-
-        return requests;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, TokenId};
+    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, Message, TokenId};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
