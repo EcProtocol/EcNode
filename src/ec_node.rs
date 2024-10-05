@@ -55,15 +55,15 @@ impl EcNode {
         self.time += 1;
         for submit in self.mem_pool.tick(&self.peers, self.time) {
             // TODO pack messages
-            let target = self.peers.for_index(submit.0).unwrap();
+            let target = self.peers.for_index(submit.target).unwrap();
             responses.push(MessageEnvelope {
                 sender: self.peer_id,
                 receiver: target,
                 ticket: 0,
                 time: self.time,
                 message: Message::Vote {
-                    block: submit.1,
-                    vote: submit.2,
+                    block: submit.block,
+                    vote: submit.vote,
                     reply: true,
                 },
             })

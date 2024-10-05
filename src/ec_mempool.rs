@@ -19,10 +19,22 @@ pub enum BlockState {
     Blocked,
 }
 
-pub trait MessageSink {
-    fn vote(&mut self, block_id: &BlockId, token_id: &TokenId, vote: u8, extends: bool);
-    fn block(&mut self, block_id: &BlockId);
-    fn parent(&mut self, block_id: &BlockId, parent_id: &BlockId);
+pub enum MessageRequest {
+    VOTE(BlockId, TokenId, u8, bool),
+    BLOCK(BlockId),
+    PARENT(BlockId, BlockId),
+}
+
+impl MessageRequest {
+    pub fn sort_key(&self) -> (&TokenId, u8) {
+        match self {
+            MessageRequest::VOTE(_, token_id, _, matching) => {
+                (token_id, if *matching { 1 } else { 0 })
+            }
+            MessageRequest::BLOCK(block_id) => (block_id, 0),
+            MessageRequest::PARENT(_, parent_id) => (parent_id, 0),
+        }
+    }
 }
 
 struct PoolVote {
@@ -184,7 +196,7 @@ impl EcMemPool {
                 // TODO check that block-id is SHA of parent ("true parent")
                 for i in 0..block.used as usize {
                     if block.parts[i].last == parent.id {
-                        if validate_with_parent(parent, &block, i) {
+                        if state.validate & 1 << i != 0 && validate_with_parent(parent, &block, i) {
                             state.validate ^= 1 << i;
                         }
                         break;
@@ -236,7 +248,9 @@ impl EcMemPool {
             });
     }
 
-    pub(crate) fn tick(&mut self, peers: &EcPeers, time: EcTime, messages: &dyn MessageSink) {
+    pub(crate) fn tick(&mut self, peers: &EcPeers, time: EcTime) -> Vec<MessageRequest> {
+        let mut messages = Vec::new();
+
         // TODO clean out expired elements - how old?
         self.pool.retain(|_, s| time - s.time < 20);
 
@@ -316,24 +330,26 @@ impl EcMemPool {
                 for i in 0..block.used as usize {
                     if (block_state.validate & 1 << i) != 0 {
                         // fetch a parent
-                        messages.parent(block_id, &block.parts[i].last);
+                        messages.push(MessageRequest::PARENT(*block_id, block.parts[i].last));
                     }
 
                     if (block_state.remaining & 1 << i) != 0 {
                         // request vote
-                        messages.vote(
-                            block_id,
-                            &block.parts[i].token,
+                        messages.push(MessageRequest::VOTE(
+                            *block_id,
+                            block.parts[i].token,
                             block_state.vote,
-                            block_state.vote & 1 << i != 0,
-                        )
+                            block_state.vote & 1 << i != 0
+                        ));
                     }
                 }
             } else {
                 // request block
-                messages.block(block_id);
+                messages.push(MessageRequest::BLOCK(*block_id));
             }
         }
+
+        return messages;
     }
 }
 
