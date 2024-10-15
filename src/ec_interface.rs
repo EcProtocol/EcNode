@@ -43,13 +43,13 @@ pub struct TokenMapping {
 // TODO make group message of Submit, Query and Validate
 pub enum Message {
     Vote {
-        block: BlockId,
+        block_id: BlockId,
         vote: u8,
         reply: bool,
     },
     Query {
         token: TokenId,
-        target: PeerId,
+        target: PeerId, // who wants the result? 0 => me (in network case this allow NAT discovery of peer address)
         ticket: MessageTicket,
     },
     Answer {
@@ -62,16 +62,13 @@ pub enum Message {
 }
 
 pub enum RequestMessage {
-    Submit {
+    Vote {
         block: BlockId,
         status: [bool; TOKENS_PER_BLOCK],
     },
     Query {
         token: TokenId,
         target: PeerId,
-    },
-    Validate {
-        block: BlockId
     },
     Empty,
 }
@@ -114,12 +111,15 @@ pub trait EcTokens {
 
     /// Challenge: Find the smallest expand around token with tokenIds ending on bytes
     /// matching the bytes in the key
+    /// Also tokenmappings must not point to blocks older than some threshold
     ///
     fn tokens_signature(&self, token: &TokenId, key: &PeerId) -> Option<Message>;
 }
 
 pub trait EcBlocks {
     fn lookup(&self, block: &BlockId) -> Option<Block>;
+
+    fn exists(&self, block: &BlockId) -> bool;
 
     fn save(&mut self, block: &Block);
 

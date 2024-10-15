@@ -16,7 +16,11 @@ impl MemBlocks {
 
 impl EcBlocks for MemBlocks {
     fn lookup(&self, block: &BlockId) -> Option<Block> {
-        self.blocks.get(block).map(|b| *b)
+        self.blocks.get(block).copied()
+    }
+
+    fn exists(&self, block: &BlockId) -> bool {
+        self.blocks.contains_key(block)
     }
 
     fn save(&mut self, block: &Block) {

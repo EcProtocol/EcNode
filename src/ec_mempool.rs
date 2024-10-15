@@ -12,7 +12,7 @@ use crate::ec_interface::{
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub enum BlockState {
     Pending,
     Commit,
@@ -123,27 +123,25 @@ fn validate_signature(key: &PublicKeyReference, signature: &Signature) -> bool {
 }
 
 fn validate_with_parent(parent: &Block, block: &Block, i: usize) -> bool {
-    let mut valid = true;
     if parent.time >= block.time {
         // block MUST come after parents
-        valid = false
+        false
     } else if let Some(sig) = &block.signatures[i] {
-        valid = false;
         for j in 0..parent.used as usize {
             // find the matching ref
             if parent.parts[j].token == block.parts[i].token {
                 if validate_signature(&parent.parts[j].key, sig) {
-                    valid = true;
-                    break;
+                    return true;
                 }
             }
         }
+        false
     } else if block.parts[i].last != 0 {
         // missing signature
-        valid = false
+        false
+    } else {
+        true
     }
-
-    return valid;
 }
 
 impl EcMemPool {
@@ -158,13 +156,13 @@ impl EcMemPool {
     pub(crate) fn status(&self, block: &BlockId) -> Option<BlockState> {
         self.pool
             .get(block)
-            .map(|b| b.state)
+            .map(|b| b.state.clone())
             // else check if its already committed
             .or_else(|| {
                 self.blocks
                     .borrow()
-                    .lookup(block)
-                    .map_or(None, |_| Some(BlockState::Commit))
+                    .exists(block)
+                    .then_some(BlockState::Commit)
             })
     }
 
@@ -190,13 +188,35 @@ impl EcMemPool {
             .or_else(|| self.blocks.borrow().lookup(block));
     }
 
+    /// Validates a block in the memory pool against its parent block.
+    ///
+    /// This function is called when a parent block becomes available, allowing for
+    /// validation of pending blocks that were waiting for their parent.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - The parent block used for validation.
+    /// * `block_id` - The ID of the block to be validated.
+    ///
+    /// # Behavior
+    ///
+    /// 1. Retrieves the block state from the memory pool.
+    /// 2. If the block exists and is in a pending state:
+    ///    a. Iterates through the block's parts.
+    ///    b. Finds the part that references the parent block.
+    ///    c. If that part needs validation, calls `validate_with_parent`.
+    ///    d. If validation succeeds, marks that part as validated.
+    ///
+    /// # Note
+    ///
+    /// TODO: Implement a check to ensure the block_id is the SHA of the parent ("true parent").
     pub(crate) fn validate_with(&mut self, parent: &Block, block_id: &BlockId) {
         if let Some(state) = self.pool.get_mut(block_id) {
-            if let (Some(block), Pending) = (state.block, state.state) {
-                // TODO check that block-id is SHA of parent ("true parent")
+            if let (Some(block), BlockState::Pending) = (&state.block, &state.state) {
                 for i in 0..block.used as usize {
                     if block.parts[i].last == parent.id {
-                        if state.validate & 1 << i != 0 && validate_with_parent(parent, &block, i) {
+                        if state.validate & (1 << i) != 0 && validate_with_parent(parent, block, i)
+                        {
                             state.validate ^= 1 << i;
                         }
                         break;
@@ -223,28 +243,7 @@ impl EcMemPool {
 
                 // TODO verify that block-id is the SHA of block content (INCL (?) /not(?) signatures)
 
-                let mut validated: u8 = 0;
-                let mut vote: u8 = 0;
-                let tokens = self.tokens.borrow();
-                for i in 0..block.used as usize {
-                    if let Some(parent) = self.query(&block.parts[i].last) {
-                        if !validate_with_parent(&parent, block, i) {
-                            // break now - this block is invalid
-                            return (false, 0, 1);
-                        }
-                    } else {
-                        // still missing validation
-                        validated |= 1 << i;
-                    }
-
-                    if tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block)
-                        == block.parts[i].last
-                    {
-                        vote |= 1 << i
-                    }
-                }
-
-                (true, vote, validated)
+                (true, 0, 0)
             });
     }
 
@@ -274,7 +273,7 @@ impl EcMemPool {
                     let mut witness_balance = 0;
 
                     // test all votes for range and sum up
-                    for (peer_id, peer_vote) in block_state.votes {
+                    for (peer_id, peer_vote) in &block_state.votes {
                         let mut effect = false;
 
                         for (i, range) in ranges.iter().enumerate() {
@@ -290,7 +289,7 @@ impl EcMemPool {
 
                         if !effect {
                             // TODO will probably not work ... but the idea
-                            block_state.votes.remove(&peer_id);
+                            //block_state.votes.remove(&peer_id);
                         }
                     }
 
@@ -327,6 +326,16 @@ impl EcMemPool {
                     continue;
                 }
 
+                // TODO optimize - only update if changed
+                let mut vote = 0;
+                for i in 0..block.used as usize {
+                    if tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block)
+                        == block.parts[i].last
+                    {
+                        vote |= 1 << i
+                    }
+                }
+
                 for i in 0..block.used as usize {
                     if (block_state.validate & 1 << i) != 0 {
                         // fetch a parent
@@ -338,8 +347,8 @@ impl EcMemPool {
                         messages.push(MessageRequest::VOTE(
                             *block_id,
                             block.parts[i].token,
-                            block_state.vote,
-                            block_state.vote & 1 << i != 0
+                            vote,
+                            true,
                         ));
                     }
                 }
@@ -376,6 +385,10 @@ mod tests {
 
         fn remove(&mut self, _block: &BlockId) {
             // Not needed for this test
+        }
+
+        fn exists(&self, block: &BlockId) -> bool {
+            self.blocks.contains_key(block)
         }
     }
 

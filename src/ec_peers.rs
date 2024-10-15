@@ -47,18 +47,44 @@ impl EcPeers {
         res as usize
     }
 
-    // [usize; 2]
-    pub(crate) fn peers_for(&self, key: &TokenId, time: EcTime) -> Vec<usize> {
+    pub(crate) fn peers_for(&self, key: &TokenId, time: EcTime) -> [PeerId; 2] {
         let idx = match self.active.binary_search_by(|p| p.id.cmp(key)) {
             Ok(i) => i + 1,
-            Err(i) => i
+            Err(i) => i,
+        };
+
+        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize - 1;
+        //let start = self.idx_sub(idx, 4);
+        // rotating peers
+        return [
+            self.active.get(self.idx_adj(idx, -adj)).unwrap().id,
+            self.active.get(self.idx_adj(idx, adj)).unwrap().id,
+        ];
+    }
+
+    pub(crate) fn peer_for(&self, key: &TokenId, time: EcTime) -> PeerId {
+        let idx = match self.active.binary_search_by(|p| p.id.cmp(key)) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+
+        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize - 1;
+        //let start = self.idx_sub(idx, 4);
+        // rotating peers
+        return self.active.get(self.idx_adj(idx, -adj)).unwrap().id;
+    }
+
+    pub(crate) fn peers_idx_for(&self, key: &TokenId, time: EcTime) -> Vec<usize> {
+        let idx = match self.active.binary_search_by(|p| p.id.cmp(key)) {
+            Ok(i) => i + 1,
+            Err(i) => i,
         };
 
         let adj = (((key ^ self.peer_id) + time) & 0x3) as isize - 1;
         //let start = self.idx_sub(idx, 4);
         // rotating peers
         return vec![self.idx_adj(idx, -adj), self.idx_adj(idx, adj)];
-//        return vec![self.idx_add(start, offset), self.idx_add(start, offset * 2), self.idx_add(start, offset * 3)];
+        //        return vec![self.idx_add(start, offset), self.idx_add(start, offset * 2), self.idx_add(start, offset * 3)];
 
         /*
         let start = self.idx_sub(idx, 4);
@@ -93,20 +119,23 @@ impl EcPeers {
 
     pub(crate) fn peer_range(&self, key: &PeerId) -> PeerRange {
         if self.active.len() <= 8 {
-            return PeerRange { low: PeerId::MIN, high: PeerId::MAX };
+            return PeerRange {
+                low: PeerId::MIN,
+                high: PeerId::MAX,
+            };
         }
 
         match self.active.binary_search_by(|p| p.id.cmp(key)) {
-            Ok(idx) | Err(idx) => {
-                PeerRange {
-                    low: self.active[self.idx_adj(idx, -4)].id,
-                    high: self.active[self.idx_adj(idx, 4)].id,
-                }
-            }
+            Ok(idx) | Err(idx) => PeerRange {
+                low: self.active[self.idx_adj(idx, -4)].id,
+                high: self.active[self.idx_adj(idx, 4)].id,
+            },
         }
     }
     pub(crate) fn trusted_peer(&self, key: &PeerId) -> Option<usize> {
-        self.active.binary_search_by(|p| p.id.cmp(key)).map_or(None, |idx| Some(idx))
+        self.active
+            .binary_search_by(|p| p.id.cmp(key))
+            .map_or(None, |idx| Some(idx))
     }
 
     pub fn new(peer_id: PeerId) -> Self {
