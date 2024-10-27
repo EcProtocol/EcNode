@@ -73,11 +73,6 @@ impl EcNode {
                         })
                     }
                 }
-                MessageRequest::BLOCK(block_id) => {
-                    let peer_id = self.peers.peer_for(&block_id, self.time);
-
-                    responses.push(self.request_block(&peer_id, &block_id))
-                }
                 MessageRequest::PARENT(block_id, parent_id) => {
                     // TODO a work around. Should be handled in mem_pool
                     if let Some(parent) = self.mem_pool.query(&parent_id) {

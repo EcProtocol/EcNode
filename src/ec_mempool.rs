@@ -21,7 +21,6 @@ pub enum BlockState {
 
 pub enum MessageRequest {
     VOTE(BlockId, TokenId, u8, bool),
-    BLOCK(BlockId),
     PARENT(BlockId, BlockId),
 }
 
@@ -31,7 +30,6 @@ impl MessageRequest {
             MessageRequest::VOTE(_, token_id, _, matching) => {
                 (token_id, if *matching { 1 } else { 0 })
             }
-            MessageRequest::BLOCK(block_id) => (block_id, 0),
             MessageRequest::PARENT(_, parent_id) => (parent_id, 0),
         }
     }
@@ -260,6 +258,7 @@ impl EcMemPool {
             .iter_mut()
             .filter(|(_, state)| state.state == Pending)
         {
+            // only consider blocks we hold. Requesting blocks is left to the node on vote-request for blank states
             if let Some(block) = block_state.block {
                 // only check for Commit if updated
                 if block_state.updated {
@@ -352,9 +351,11 @@ impl EcMemPool {
                         ));
                     }
                 }
-            } else {
-                // request block
-                messages.push(MessageRequest::BLOCK(*block_id));
+
+                // vote witness
+                if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
+                    messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, true));
+                }
             }
         }
 
