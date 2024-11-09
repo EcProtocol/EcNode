@@ -1,4 +1,5 @@
 use crate::ec_interface::{EcTime, PeerId, TokenId};
+use rand::Rng;
 
 struct MemPeer {
     id: PeerId,
@@ -53,7 +54,7 @@ impl EcPeers {
             Err(i) => i,
         };
 
-        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize - 1;
+        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize + 1;
         //let start = self.idx_sub(idx, 4);
         // rotating peers
         return [
@@ -68,7 +69,7 @@ impl EcPeers {
             Err(i) => i,
         };
 
-        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize - 1;
+        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize + 1;
         //let start = self.idx_sub(idx, 4);
         // rotating peers
         return self.active.get(self.idx_adj(idx, -adj)).unwrap().id;
@@ -80,7 +81,7 @@ impl EcPeers {
             Err(i) => i,
         };
 
-        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize - 1;
+        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize + 1;
         //let start = self.idx_sub(idx, 4);
         // rotating peers
         return vec![self.idx_adj(idx, -adj), self.idx_adj(idx, adj)];
@@ -118,7 +119,7 @@ impl EcPeers {
     }
 
     pub(crate) fn peer_range(&self, key: &PeerId) -> PeerRange {
-        if self.active.len() <= 8 {
+        if self.active.len() <= 10 {
             return PeerRange {
                 low: PeerId::MIN,
                 high: PeerId::MAX,
@@ -127,8 +128,8 @@ impl EcPeers {
 
         match self.active.binary_search_by(|p| p.id.cmp(key)) {
             Ok(idx) | Err(idx) => PeerRange {
-                low: self.active[self.idx_adj(idx, -4)].id,
-                high: self.active[self.idx_adj(idx, 4)].id,
+                low: self.active[self.idx_adj(idx, -6)].id,
+                high: self.active[self.idx_adj(idx, 6)].id,
             },
         }
     }

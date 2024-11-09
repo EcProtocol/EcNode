@@ -16,6 +16,8 @@ pub const TOKENS_SIGNATURE_SIZE: usize = 8;
 // block can not claim to be further into the future
 pub const SOME_STEPS_INTO_THE_FUTURE: EcTime = 100;
 
+pub const VOTE_THRESHOLD: i64 = 2;
+
 // TODO bad name
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
 pub struct TokenBlock {
@@ -35,12 +37,14 @@ pub struct Block {
     pub signatures: [Option<Signature>; TOKENS_PER_BLOCK],
 }
 
+#[derive(Clone)]
 pub struct TokenMapping {
     pub id: TokenId,
     pub block: BlockId,
 }
 
 // TODO make group message of Submit, Query and Validate
+#[derive(Clone)]
 pub enum Message {
     Vote {
         block_id: BlockId,
@@ -79,13 +83,14 @@ pub enum Message2 {
         signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
     },
     Block {
-        block: Block
+        block: Block,
     },
     Requests {
-        messages: [RequestMessage; TOKENS_SIGNATURE_SIZE]
+        messages: [RequestMessage; TOKENS_SIGNATURE_SIZE],
     },
 }
 
+#[derive(Clone)]
 pub struct MessageEnvelope {
     pub sender: PeerId,
     pub receiver: PeerId,

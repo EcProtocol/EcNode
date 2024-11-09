@@ -6,28 +6,32 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use log::info;
-use rand::{Rng, RngCore, SeedableRng};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::{Rng, RngCore, SeedableRng};
 use simple_logger::SimpleLogger;
 
 use crate::ec_blocks::MemBlocks;
-use crate::ec_interface::{Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock, TokenId, TOKENS_PER_BLOCK};
+use crate::ec_interface::{
+    Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock, TokenId,
+    TOKENS_PER_BLOCK,
+};
 use crate::ec_node::EcNode;
 use crate::ec_tokens::MemTokens;
 
-mod ec_peers;
-mod ec_tokens;
-mod ec_node;
+mod ec_blocks;
 mod ec_interface;
 mod ec_mempool;
-mod ec_blocks;
+mod ec_node;
+mod ec_peers;
+mod ec_tokens;
 
 fn main() {
     SimpleLogger::new().init().unwrap();
 
     info!("starting");
 
+    let rounds = 1000;
     let mut seed = [0u8; 32];
     rand::thread_rng().fill(&mut seed);
 
@@ -39,7 +43,7 @@ fn main() {
     // let seed = [242, 73, 216, 129, 64, 247, 185, 72, 112, 29, 148, 147, 117, 10, 202, 13, 166, 82, 168, 166, 67, 22, 228, 32, 90, 137, 239, 131, 247, 164, 39, 149];
 
     // 10
-    let seed = [126, 148, 56, 231, 83, 28, 3, 228, 185, 47, 238, 222, 61, 98, 203, 62, 3, 82, 87, 120, 68, 57, 4, 129, 196, 232, 229, 176, 224, 147, 141, 26];
+    //let seed = [126, 148, 56, 231, 83, 28, 3, 228, 185, 47, 238, 222, 61, 98, 203, 62, 3, 82, 87, 120, 68, 57, 4, 129, 196, 232, 229, 176, 224, 147, 141, 26];
 
     let mut rng = StdRng::from_seed(seed);
 
@@ -71,9 +75,10 @@ fn main() {
 
     // iterations
     let mut message_count = 0;
+    let mut counters = (0, 0, 0, 0);
     let mut committed = 0;
     let mut messages: Vec<MessageEnvelope> = Vec::new();
-    for i in 0..1000 {
+    for i in 0..rounds {
         // check for commited
         let mut clear = HashSet::new();
 
@@ -82,8 +87,19 @@ fn main() {
                 for x in 0..block.used as usize {
                     tokens.push((block.parts[x].token, *b, block.parts[x].key));
                 }
+
+                let nodes = nodes
+                    .iter()
+                    .filter(|(_, n)| n.committed_block(&b).is_some())
+                    .count();
                 clear.insert(*b);
-                info!("{}: commit p:{} b:{}", i, p & 0xFF, b & 0xFF);
+                info!(
+                    "{}: commit B: {} p: {} (on {})",
+                    i,
+                    b & 0xFF,
+                    p & 0xFF,
+                    nodes
+                );
                 committed += 1;
             }
         }
@@ -99,7 +115,7 @@ fn main() {
 
             let mut new_block = Block {
                 id: rng.next_u64(),
-                time: i,            // Must be larger than any prev mapping - but trivial here
+                time: i, // Must be larger than any prev mapping - but trivial here
                 used: used as u8,
                 parts: [TokenBlock {
                     token: 0,
@@ -112,8 +128,8 @@ fn main() {
             for (y, (t, b, k)) in tokens[x..(x + used)].iter().enumerate() {
                 new_block.parts[y].token = *t;
                 new_block.parts[y].last = *b;
-                new_block.parts[y].key = rng.next_u64();    // TODO
-                new_block.signatures[y] = Some(*k);  // TODO
+                new_block.parts[y].key = rng.next_u64(); // TODO
+                new_block.signatures[y] = Some(*k); // TODO
             }
 
             let target = peers.choose(&mut rng).unwrap();
@@ -122,48 +138,91 @@ fn main() {
             blocks.insert(new_block.id, *target);
 
             x += used;
-            info!("{} block created b:{} size:{} - p:{}", i, new_block.id & 0xFF, used, node.get_peer_id() & 0xFF);
+            info!(
+                "{} block created B: {} size:{} - p: {}",
+                i,
+                new_block.id & 0xFF,
+                used,
+                node.get_peer_id() & 0xFF
+            );
         }
 
         tokens.clear();
 
         let mut next: Vec<MessageEnvelope> = Vec::new();
 
-        messages.shuffle(&mut rng);
-        // drop a fraction (network loss)
-        // delay: push a fraction to next
+        let number_of_messages = messages.len();
+        if number_of_messages > 0 {
+            messages.shuffle(&mut rng);
+            // delay: push a fraction to next
+            next.extend_from_slice(&mut messages[(number_of_messages/2)..number_of_messages]);
+            // drop a fraction (network loss)
+            messages.truncate(number_of_messages/2 - number_of_messages/20);
+
+            //info!("{}: next: {} msgs: {} number_of_messages: {}", i, next.len(), messages.len(), number_of_messages);
+        }
 
         for m in &messages {
             if let Some(node) = nodes.get_mut(&m.receiver) {
-                if false && blocks.iter().any(|p| *p.1 == m.receiver || *p.1 == m.sender) {
-                    println!("{}> {}: {} -> {}", i, match m.message {
-                        Message::Query { .. } => "Q",
-                        Message::Vote { .. } => "S",
-                        Message::Block { .. } => "B",
-                        _ => "",
-                    }, m.sender & 0xFF, m.receiver & 0xFF)
+                if false
+                    && blocks
+                        .iter()
+                        .any(|p| *p.1 == m.receiver || *p.1 == m.sender)
+                {
+                    println!(
+                        "{}> {}: {} -> {}",
+                        i,
+                        match m.message {
+                            Message::Query { .. } => "Q",
+                            Message::Vote { .. } => "S",
+                            Message::Block { .. } => "B",
+                            _ => "",
+                        },
+                        m.sender & 0xFF,
+                        m.receiver & 0xFF
+                    )
                 }
+                match m.message {
+                    Message::Query { .. } => counters.0 += 1,
+                    Message::Vote { .. } => counters.1 += 1,
+                    Message::Block { .. } => counters.2 += 1,
+                    Message::Answer { .. } => counters.3 += 1,
+                };
                 node.handle_message(&m, &mut next);
             }
         }
 
         // next round
         for (_, node) in &mut nodes {
-            node.tick(&mut next);
+            node.tick(&mut next, true); //rng.gen_bool(0.9));
         }
 
-        info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
+        //info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
 
         message_count += messages.len();
         messages.clear();
         messages.append(&mut next);
 
-        if messages.len() == 0 {
+        /*if messages.len() == 0 {
             info!("{}: next round EMPTY {}", i, committed);
             break;
-        }
+        }*/
     }
 
-    info!("done. Messages {}", message_count);
     println!("let seed = {:?};", seed);
+    if committed > 0 {
+        info!(
+            "done. Messages {}. commit: {},  avg: {} rounds/commit, {} messeage/commit, {:?} dist",
+            message_count,
+            committed,
+            rounds / committed,
+            message_count as u64 / committed,
+            counters
+        );
+    } else {
+        info!(
+            "done. Messages {}. commit: NONE, {:?} dist",
+            message_count, counters
+        );
+    }
 }

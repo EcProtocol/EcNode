@@ -53,9 +53,9 @@ impl EcNode {
         self.blocks.borrow().lookup(block_id)
     }
 
-    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
+    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>, send: bool) {
         self.time += 1;
-        for request in self.mem_pool.tick(&self.peers, self.time) {
+        for request in self.mem_pool.tick(&self.peers, self.time, self.peer_id) {
             // TODO pack messages in Message2 style
             match request {
                 MessageRequest::VOTE(block_id, token_id, vote, reply) => {

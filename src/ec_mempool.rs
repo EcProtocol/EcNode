@@ -1,5 +1,6 @@
 // track the state of transactions
 
+use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -7,7 +8,7 @@ use hashbrown::HashMap;
 
 use crate::ec_interface::{
     Block, BlockId, EcBlocks, EcTime, EcTokens, PeerId, PublicKeyReference, Signature, TokenId,
-    SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK,
+    SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK, VOTE_THRESHOLD,
 };
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
@@ -245,11 +246,16 @@ impl EcMemPool {
             });
     }
 
-    pub(crate) fn tick(&mut self, peers: &EcPeers, time: EcTime) -> Vec<MessageRequest> {
+    pub(crate) fn tick(
+        &mut self,
+        peers: &EcPeers,
+        time: EcTime,
+        id: PeerId,
+    ) -> Vec<MessageRequest> {
         let mut messages = Vec::new();
 
         // TODO clean out expired elements - how old?
-        self.pool.retain(|_, s| time - s.time < 20);
+        self.pool.retain(|_, s| time - s.time < 100);
 
         let mut tokens = self.tokens.borrow_mut();
 
@@ -292,14 +298,14 @@ impl EcMemPool {
                         }
                     }
 
-                    block_state.remaining = if witness_balance <= 2 {
+                    block_state.remaining = if witness_balance <= VOTE_THRESHOLD {
                         1 << TOKENS_PER_BLOCK
                     } else {
                         0
                     };
 
                     for i in 0..ranges.len() {
-                        if balance[i] <= 2 && balance[i] >= -2 {
+                        if balance[i] <= VOTE_THRESHOLD && balance[i] >= -VOTE_THRESHOLD {
                             block_state.remaining |= 1 << i
                         }
                     }
@@ -322,39 +328,50 @@ impl EcMemPool {
 
                     block_state.state = BlockState::Commit;
 
+                    info!(
+                        "{} B: {} P: {} vs: {}",
+                        time,
+                        block.id & 0xFF,
+                        id & 0xFF,
+                        block_state.votes.len()
+                    );
+
                     continue;
                 }
 
-                // TODO optimize - only update if changed
-                let mut vote = 0;
-                for i in 0..block.used as usize {
-                    if tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block)
-                        == block.parts[i].last
-                    {
-                        vote |= 1 << i
-                    }
-                }
-
-                for i in 0..block.used as usize {
-                    if (block_state.validate & 1 << i) != 0 {
-                        // fetch a parent
-                        messages.push(MessageRequest::PARENT(*block_id, block.parts[i].last));
+                //if (time ^ block_id) & 1 == 0 
+                {
+                    // TODO optimize - only update if changed
+                    let mut vote = 0;
+                    for i in 0..block.used as usize {
+                        if tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block)
+                            == block.parts[i].last
+                        {
+                            vote |= 1 << i
+                        }
                     }
 
-                    if (block_state.remaining & 1 << i) != 0 {
-                        // request vote
-                        messages.push(MessageRequest::VOTE(
-                            *block_id,
-                            block.parts[i].token,
-                            vote,
-                            true,
-                        ));
-                    }
-                }
+                    for i in 0..block.used as usize {
+                        if (block_state.validate & 1 << i) != 0 {
+                            // fetch a parent
+                            messages.push(MessageRequest::PARENT(*block_id, block.parts[i].last));
+                        }
 
-                // vote witness
-                if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
-                    messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, true));
+                        if (block_state.remaining & 1 << i) != 0 {
+                            // request vote
+                            messages.push(MessageRequest::VOTE(
+                                *block_id,
+                                block.parts[i].token,
+                                vote,
+                                true,
+                            ));
+                        }
+                    }
+
+                    // vote witness
+                    if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
+                        messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, true));
+                    }
                 }
             }
         }
