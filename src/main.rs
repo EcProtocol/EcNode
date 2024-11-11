@@ -64,7 +64,7 @@ fn main() {
         let mut node = EcNode::new(tokens, blocks, *peer_id, 0);
 
         // select a random sample for each
-        for add_peer in peers.choose_multiple(&mut rng, 70) {
+        for add_peer in peers.choose_multiple(&mut rng, 20) {
             node.seed_peer(add_peer);
         }
 
@@ -155,9 +155,9 @@ fn main() {
         if number_of_messages > 0 {
             messages.shuffle(&mut rng);
             // delay: push a fraction to next
-            next.extend_from_slice(&mut messages[(number_of_messages/2)..number_of_messages]);
+            next.extend_from_slice(&mut messages[(number_of_messages / 2)..number_of_messages]);
             // drop a fraction (network loss)
-            messages.truncate(number_of_messages/2 - number_of_messages/20);
+            messages.truncate(number_of_messages / 2 - number_of_messages / 20);
 
             //info!("{}: next: {} msgs: {} number_of_messages: {}", i, next.len(), messages.len(), number_of_messages);
         }
@@ -209,7 +209,7 @@ fn main() {
         }*/
     }
 
-    println!("let seed = {:?};", seed);
+    info!("let seed = {:?};", seed);
     if committed > 0 {
         info!(
             "done. Messages {}. commit: {},  avg: {} rounds/commit, {} messeage/commit, {:?} dist",

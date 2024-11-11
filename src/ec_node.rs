@@ -146,6 +146,9 @@ impl EcNode {
                         if msg.ticket > 0 {
                             responses.push(self.request_block(&msg.sender, block))
                         }
+
+                        // TODO push to a queue of potential peers
+                        self.peers.update_peer(&msg.sender, self.time);
                     }
                     _ => {} // discard - do nothing
                 }
