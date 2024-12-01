@@ -23,6 +23,7 @@ pub enum BlockState {
 pub enum MessageRequest {
     VOTE(BlockId, TokenId, u8, bool),
     PARENT(BlockId, BlockId),
+    COMMIT(BlockId, PeerId),
 }
 
 impl MessageRequest {
@@ -32,6 +33,7 @@ impl MessageRequest {
                 (token_id, if *matching { 1 } else { 0 })
             }
             MessageRequest::PARENT(_, parent_id) => (parent_id, 0),
+            MessageRequest::COMMIT(_, peer_id) => (peer_id, 0),
         }
     }
 }
@@ -327,19 +329,23 @@ impl EcMemPool {
                     self.blocks.borrow_mut().save(&block);
 
                     block_state.state = BlockState::Commit;
+                    
+                    block_state.votes.iter().for_each(|(peer_id, vote)| {
+                        messages.push(MessageRequest::COMMIT(*block_id, *peer_id));
+                    });
 
-                    info!(
+                 /*   info!(
                         "{} B: {} P: {} vs: {}",
                         time,
                         block.id & 0xFF,
                         id & 0xFF,
                         block_state.votes.len()
-                    );
+                    );*/
 
                     continue;
                 }
 
-                //if (time ^ block_id) & 1 == 0 
+                //if block.time & 1 == 0 
                 {
                     // TODO optimize - only update if changed
                     let mut vote = 0;

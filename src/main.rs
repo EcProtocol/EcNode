@@ -32,23 +32,14 @@ fn main() {
     info!("starting");
 
     let rounds = 1000;
+    let num_of_peers = 2000;
     let mut seed = [0u8; 32];
     rand::thread_rng().fill(&mut seed);
-
-    // 53
-    // let seed = [20, 150, 225, 143, 33, 223, 65, 30, 249, 119, 164, 41, 32, 76, 27, 246, 195, 73, 87, 183, 243, 213, 246, 146, 26, 52, 113, 177, 131, 181, 152, 195];
-    // make 41
-    // let seed = [59, 12, 2, 10, 104, 123, 199, 212, 128, 241, 197, 168, 58, 202, 223, 50, 195, 189, 151, 147, 202, 184, 131, 51, 195, 196, 35, 116, 113, 185, 157, 44];
-    // 21
-    // let seed = [242, 73, 216, 129, 64, 247, 185, 72, 112, 29, 148, 147, 117, 10, 202, 13, 166, 82, 168, 166, 67, 22, 228, 32, 90, 137, 239, 131, 247, 164, 39, 149];
-
-    // 10
-    //let seed = [126, 148, 56, 231, 83, 28, 3, 228, 185, 47, 238, 222, 61, 98, 203, 62, 3, 82, 87, 120, 68, 57, 4, 129, 196, 232, 229, 176, 224, 147, 141, 26];
 
     let mut rng = StdRng::from_seed(seed);
 
     // create starting peers
-    let peers: Vec<PeerId> = (0..100).map(|_| rng.next_u64()).collect();
+    let peers: Vec<PeerId> = (0..num_of_peers).map(|_| rng.next_u64()).collect();
 
     let mut tokens: Vec<(TokenId, BlockId, PublicKeyReference)> = Vec::new();
     for _ in 0..1 {
@@ -64,7 +55,7 @@ fn main() {
         let mut node = EcNode::new(tokens, blocks, *peer_id, 0);
 
         // select a random sample for each
-        for add_peer in peers.choose_multiple(&mut rng, 20) {
+        for add_peer in peers.choose_multiple(&mut rng, 3 * num_of_peers / 100) {
             node.seed_peer(add_peer);
         }
 
@@ -111,7 +102,7 @@ fn main() {
 
         let mut x = 0;
         while x < tokens.len() {
-            let used = min(rng.gen_range(1..4), tokens.len() - x);
+            let used = 1; // min(rng.gen_range(1..4), tokens.len() - x);
 
             let mut new_block = Block {
                 id: rng.next_u64(),
@@ -132,6 +123,7 @@ fn main() {
                 new_block.signatures[y] = Some(*k); // TODO
             }
 
+            // choose a target node - to own the transaction
             let target = peers.choose(&mut rng).unwrap();
             let node = nodes.get_mut(target).unwrap();
             node.block(&new_block);
@@ -197,7 +189,7 @@ fn main() {
             node.tick(&mut next, true); //rng.gen_bool(0.9));
         }
 
-        //info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
+        info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
 
         message_count += messages.len();
         messages.clear();
@@ -208,6 +200,21 @@ fn main() {
             break;
         }*/
     }
+
+    let stats = nodes
+        .iter()
+        .map(|(_, node)| node.num_peers())
+        .fold((usize::MIN, usize::MAX, usize::MIN), |acc, e| {
+            (usize::max(acc.0, e), usize::min(acc.1, e), acc.2 + e)
+        });
+
+    info!(
+        "Peers ({}): max: {} min: {} avg: {}",
+        nodes.len(),
+        stats.0,
+        stats.1,
+        stats.2 / nodes.len()
+    );
 
     info!("let seed = {:?};", seed);
     if committed > 0 {

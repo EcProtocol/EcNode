@@ -145,6 +145,10 @@ impl EcPeers {
             active: Vec::new(),
         }
     }
+    
+    pub fn num_peers(&self) -> usize {
+        self.active.len()
+    }
 }
 
 #[cfg(test)]

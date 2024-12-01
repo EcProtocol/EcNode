@@ -44,6 +44,10 @@ impl EcNode {
     pub fn seed_peer(&mut self, peer: &PeerId) {
         self.peers.update_peer(peer, self.time);
     }
+    
+    pub fn num_peers(&self) -> usize {
+        self.peers.num_peers()
+    }
 
     pub fn block(&mut self, block: &Block) {
         self.mem_pool.block(block, self.time);
@@ -92,6 +96,9 @@ impl EcNode {
                             },
                         })
                     }
+                }
+                MessageRequest::COMMIT(block_id, peer_id) => {
+                    responses.push(self.reply_direct(&peer_id, &block_id, false))
                 }
             }
         }
@@ -186,10 +193,10 @@ impl EcNode {
         }
     }
 
-    fn reply_direct(&self, sender: &PeerId, block: &BlockId, blocked: bool) -> MessageEnvelope {
+    fn reply_direct(&self, target: &PeerId, block: &BlockId, blocked: bool) -> MessageEnvelope {
         MessageEnvelope {
             sender: self.peer_id,
-            receiver: *sender,
+            receiver: *target,
             ticket: 0,
             time: self.time,
             message: Message::Vote {
