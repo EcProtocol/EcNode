@@ -329,9 +329,9 @@ impl EcMemPool {
                     self.blocks.borrow_mut().save(&block);
 
                     block_state.state = BlockState::Commit;
-                    
+
                     block_state.votes.iter().for_each(|(peer_id, vote)| {
-                        messages.push(MessageRequest::COMMIT(*block_id, *peer_id));
+                        //messages.push(MessageRequest::COMMIT(*block_id, *peer_id));
                     });
 
                  /*   info!(
@@ -345,7 +345,7 @@ impl EcMemPool {
                     continue;
                 }
 
-                //if block.time & 1 == 0 
+                //if block.time & 1 == 0
                 {
                     // TODO optimize - only update if changed
                     let mut vote = 0;

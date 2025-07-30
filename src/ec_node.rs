@@ -59,6 +59,9 @@ impl EcNode {
 
     pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>, send: bool) {
         self.time += 1;
+        // TODO sort requests - and detect CONFLICT (multiple positive vores for same token)
+        // could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
+        // also work on earlier blocks before later
         for request in self.mem_pool.tick(&self.peers, self.time, self.peer_id) {
             // TODO pack messages in Message2 style
             match request {

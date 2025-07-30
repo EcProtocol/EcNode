@@ -16,7 +16,7 @@ pub const TOKENS_SIGNATURE_SIZE: usize = 8;
 // block can not claim to be further into the future
 pub const SOME_STEPS_INTO_THE_FUTURE: EcTime = 100;
 
-pub const VOTE_THRESHOLD: i64 = 2;
+pub const VOTE_THRESHOLD: i64 = 1;
 
 // TODO bad name
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
