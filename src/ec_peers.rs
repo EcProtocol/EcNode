@@ -128,8 +128,8 @@ impl EcPeers {
 
         match self.active.binary_search_by(|p| p.id.cmp(key)) {
             Ok(idx) | Err(idx) => PeerRange {
-                low: self.active[self.idx_adj(idx, -6)].id,
-                high: self.active[self.idx_adj(idx, 6)].id,
+                low: self.active[self.idx_adj(idx, -4)].id,
+                high: self.active[self.idx_adj(idx, 4)].id,
             },
         }
     }

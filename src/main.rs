@@ -31,7 +31,7 @@ fn main() {
 
     info!("starting");
 
-    let rounds = 1000;
+    let rounds = 5000;
     let num_of_peers = 2000;
     let mut seed = [0u8; 32];
     rand::thread_rng().fill(&mut seed);
@@ -55,8 +55,15 @@ fn main() {
         let mut node = EcNode::new(tokens, blocks, *peer_id, 0);
 
         // select a random sample for each
-        for add_peer in peers.choose_multiple(&mut rng, 90 * num_of_peers / 100) {
-            node.seed_peer(add_peer);
+        // for add_peer in peers.choose_multiple(&mut rng, 35 * num_of_peers / 100) {
+        //     node.seed_peer(add_peer);
+        // }
+        for p in &peers {
+            let d = peer_id.abs_diff(*p);
+            let r = rng.next_u64();
+            if r > d && d & 3 == 0 {
+                node.seed_peer(p);
+            }
         }
 
         nodes.insert(*peer_id, node);
@@ -102,7 +109,7 @@ fn main() {
 
         let mut x = 0;
         while x < tokens.len() {
-            let used = 1; // min(rng.gen_range(1..4), tokens.len() - x);
+            let used = min(rng.gen_range(1..4), tokens.len() - x);
 
             let mut new_block = Block {
                 id: rng.next_u64(),
@@ -189,7 +196,7 @@ fn main() {
             node.tick(&mut next, true); //rng.gen_bool(0.9));
         }
 
-        info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
+        //info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
 
         message_count += messages.len();
         messages.clear();

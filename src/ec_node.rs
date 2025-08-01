@@ -147,6 +147,7 @@ impl EcNode {
                         }
                     }
                     (None, Some(_)) => {
+                        // TODO check load-balancing count for this peer
                         self.mem_pool.vote(block, *vote, &msg.sender, msg.time);
                         // better ask the sender for it - while propagating towards the "witness"
                         responses.push(self.request_block(&msg.sender, block))
@@ -157,7 +158,8 @@ impl EcNode {
                             responses.push(self.request_block(&msg.sender, block))
                         }
 
-                        // TODO push to a queue of potential peers
+                        // TODO this should be handled by "introduction" messages - linking peers
+                        // but 2-way relations improve transaction-success alot
                         self.peers.update_peer(&msg.sender, self.time);
                     }
                     _ => {} // discard - do nothing
