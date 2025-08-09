@@ -1,398 +1,636 @@
 
 # A Common Notary for the Internet
 
-Using statefull Internet-services requires trusting the service-provider to keep your data safe and to not manipulate it in ways you did not agree to. Your data lives inside a blackbox owned and operated by that provider.
+## Table of Contents
 
-This hinders interoperability. There is no way to move ownership of your data somewhere else, unless its explictly buids into the product. You can not just take a copy of your data, hand it to someone else and claim that they now own or control it.
+1. [Introduction](#introduction)
+2. [Project Outline](#project-outline)
+3. [High-Level Design](#high-level-design)
+4. [API](#api)
+   - [Request Type Messages](#request-type-messages)
+   - [Reply Type Messages](#reply-type-messages)
+   - [Token Mapping Replies](#token-mapping-replies)
+5. [Peer Discovery](#peer-discovery)
+   - [Bootstrapping](#bootstrapping)
+   - [Peer Quality and Proof of Storage](#peer-quality-and-proof-of-storage)
+   - [How to Obtain Initial Mappings](#how-to-obtain-initial-mappings)
+   - [Stale or False Mappings](#stale-or-false-mappings)
+   - [Introducing New Peers to the System](#introducing-new-peers-to-the-system)
+   - [Trusted Peers](#trusted-peers)
+   - [Selecting Trusted Peers](#selecting-trusted-peers)
+6. [Consensus](#consensus)
+   - [How Can This Work?](#how-can-this-work)
+7. [Load Balancing](#load-balancing)
+8. [Ticket Schemes for Clients](#ticket-schemes-for-clients)
+   - [API Key](#api-key)
+   - [Blinded Tickets](#blinded-tickets)
+   - [Proof of Work](#proof-of-work)
+9. [Keeping Mappings and Transactions Available](#keeping-mappings-and-transactions-available)
+10. [Security](#security)
+11. [Performance](#performance)
+12. [Example Use Cases](#example-use-cases)
+    - [Tickets](#tickets)
+    - [Payment](#payment)
+    - [Identity](#identity)
+    - [DNS](#dns)
+    - [Process/Document Flow](#processdocument-flow)
 
-This project opens up the "service blackbox". It provides a way to split services into a "data" part and an "ownership" or "tracking" part, by offering a notary for the Internet. Data, documents or state in general, is manipulated in the service-provider system - but the notary keeps a record of owenership and states. So now you can email a document to someone and handover ownership in a way that they can trust, that they can now prove that they control that data.
+---
 
-Given that the core issue here is trust, sharing and making a common service available, this sort of "product" can not be build and offered by one company. It has to be shared.
+## Introduction
 
-This paper presents a distributed consensus protocol for token-based transactions using a federated peer-to-peer network - with proof-of-work tests for unmanaged inclusion of network peers. The goal is to build a workable, global, common Notary service for the Internet.
+Using stateful Internet services requires trusting the service provider to keep your data safe and not manipulate it in ways you did not agree to. Your data lives inside a blackbox owned and operated by that provider.
 
-## Project outline
+This hinders interoperability. There is no way to move ownership of your data elsewhere unless it's explicitly built into the product. You cannot simply take a copy of your data, hand it to someone else, and claim that they now own or control it.
 
-To achieve this, we need to build a fast, globably distributed consensus network. This does this by limiting consensus for specific tokens to a "neighbourhood" set of peers and by offering a public API to read the current state.
+This project opens up the "service blackbox." It provides a way to split services into a "data" part and an "ownership" or "tracking" part by offering a notary for the Internet. Data, documents, or state in general are manipulated in the service-provider system, but the notary keeps a record of ownership and states. Now you can email a document to someone and hand over ownership in a way that they can trust—they can prove that they control that data.
 
-The transactions (identified by the SHA of their content) of the system does not contain "user-data" as such. User-data is regarded as toxic. The expected use-case is for users to SHA content and store it using other network-structures. In this way this network can be used for verification and tracking - vastly simplifing the responsiblity of other networks (and allowing users to store/provide data in whatever way or format is suitable for purpose).
+Given that the core issue here is trust, sharing, and making a common service available, this sort of "product" cannot be built and offered by one company. It has to be shared.
 
-Since tokens have no special meaning to this network - they can be created AND "destroyed" (accept no further transactions). This allows use-cases impossible/impractical in networks where tokens are e.g. mined or otherwise limited in form or supply.
+This paper presents a distributed consensus protocol for token-based transactions using a federated peer-to-peer network with proof-of-storage tests for unmanaged inclusion of network peers. The goal is to build a workable, global, common notary service for the Internet.
 
-The network topology generally does not distinguish between "clients" (end users) and "servers" (federated peers). But it assumes that a large set of peers are stable and available. These federated peers have to continuesly "earn their seat" (address) in the network. In this text we will use nodes to describe both types and peers to mean more nodes that participate in federation.
+## Project Outline
 
-# Highlevel Design
-Users create new transactions and query for existing transactions and mappings. If the network accept a new transaction the token-ids contained in it are added to the front of the transaction-chain for each of those tokens.
+To achieve this, we need to build a fast, globally distributed consensus network. This is accomplished by limiting consensus for specific tokens to a "neighborhood" set of peers and by offering a public API to read the current state.
 
-A transaction is a collection of upto 6 Tokens (each 256 bit) mapping to SHA (blake2 or 3) of signature public-keys - as well as the transaction-id of the previous transaction to update the token. Plus a few other values (more later).
+The transactions (identified by the SHA of their content) in this system do not contain "user-data" as such. User-data is regarded as toxic. The expected use case is for users to SHA content and store it using other network structures. In this way, this network can be used for verification and tracking, vastly simplifying the responsibility of other networks (and allowing users to store/provide data in whatever way or format is suitable for their purpose).
 
-One token-mapping:
-[Token, SHA(public key), Previous-transaction-id] (in all 3 256 bit values/96 bytes)
+Since tokens have no special meaning to this network, they can be created AND "destroyed" (accept no further transactions). This allows use cases impossible or impractical in networks where tokens are, for example, mined or otherwise limited in form or supply.
 
-IF the previous-transaction-id field is 0 - this transaction tries to create this token (first use seen by the network)
-IF the SHA(public key) field is 0 - this transaction destroyes this token (no more changes are allowed by the network).
-Both may be 0 in which case the token is created - but not usable in further transactions.
+The network topology generally does not distinguish between "clients" (end users) and "servers" (federated peers). However, it assumes that a large set of peers are stable and available. These federated peers have to continuously "earn their seat" (address) in the network. In this text, we will use "nodes" to describe both types and "peers" to mean nodes that participate in federation.
 
-IF the previous-transaction-id field contains a value. This must be a valid (findable by the nodes) transaction-id. When validating transactions nodes, must retrieve all previous-linked transactions - and verify that provided signatures have a public key that hashes to the SHA(public key) field - and of cause that the signature is valid.
+# High-Level Design
 
-The SHA(public key) field can also be "-1" (and no signature for that token-update is given). In that case the transaction does not update the token - but verifies that at that time this token is mapped to the previous-transaction-id. More on that use-case later.
+Users create new transactions and query for existing transactions and mappings. If the network accepts a new transaction, the token IDs contained in it are added to the front of the transaction chain for each of those tokens.
 
-New nodes genereate a EC DH key-pair - and use it longterm (find out what the needed mitigation for DH is). A "256 bit node-address" is derived by applying Argon2 to the public key.
+A transaction is a collection of up to 6 tokens (each 256 bit) mapping to SHA Blake3 of signature public keys, as well as the transaction ID of the previous transaction to update the token, plus a few other values (described later).
 
-The "neighbourhood" of a token is simply defined as the distance from the token-id to node-addresses.
+One token mapping:
+[Token, SHA(public key), Previous-transaction-id] (in total: 3 × 256-bit values = 96 bytes)
+
+**Token Creation and Destruction Rules:**
+- IF the previous-transaction-id field is 0: this transaction tries to create this token (first use seen by the network)
+- IF the SHA(public key) field is 0: this transaction destroys this token (no more changes are allowed by the network)
+- Both may be 0, in which case the token is created but not usable in further transactions
+
+**Transaction Validation:**
+IF the previous-transaction-id field contains a value, this must be a valid (findable by the nodes) transaction ID. When validating transactions, nodes must retrieve all previous-linked transactions and verify that:
+1. Provided signatures have a public key that hashes to the SHA(public key) field
+2. The signature is valid
+
+The SHA(public key) field can also be "-1" (and no signature for that token update is given). In that case, the transaction does not update the token but verifies that at that time this token is mapped to the previous-transaction-id. More on that use case later.
+
+**Node Identity:**
+New nodes generate an EC DH key pair and use it long-term (mitigation for DH vulnerabilities needs investigation). A "256-bit node address" is derived by applying Argon2 to the public key.
+
+**Token Neighborhoods:**
+The "neighborhood" of a token is simply defined as the distance from the token ID to node addresses.
 
 ## API
-The final system is intended to use UDP encrypted packages - using the shared-key obtained by doing DH from the Sender to the Receiver node. Encryption uses AEAD standard to secure integrety and security of each packet. All packets must be below MTU (~1500 bytes) to achieve the fastes network transfers.
 
-The system tries to avoid network roundtrips as much as possible. So there are no handshake or multiround (single) operations.
+The final system is intended to use UDP encrypted packets using the shared key obtained by performing Diffie-Hellman key exchange from the sender to the receiver node. Encryption uses the ChaCha20-Poly1305 standard to secure integrity and confidentiality of each packet. All packets must be below MTU (~1500 bytes) to achieve the fastest network transfers.
 
-The core system offers only these messages which in many cases can be batched in single network packages.
+The system tries to avoid network round trips as much as possible. Therefore, there are no handshake or multi-round (single) operations.
 
-General message layout
+The core system offers only these message types, which in many cases can be batched in single network packets.
 
-    [Version-id: 16 bit] [reserved: 44 bit] [IV 196 bit]
-    [Sender public key: 256 bit]
-    [MAC: 256 bit]
-    [encrypted content... rest of package]
+**General Message Layout:**
+```
+[Version-id: 16 bit] [Reserved: 44 bit] [IV: 196 bit]
+[Sender public key: 256 bit]
+[MAC: 256 bit]
+[Encrypted content... rest of packet]
+```
 
-### "Request type" messages:
-- Get transaction. Input: Transaction id, as well as a network-address of the requesting peer.
-- Get token mapping: Input: SHA(Token id), as well as a network-address of the requesting peer.
-- Vote for a transaction to be added to the "front" of each contained token-chain. Input: transaction id and votes (see more later).
+### "Request Type" Messages:
 
-These types of messages must include a "ticket value". For transaction and token "get", the ticket is a SHA of a secret value kept by the sender and the token or transaction id being asked for.
+1. **Get Transaction**: Input: Transaction ID and network address of the requesting peer
+2. **Get Token Mapping**: Input: SHA(Token ID) and network address of the requesting peer  
+3. **Vote**: Vote for a transaction to be added to the "front" of each contained token chain. Input: transaction ID and votes (detailed later)
 
-For Vote the ticket is "proof" that the sender has obtained rights to submit transactions to this node (see more later) - OR 0 if the sender believes that the receiver has accepted it as a trusted peer (more later). This means that Votes will just be discared if neither of these conditions holds.
+**Ticket System:**
+These message types must include a "ticket value":
+- For transaction and token "get" requests: the ticket is a SHA of a secret value kept by the sender and the token or transaction ID being requested
+- For Vote messages: the ticket is "proof" that the sender has obtained rights to submit transactions to this node (detailed later), OR 0 if the sender believes the receiver has accepted it as a trusted peer. Votes will be discarded if neither condition holds.
 
-IF a peer does not know the mapping of a get-request, it *can* forward the request to a better quilified peer and add the network information to get the response back to the original requester. To support NAT'ed networks the original requester does not put any inforamtion in the network-address part. Upon seeing this a forwarding peer will put the network-address that the messages was received from in the forwarded message.
-Since requests for unknown SHAs could be forwarded forever - and given the asyncronous nature of the protocol - peers only forward with some probability.
+**Message Forwarding:**
+IF a peer does not know the mapping of a get-request, it *can* forward the request to a better qualified peer and add the network information to get the response back to the original requester. To support NAT'd networks, the original requester does not put any information in the network-address part. Upon seeing this, a forwarding peer will put the network address that the message was received from in the forwarded message.
 
-This also applies to load control. Each peer is free to discard any number of messages it deems needed.
+Since requests for unknown SHAs could be forwarded forever—and given the asynchronous nature of the protocol—peers only forward with some probability.
 
-It is the *clear intend* of the system to allow public access to issue get-messages (and responses) (best effort). But to restrict Vote messages either by PoW or by validating various forms of tickets (see concept ideas later). 
+This also applies to load control. Each peer is free to discard any number of messages it deems necessary.
 
-### "Reply type" messages:
-Responding to Request messages:
+It is the *clear intent* of the system to allow public access to issue get-messages (and responses) on a best-effort basis, but to restrict Vote messages either by proof-of-storage or by validating various forms of tickets (see concept ideas later). 
 
-- Transaction content. The content of a transaction PLUS signatures (EC signature pair plus public key).
-- Token mappings. The mapping of a token-id to the current (latest) transaction-id to use it (as seen by this peer). Head of the token chain. Additinally the token-mapping response contains 8 "surrounding token-mappings".
+### "Reply Type" Messages:
 
-For a node to accept these messages they must contain a valid ticket. Since the node has the secret to create tickets it simply test if the tickets provided is the SHA of either the transaction-id or token provided making sure it is the answer to something it has asked for. 
+Responding to request messages:
 
-The nodes will update the ticket-secret every some milli secounds. Tests will be done with the current and the previous secret.
+1. **Transaction Content**: The content of a transaction PLUS signatures (EC signature pair plus public key)
+2. **Token Mappings**: The mapping of a token ID to the current (latest) transaction ID that uses it (as seen by this peer)—the head of the token chain. Additionally, the token-mapping response contains 10 surronding token-mappings based on a signature-scheme (more below)
 
-Hence: If a ticket does not match any - it is either spam or "slow response". So no infinite re-sending will be accepted either.
+**Ticket Validation:**
+For a node to accept these messages, they must contain a valid ticket. Since the node has the secret to create tickets, it simply tests if the ticket provided is the SHA of either the transaction ID or token provided, ensuring it is the answer to something it has requested.
 
-In one special case the ticket field is allowed to be 0 for token-mapping responses - when peers "introduce" themselfs. See more in "Peer discovery".
+Nodes update the ticket secret every few milliseconds. Tests are done with both the current and previous secret.
 
-#### Token mapping replies
-Reply to a token mapping request first requires that the receiver knows the token-id of the requested SHA. Therefor the peers store token-mappings by their SHA in a sorted key/value style database.
+Therefore: If a ticket does not match either, it is either spam or a "slow response." No infinite re-sending will be accepted.
 
-Further more, the "surrounding mappings" of the Token mapping message must live up to a set of criteria to counter "man-in-the-middle" peers - here is how it works:
+In one special case, the ticket field is allowed to be 0 for token-mapping responses—when peers "introduce" themselves. See more in "Peer Discovery."
 
-The replying peer calculates an 8-byte SHA (blake2 or 3) of its own public-key + the token-id + the previous-transaction-id of the response. Lets call this the "signature" of the reply.
+#### Token Mapping Replies
 
-The peer then scans left and right in its token-mapping-database - sorted by SHA.
-The 8 surrounding mappings are selected as the closest set of SHAs to form the "signature" with their last byte.
+A reply to a token mapping request first requires that the receiver knows the token ID of the requested SHA. Therefore, peers store token mappings by their SHA in a sorted key/value database.
 
-Example:
+To prove the quality of the replier the response also contains a sample of token-mappings from "around" the request SHA. 
 
-    Request token id 1234567. Lets say SHA(1234567) = 0x1500
-    The message then contains 0x1500 (plus a ticket, plus address)
+Specially a responder calculate a 10 bit Blake3 SHA of: 
+- The receivers public key
+- The token ID  
+- The previous-transaction-id of the response
 
-*Reply*
-The peer calculates the signature 0x1122334455667788. It then looks for the point 0x1500 in its database of head-of-chain token mappings. Scanning to the left and right of this point it checks the last byte of the SHA of the token-ids stored (remeber they are ordred by SHA not token-id) - and collect the narrowest set of SHA to form the signature. Like:
+Let's call this the "signature" of the reply. Split it into 10-bit chunks and then (starting from the requested SHA) scan the sorted token-SHAs database in decending order, stop at the first SHA that ends with the first 10-bit component of the signature - output the token and mapping as the first component of the signature. Then continue from that point until a SHA ending with the next chunk of the signature. And so on until the first 5 elements have been mapped. 
+Then repeat the process acending from requested token SHA.
 
-    Lets say:
-    SHA(4583838) = 0x19 88
-    SHA(7686868) = 0x18 77
-    SHA(8989858) = 0x17 66
-    SHA(1525445) = 0x16 55
-    SHA(0098765) = 0x14 44
-    SHA(1563547) = 0x13 33
-    SHA(9987647) = 0x12 22
-    SHA(3775775) = 0x11 11
+This forms the 10 signature-mappings.
 
-    The peer then puts this sequence in the reply:
-    4583838 => t8
-    7686868 => t7
-    8989858 => t6
-    1525445 => t5
-    0098765 => t4
-    1563547 => t3
-    9987647 => t2
-    3775775 => t1
+**Validation Process:**
+When the receiver sees this sequence, it can quickly:
+1. SHA each of the token IDs and check that they "surround" the SHA of the requested token (5 above, 5 below)
+2. Calculate the expected signature as described above.
+3. Check that the SHAs ends with the 10-bit chunks as described above.
 
-    As well as the mapping of 
-    1234567 => t0
+Failure to meet any of these requirements causes the response to be discarded as spam.
 
-And sends it to the network-address in the request-message - or the origin of the message if that field is empty.
+## Peer Quality and Proof of Storage
+Token-mapping responses form the foundation of the "Proof-of-storage" system underpinning the security of this system. The aim is to force peers to keep up-to-date storage of all/most token-mappings in its neighborhood.
 
-(where t0-t8 are transaction ids)
+The signature-scheme enables that.
 
-When the receiever sees this sequence it can quickly SHA each of the token-ids and check that they "surround" the SHA of the requested token.
-It can also quickly calculated the expected signature from the public-key of the sending peer together with the mapping returned, and check that the SHAs of the surrounding tokens in fact form the signature with their final bytes.
+From a single response a receiver can test the distance from the highest SHA to lowest. Since even distribution of mappings is a core foundation of SHA functions - its expected that taking a sample (as driven by the signature scheme) of approximatly the same number elements from all areas of the spectrum has a density directly propornal to the number of elements.
 
-Failure to live up to any of this discards the response as spam.
+On the other hand this also means that a peer that stores more elements will be able produce "narrower" signatures. So we will expect good quality peers to have signature-width below a certain limit. And this limit will be "global" - it should be observable across the spectrum.
 
-Further more will the receiver look at the "width" of the response-SHA's - the distance from the fist to the last SHA.
+A cheating responder could however with modern hardware calculate SHA's with the desired properties and still be able to make the reponse-timelimit. So more independant responses most be collected.
 
-    In the example above that "width" would be: 0x1988 - 0x1111 = 0x0877
+Given a set of responses the receiver can first check if they agree on the token-mapping of the requested SHA and gather responses until a +2 majority forms for a mapping.
 
-Since token SHAs by the properties of such functions are evenly distributed the "width" is expected to reflect the generally densitity of token-SHAs in the network. 
-Given some "experience" with the network, a receiver can judge the quality of the sending peer by the "width" - and discard below par responses.
+But the receiver can now also verify the quality of the majority responders more closely - and filter out poor responders. 
 
-Notice that the response does not have to have exactly 4 mappings on each side of the requested token-id. As long as it surronds it its valid.
+We will require that half of the mappings reported in the different responses are the same! For peers that store the same token-mappings this will be the natural outcome since they apply the same search across the same data. Even if they have very close dataset will the signature-search find the same tokens with high properbility.
 
-A man-in-middel would not be able to get a reply from another peer (different public key) and forward the same or another mapping using those surrounding ids. The signature would not match.
+If the signatures however do not have many overlapping token-mappings it will be because the peers did not store the same data. Which would be the case if they each contained samples of the "true set of token mappings".
 
-It will also be timeconsuming to calculate 8 made-up token-ids to live up to the required properties (closeness of hashes and final byte values in the required order). 
-Remember that the ticket times-out after only some milli seconds and that the "width" of the surrounding SHAs must be below a threshold (see below).
+Storing a lower density will show up if the receiver has compareable responses. The most reliable way to get same dataset is for all peers to collect and store as close to all token-mappings as possible.
 
-# Peer discovery
-Token mapping request/responses not only support "clients" who wants to check the current mapping of a token - it also forms the foundation of peer discovery and network formation.
+A lazy peer might also try to get the tokens from other peers and form a response based on that. But since the signature is calculated based on the receiving public-key, they would see another set of tokens for the same request. And it would require many requests to form a fradulent response - a lot more than can be achived in the time-window.
 
-Since peers can forward messages to better quilified or less loaded peers, this enable nodes to discover previously unknown peers. But requesters need to know SHAs of tokens or transaction-ids beforehand since the protocol does not allow *wildcard* searches.
+So anyone who wants to obtain the mapping from the best peers in the system, would run a series of such requests and filter the responses based on these principles.
 
-To facilitate discovery all peers participating in federations *SHOULD* create a transaction with a token matching its public-key. This token-chain may in the future serve further peer-related functionality/verifications, but currently only the first token-mapping is used. 
-We will refer to these transactions as "lampposts".
+**Secret Channel System:**
+Since receivers could respond from multiple peers to shortcut the process or manipulate mappings, the requester uses the ticket system to separate responses into "secret channels":
 
-## Bootstraping
-All new nodes need to be seeded with a set of known peers (out-of-band). The seed must contain both network-address and public keys to be able to communicate with those nodes. Users would obtain e.g. a 5-10 such from a semi-trusted source.
+- Instead of having one secret value to create tickets for requests, the peer maintains multiple secret values
+- Responses are tested with these to identify channels
+- Voting collects the last message per channel (regardless of the sending peer)
+- Since tickets are opaque to receivers, they have no way of detecting this
+- It provides no advantage to respond to the same request from multiple peers
+- Even if the receiver sees 2 different tickets for the same request ID, it could still be the same channel if the timer rolled the secret
 
-If the seed peers have correctly registered "lampposts" the bootstraping node can query those from those same peers (using the public-keys as tokens). 
+# Peer Discovery
 
-The public-keys of new peers are added to the process as well as token-ids and transaction-ids from valid mapping responses. As well as transactions pointing to previous transaction-ids and other token-ids contained therin etc.
+Token mapping request/responses not only support "clients" who want to check the current mapping of a token—they also form the foundation of peer discovery and network formation.
 
-If the seeds does not form a closed loop of peers this process should eventually produce responses from peers across the network, and across the spectrum. Users may also use out-of-band obtained token-ids to verify that the peers do indeed connect with the desired network.
+Since peers can forward messages to better qualified or less loaded peers, this enables nodes to discover previously unknown peers. However, requesters need to know SHAs of tokens or transaction IDs beforehand since the protocol does not allow *wildcard* searches.
 
-The new node runs this process until enough peers with demonstrated network-connectivity have been obtained.
+To facilitate discovery, all peers participating in federations *MUST* create a transaction with a token matching their public key. This token chain may in the future serve further peer-related functionality/verifications, but currently only the first token mapping is used.
 
-Different types of nodes may have different requirements for peers. E.g. client-type nodes will need to have set of peers for which they have tickets to submit to. Relay/query-only type of nodes may just want a large set of connected peers etc.
+We will refer to these transactions as "lampposts."
 
-We will proceed to consider nodes that want to get accepted as federation-peers.
+## Bootstrapping
 
-## Peer quality and PoW
-As described earlier the "width" of surrounding SHAs indicate the quality of the peer sending the response. This is the foundation of the "proof-of-work" (PoW) system used to select peers by all types of nodes in the system.
+All new nodes need to be seeded with a set of known peers (out-of-band). The seed must contain both network addresses and public keys to be able to communicate with those nodes. Users would obtain, for example, 5-10 such peers from a semi-trusted source.
 
-SHAs by the property of such functions distribute evenly. But locally individual SHAs may have very different distances. Given the "signature" requirements the token-ids needed are very unlikely to be the exact sequience of ids available in the database - but rather to span over a certan "width". Tests show that this width very closely follow the general density of the ids in the network - across all regions of the spectrum.
+If the seed peers have correctly registered "lampposts," the bootstrapping node can query those from the same peers (using the public keys as tokens).
 
-This enables nodes to assume that peers that keep up and hold their share of the spectrum, will be able to produce signatures of approximatly the same width.
+The public keys of new peers are added to the process, as well as token IDs and transaction IDs from valid mapping responses, along with transactions pointing to previous transaction IDs and other token IDs contained therein.
 
-Each peer initiates its own requests using SHAs of token-ids or transaction-ids that it already knows about - and must never process responses for something it didn't request. To be able to reply a peer need to know the token-id of the SHA - and then be able to produce a satisfactory signature within the timelimit and of the expected width.
+If the seeds do not form a closed loop of peers, this process should eventually produce responses from peers across the network and across the spectrum. Users may also use out-of-band obtained token IDs to verify that the peers do indeed connect with the desired network.
 
-*We will assume that the most econnomical and rational way* to comply with this is to capture and store enough *common* token mappings in the region of the peer-address. Even advesary, malisious actors, would recognize this and either try to take over existing peers or comply with the intentions of the system - before attempting to manipulate mappings.
+The new node runs this process until enough peers with demonstrated network connectivity have been obtained.
 
-Irrational or faulty peers will either get messages rejected or have to spend large amount of time and energy to produce compliant responses (unlikely for faulty peers).
+Different types of nodes may have different requirements for peers:
+- Client-type nodes need a set of peers for which they have tickets to submit to
+- Relay/query-only type nodes may just want a large set of connected peers
 
-Thus this leads to a network of peers that wants to play be the rules for a very large majority of the tokens - so it will be generally useful for users of those tokens. We will later look into how to fight issues with manipulation of specific tokens.
+We will proceed to consider nodes that want to get accepted as federation peers.
 
-### How to obtain initial mappings
-New peers can obtain the needed mappings by getting token mapppings around its own address. Upon receiving a response it should by default record all the mapping in the response in its database. It should then issue request for some of the new token-ids and continue in this fashion until it gets to a sufficient density.
+### How to Obtain Initial Mappings
 
-When it gets responses for mappings that it has already recorded it should compare the mapping. If there is a conflict it should run a voting-round (described below) for the true mapping and select the "winner". In addition it should get all head-of-chain transactions and store those to enable it to validate new transactions eventually.
+New peers can obtain the needed mappings by getting token mappings around their own address. Upon receiving a response, they should by default record all mappings in the response in their database. They should then issue requests for some of the new token IDs and continue in this fashion until they reach sufficient density.
 
-The general principle for manageing the token-mapping database is to store all response-mappings. When conflicts are observed, run voting. Continuesly run a "reaper" process that scans over the token-mapping database and prune elements with a probability based on how distant the token-id is from the address of the peer - and how long time since the mapping was created.
+When receiving responses for mappings that have already been recorded, the peer should compare the mappings. If there is a conflict, it should run a voting round (described below) for the true mapping and select the "winner." In addition, it should get all head-of-chain transactions and store those to enable validation of new transactions eventually.
 
-If the database gets "thin" the bootstapping process can start again to obtain mappings across the spectrum.
+**Database Management Principles:**
+1. Store all response mappings
+2. When conflicts are observed, run voting
+3. Continuously run a "reaper" process that scans the token-mapping database and prunes elements with probability based on:
+   - How distant the token ID is from the peer's address
+   - How long since the mapping was created
 
-### Stall or false mappings
-A peer may know enough common token-ids to respond to requests, but either have out-of-date mapping or try to manipulate mapping of tokens to other transaction-ids than the "true" head-of-chain. This would enable "double-spending" and other unwanted scenarios.
+If the database gets "thin," the bootstrapping process can start again to obtain mappings across the spectrum.
 
-To fight these types of peers, we will collect multiple responses for each request and only accept majority mappings.
+### Stale or False Mappings
 
-Peers must continuously run a peer-collecting and validating process after the initial bootstrapping. It *should* do as follows:
+A peer may know enough common token IDs to respond to requests but either have out-of-date mappings or try to manipulate mappings of tokens to other transaction IDs than the "true" head-of-chain. This would enable "double-spending" and other unwanted scenarios.
 
-Genereate a random 256 bit number and find the closest token-id in the token-mapping database and request mappings for that. The request should be send to known peers with addresses close to the token-ids as well as randomly selected peers - e.g. selecting from peers recently heard from etc. (piggyback other traffic).
+To combat these types of peers, we will collect multiple responses for each request and only accept majority mappings.
 
-Upon receiving responses a peer must collect and compare the mappings. And when a majority forms (+2 for a specifc) mapping - pick from the set of peers voting for that value, the one with the address *closest* to the requested token-id. Also fetch and store (if not already) the transaction being pointed to. At the same time flip any trusted peers that voted differently into "prospects" (TODO check if this should really be done / consequences).
-If no majority has formed within some timelimit, discard the voting-state.
+**Continuous Validation Process:**
+Peers must continuously run a peer-collecting and validating process after initial bootstrapping:
 
-Given that receivers of request could respond from multiple peers to shortcut the process or manipulate the mapping, the requester will use the ticket system to seperate responses into "secret channels". This is how it works:
+1. Generate a random 256-bit number and find the closest token ID in the token-mapping database
+2. Request mappings for that token ID from:
+   - Known peers with addresses close to the token IDs
+   - Randomly selected peers (e.g., peers recently heard from)
+   - Piggyback on other traffic
 
-Instead of just having one secret-value to create tickets for requests - the peer maintains a number of them. Responses will then be tested with those to identify the channels - and voting collect the last message per channel (regardless of the sending peer). Since tickets are opaque to receivers they will have no way of detecting that - and it will not gain any advantage by responding to the same request from multiple peers. Even if the receiver sees 2 different tickets for the same request id, it could still be the same channel just that the timer rolled the secret.
+3. Upon receiving responses:
+   - Collect and compare the mappings
+   - When a majority forms (+2 for a specific mapping):
+     - Pick from the set of peers voting for that value, the one with the address *closest* to the requested token ID
+     - Fetch and store (if not already) the transaction being pointed to
+     - Demote any trusted peers that voted differently to "prospects" (TODO: check consequences)
+   - If no majority forms within the time limit, discard the voting state
 
-## Introducing new peers to the system
-It follows from the above that a completly new peer will have no chance of getting requests, without help - and hence of getting accepted into the network. For that reason peers can send token-mapping responses with a 0-ticket. This signals that its an "introduction" messages.
 
-The main elements of the token-mapping message is the same. But the signature is calculated differently. In this case its the 8 byte SHA of the public-key of the sender, the public-key of the receiver and finally the head-of-chain transaction-id of the "lamppost" as reported in the message (TODO plus the IV of the message?). This ensures that a new peer have to present different mappings to different receivers.
+## Introducing New Peers to the System
 
-As with messages in general there is no garantee that receiving peers will process such messages.
+It follows from the above that a completely new peer will have no chance of getting requests without help—and hence no chance of getting accepted into the network. For this reason, peers can send token-mapping responses with a 0-ticket, signaling that it's an "introduction" message.
 
-If the message is processed, all the rules outlined earlier are checked - and if the new peer abide, its added as a "prospect" peer (and its network address is recorded). Prospects do not get Vote-messages or forwarded token-mapping request from the network (but do receive get-transaction), but they have a chance of getting request-messages from the PoW process - and thus of getting accepted as a trusted peer.
-Peers for which "introduction" messages have been send are put in a "pending" state, such that if an "introduction" comes back its known that the connection is usable.
+**Introduction Message Format:**
+The main elements of the token-mapping message are the same, but the signature is calculated differently:
+- 8-byte SHA of:
+  - Public key of the sender
+  - Public key of the receiver  
+  - Head-of-chain transaction ID of the "lamppost" as reported in the message
+  - (TODO: plus the IV of the message?)
 
-So a new peer must keep up with the network until it eventually starts seeing request messages from other peers, it will be in a "replicator" state until it can rely on Vote messages to keep its state up-to-date.
+This ensures that a new peer has to present different mappings to different receivers.
 
-Keeping up works much like the PoW process. Only in this case the random number to lookup is in a smaller range around the address of the peer. And the frequency of requests should be higher.
+As with messages in general, there is no guarantee that receiving peers will process such messages.
 
-## Trusted peers
-Nodes maintains a set of *trusted peers* across the spectrum - but with increasing density closer to its own address. This facilitate more effecient routing and voting by focusing traffic and keeping neighbours aware of eachother.
+**Processing Introduction Messages:**
+If the message is processed:
+1. All the rules outlined earlier are checked
+2. If the new peer complies, it's added as a "prospect" peer (and its network address is recorded)
+3. Prospects do not get:
+   - Vote messages
+   - Forwarded token-mapping requests from the network
+4. Prospects do receive:
+   - Get-transaction messages
+   - A chance of getting request messages from the proof-of-storage process
+   - Thus a path to getting accepted as a trusted peer
 
-Trusted peers can submit transactions *without tickets* and vote for its neighbourhood. This is the main benefit of (or *payment* for) becoming a trusted peer of the network. They pay for the ability to submit new transactions by offering storage for a slice of the data in the network.
+Peers for which "introduction" messages have been sent are put in a "pending" state, so if an "introduction" comes back, it's known that the connection is usable.
 
-When a peer is accepted an "introduction" message is send back. Peers will thus expect to be trusted by the sender upon receiving such a message. Peers periodically sends "introduction" messages to its set of trusted peers. Upon receiving such a message from an already trusted or prospect peer we just updates the last-heard-from state. 
-If no such message has arrived for a while from a trusted peer, we should assume that either its gone or has removed us from its set of peers. In those cases a fresh "introduction" message can be send and the peer put into "pending" mode.
+**Replicator State:**
+A new peer must keep up with the network until it eventually starts seeing request messages from other peers. It will be in a "replicator" state until it can rely on Vote messages to keep its state up-to-date.
 
-Valid responses to get-requests from all trusted and prospect peers add to a quality-score and update last-heard-from.
+Keeping up works much like the proof-of-storage process, except:
+- The random number to look up is in a smaller range around the peer's address
+- The frequency of requests should be higher
 
-The aim is motivate operators to continuesly create new peers and try to get them added as prospects - and evetully upgrade to trusted peers. This ensures that an opeartor maintains the ability to submit transactions even as trusted peers from time to time will "loose" to other peers.
+## Trusted Peers
 
-Already operating a trusted peer also provides the ability to respond to request using new peers.
+Nodes maintain a set of *trusted peers* across the spectrum—but with increasing density closer to their own address. This facilitates more efficient routing and voting by focusing traffic and keeping neighbors aware of each other.
 
-Note that an operator can share some parts of the storage between its peers and thus lower the marginal cost.
+**Benefits and Responsibilities:**
+Trusted peers can:
+- Submit transactions *without tickets*
+- Vote for their neighborhood
 
-## Selecting trusted peers
-Its not desirable to have peers use or know all other peers in the entire network - even if this is the most effieceint routing configuration. The reason is to keep message routing in the system less predictable and thus safer. By the laws of physics some peers will have longer network latencies between them and networks may fail or become unavailble. To work around this its better for many overlapping, random graphs to form between the available peers.
+This is the main benefit of (or *payment* for) becoming a trusted peer of the network. They pay for the ability to submit new transactions by offering storage for a slice of the data in the network.
 
-Secondly the aim of this system is to accumodate global networks of millions of peers - so it might also be impractical in the longer term to keep state for each (even if the required state per peer is rather limited compared to modern memory sizes).
+**Trust Establishment:**
+1. When a peer is accepted, an "introduction" message is sent back
+2. Peers expect to be trusted by the sender upon receiving such a message
+3. Peers periodically send "introduction" messages to their set of trusted peers
+4. Upon receiving such a message from an already trusted or prospect peer, only the last-heard-from state is updated
+5. If no such message has arrived for a while from a trusted peer, assume that either:
+   - It's gone, or
+   - It has removed us from its set of peers
+   - In these cases, send a fresh "introduction" message and put the peer into "pending" mode
 
-When map-voting rounds are held and won - the peer will check if any of the winning peers are unknown, and if the area of the peer(s) are underpopulated - then send "introduction" messages to those and store them as pending.
+**Quality Tracking:**
+Valid responses to get-requests from all trusted and prospect peers:
+- Add to a quality score
+- Update last-heard-from timestamp
 
-When a pending peer returns with an "introduction" message - its turned into a trusted peer.
+**Incentive Structure:**
+The aim is to motivate operators to continuously:
+1. Create new peers and try to get them added as prospects
+2. Eventually upgrade them to trusted peers
 
-From time to time a node should prune trusted, pending and prospect peers that it has not heard from in a while or if the area they occupy is too densly populated. At the same time, if it notices thinly populated areas with prospect peers - it should send "introduction" messages and turn them into trusted peers. If it has more prospects to choose from, select the one with the latest heard-from.
+This ensures that an operator maintains the ability to submit transactions even as trusted peers occasionally "lose" to other peers.
+
+Operating a trusted peer also provides the ability to respond to requests using new peers.
+
+**Note:** An operator can share some parts of the storage between its peers and thus lower the marginal cost.
+
+## Selecting Trusted Peers
+
+It's not desirable to have peers use or know all other peers in the entire network—even if this is the most efficient routing configuration. The reasons are:
+
+1. **Security**: Keep message routing in the system less predictable and thus safer
+2. **Network Reality**: By the laws of physics, some peers will have longer network latencies, and networks may fail or become unavailable. It's better for many overlapping, random graphs to form between available peers
+3. **Scalability**: The aim is to accommodate global networks of millions of peers—it might be impractical in the longer term to keep state for each peer (even if the required state per peer is limited compared to modern memory sizes)
+
+**Selection Process:**
+1. When map-voting rounds are held and won:
+   - Check if any of the winning peers are unknown
+   - If the area of the peer(s) is underpopulated:
+     - Send "introduction" messages to those peers
+     - Store them as pending
+
+2. When a pending peer returns with an "introduction" message:
+   - Turn it into a trusted peer
+
+**Peer Management:**
+From time to time, a node should:
+
+**Prune peers that:**
+- Haven't been heard from in a while
+- Occupy areas that are too densely populated
+
+**Promote peers when:**
+- Thinly populated areas have prospect peers
+- Send "introduction" messages and turn them into trusted peers
+- If multiple prospects are available, select the one with the latest heard-from timestamp
 
 # Consensus
-We have already touched upon how peers collect mapping-responses, store them and vote if they see conflicting mappings. Tests show that getting +2 vote on equal mappings in a randomized network of peers indicate that this mapping dominates by far the neighbourhood of the token.
 
-The same principle is applied when submitting new transactions to the network. With some additions.
+We have already discussed how peers collect mapping responses, store them, and vote if they see conflicting mappings. Tests show that getting +2 votes on equal mappings in a randomized network of peers indicates that this mapping dominates by far the neighborhood of the token.
 
-When a node wants to submit a new transaction to the network it picks peers that it *believe* has it registered as either a trusted peer or it will accept the ticket provided. So the initial peer(s) to receive such a transaction-id will not know the content of the transaction (incl signatures) - so they will immediatly request the transaction-content from the submitting node (if Loadbalancing permits it).
+The same principle is applied when submitting new transactions to the network, with some additions.
 
-Once the actual transaction is received the peer now knows which token-mappings are affected. So for each token it Votes/forward the transaction to peers in the areas around those (reusing if they overlap). It also indicates with the Vote if it believes the mapping represents a valid step on the token-chain. That would be: The previous-transaction-id matches what is recorded in its database - or that the timestamp/counter of the transaction (not descussed before) is less than the one recorded (its an out-of-order update).
+## Transaction Submission Process
 
-If a peer has already commited the submitted transaction - it should imediatly repsond with all-possitive vote to the caller (and indicate that it should not receive further votes for this).
+**Initial Submission:**
+1. When a node wants to submit a new transaction, it picks peers that it *believes* have it registered as either:
+   - A trusted peer, or  
+   - Will accept the ticket provided
+2. The initial peer(s) receiving the transaction ID will not know the transaction content (including signatures)
+3. They will immediately request the transaction content from the submitting node (if load balancing permits)
 
-Peers also submits the transaction to the area around the transaction-id itself. This way the transaction will be findable without knowing any token-ids from it AND the process gets a pseudo-random witness to also distribute the transaction to the network.
+**Vote Distribution:**
+Once the actual transaction is received:
+1. The peer knows which token mappings are affected
+2. For each token, it votes/forwards the transaction to peers in the areas around those tokens (reusing if they overlap)
+3. It indicates with the vote if it believes the mapping represents a valid step on the token chain:
+   - The previous-transaction-id matches what is recorded in its database, OR
+   - The timestamp/counter of the transaction is less than the one recorded (it's an out-of-order update)
 
-Now much like with the voting of mapping-responses, the peer keeps a log of votes from trusted peers. Newer votes replace older ones.
+**Already Committed Transactions:**
+If a peer has already committed the submitted transaction, it should immediately respond with an all-positive vote to the caller (and indicate that it should not receive further votes for this).
 
-Parallel to the process of posting votes the peer collects all previous transactions - and validate that the timestamp/counter in the new transaction is larger than anyone recorded in each of those (and less than 2 hours into the future) AND then it verifies all signatures. If any of these checks does not hold - the peer will activly start to vote "no" for the transaction (and block it from commiting).
+**Witness Distribution:**
+Peers also submit the transaction to the area around the transaction ID itself. This way:
+- The transaction will be findable without knowing any token IDs from it
+- The process gets a pseudo-random witness to also distribute the transaction to the network
 
-IF all tokens get a +2 vote from their respective neithbourhoods - the peer commits the transaction. The actual "witness" area votes does not count as such (not expected to have up-to-date mappings) but we track that we get votes back from at least 2 peers in that area.
+## Voting and Validation
 
-When commiting a transaction the token-mapping database is updated. If the timestamp/counter of the previous recording is greater than the new transaction this update will be regarded as out-of-order (no change to that token-mapping is done). Mappings created from just recording mapping responses with unknown transactions has 0-timestamp (so will always be overriden). Mappings for which conflict voting has run will also have fetched the transaction and hence have a timestamp/counter from that.
+**Vote Tracking:**
+Much like with the voting of mapping responses, the peer keeps a log of votes from trusted peers. Newer votes replace older ones.
 
-## How can this work?
-The peers maintains a set of trusted peers across the spectrum - but with increasing density closer to its own address. This means that peers in the same area will tend to trust eachother and thus be sending votes between them - and eventually decide the majority. Nodes not in an area will eventually get "commited" messages in response from the core peers of the area - or no answer if they can not agree on it (in which case transactions time out). 
+**Parallel Validation:**
+Parallel to the process of posting votes, the peer:
+1. Collects all previous transactions
+2. Validates that the timestamp/counter in the new transaction is:
+   - Larger than any recorded in each of those previous transactions
+   - Less than 2 hours into the future
+3. Verifies all signatures
+4. If any of these checks fail, the peer will actively vote "no" for the transaction (and block it from committing)
 
-So a commitable transaction will propagate that state back through the peers leading to the origin. As demonstrated by simulation.
+**Commit Criteria:**
+IF all tokens get a +2 vote from their respective neighborhoods, the peer commits the transaction. The actual "witness" area votes do not count as such (not expected to have up-to-date mappings), but we track that we get votes back from at least 2 peers in that area.
 
-# Load balancing
-Aim is to limit some nodes from pumping unporportinal many transactions into the system. Therefor peers keep a count of new transactions initiated by its trusted peers - and employ other load-balancing techniques for "client type" nodes. If a sender exeeds its limit the transaction is discarded.
+**Database Updates:**
+When committing a transaction, the token-mapping database is updated:
+- If the timestamp/counter of the previous recording is greater than the new transaction, this update is regarded as out-of-order (no change to that token mapping is done)
+- Mappings created from just recording mapping responses with unknown transactions have 0-timestamp (so will always be overridden)
+- Mappings for which conflict voting has run will also have fetched the transaction and hence have a timestamp/counter from that
 
-With some interval, the counters are reset. And the limits ajusted to the desired overall load for the system.
+## How Can This Work?
 
-# Ticket schemes for clients
-The majority of the nodes are expected to be "clients" with no ability or desire of participating in federation. Such nodes can freely query for transactions and mappings but to submit transactions they need tickets to one or more peers.
+Peers maintain a set of trusted peers across the spectrum—but with increasing density closer to their own address. This means that:
 
-We envision a userbase where service-providers offer specialized apps - and in return for using the network, they operate a number of peers for which they control access. They are free to implement the type of ticket system appropriate for their useccase. 
+1. **Local Consensus**: Peers in the same area will tend to trust each other and thus send votes between them, eventually deciding the majority
 
-Since a ticket is just an opaque 256 bit value, different schemes are possible. Here follows some for inspiration:
+2. **Propagation**: Nodes not in an area will eventually get "committed" messages in response from the core peers of the area, or no answer if they cannot agree (in which case transactions time out)
 
-## API key
-Trusted clients are issued an API key. Potentially used together with the public-key of the client-node (if that is stable). A variation of this is to mainly use the public-key - but leave something in the ticket field to distinquish it from peer-traffic.
+3. **State Propagation**: A committable transaction will propagate that state back through the peers leading to the origin
 
-This of cause makes it possible for the operator to link all transactions back to the user. In many such scenarios this is anyway possible given a parallel data-system.
+**This has been demonstrated by simulation.**
 
-## Blinded tickets
-In some cases its not desireable for the operator to be able to track the transactions of indivial users. In such cases an operator may use an out-of-band (web/app) to cryptograhically "blind" tickets together with users. E.g.
+# Load Balancing
 
-A user generates an ephemeral EC key, B. Then takes the transaction-id it wants to process without detection and do a scalar mult with B, call it H.
-Then going to the operator site with H the user pays for one transaction, the operator applies its own secret EC key O to H yielding S1.
-The user can now apply the inverse of B to remove it - leaving S2.
+The aim is to limit some nodes from pumping disproportionately many transactions into the system. Therefore, peers:
 
-When submitting the transaction to an operator controlled peer using S2 as ticket, the system applies the inverse of O and checks that this is equal to the transaction-id, without being able to link S2 or the transaction-id to H.
+1. Keep a count of new transactions initiated by their trusted peers
+2. Employ other load-balancing techniques for "client type" nodes
+3. Discard transactions if a sender exceeds its limit
 
-Instead of a single transaction this could also be done for eg. a SHA of a users short-lived public-key and a time-range-indicator-value e.g. todays date. Upon recieving such a ticket the peer inverse the ticket and checks that it matches the client public-key hashed with the current time-range-indicator. This would of cause allow any number of transactions during that time-range.
+At regular intervals:
+- Counters are reset
+- Limits are adjusted to the desired overall load for the system
 
-Other variations of this scheme can lock to other such hash-commitments.
+# Ticket Schemes for Clients
 
-## PoW
-In the same spirit. An open and permission-less system is also possible. Here a client could be be asked to provide a ticket which hashed together with the transaction-id would result in a value with some property, e.g. starts with some number of 0-bits etc.
+The majority of nodes are expected to be "clients" with no ability or desire to participate in federation. Such nodes can:
+- Freely query for transactions and mappings
+- Submit transactions only if they have tickets to one or more peers
 
-Its easy to test for the peer-system - but would be timeconsuming up to some level for users to generate. So this sort of system would not allow the operator to profit from the transaction - but could rate limit an otherwice open gateway.
+We envision a user base where service providers offer specialized apps—and in return for using the network, they operate a number of peers for which they control access. They are free to implement the type of ticket system appropriate for their use case.
 
-# Keeping mappings and transactions available
-The system spreads transactions and mappings to a number of peers. 
+Since a ticket is just an opaque 256-bit value, different schemes are possible. Here are some examples for inspiration:
 
-New peers that wants to enter the network runs in "replicator" mode - standby to take over failing peers.
+## API Key
 
-The general contract with users is that the main priority is to keep the head-of-chains available. But that some level of history can be expected. Usescases should try to work with this - so providing e.g. history of documents and hashing them to new tokens such that head-of-chain also proves that previous versions existed as stated.
+Trusted clients are issued an API key, potentially used together with the public key of the client node (if that is stable). A variation is to mainly use the public key but leave something in the ticket field to distinguish it from peer traffic.
 
-TODO its an open question to test and qualify how well this will work or if further processes are needed to keep availablity to desired levels.
+This, of course, makes it possible for the operator to link all transactions back to the user. In many scenarios, this is anyway possible given a parallel data system.
+
+## Blinded Tickets
+
+In some cases, it's not desirable for the operator to be able to track the transactions of individual users. In such cases, an operator may use an out-of-band system (web/app) to cryptographically "blind" tickets together with users.
+
+**Example Process:**
+1. A user generates an ephemeral EC key, B
+2. The user takes the transaction ID it wants to process without detection and performs scalar multiplication with B, call it H
+3. Going to the operator site with H, the user pays for one transaction
+4. The operator applies its own secret EC key O to H, yielding S1
+5. The user can now apply the inverse of B to remove it, leaving S2
+
+**Transaction Submission:**
+When submitting the transaction to an operator-controlled peer using S2 as a ticket:
+- The system applies the inverse of O and checks that this equals the transaction ID
+- It cannot link S2 or the transaction ID to H
+
+**Time-Based Variation:**
+Instead of a single transaction, this could also be done for:
+- A SHA of a user's short-lived public key
+- A time-range-indicator value (e.g., today's date)
+
+Upon receiving such a ticket:
+- The peer inverses the ticket
+- Checks that it matches the client public key hashed with the current time-range-indicator
+- This would allow any number of transactions during that time range
+
+Other variations of this scheme can lock to other hash commitments.
+
+## Proof of Work
+
+In the same spirit, an open and permissionless system is also possible. Here a client could be asked to provide a ticket which, when hashed together with the transaction ID, would result in a value with some property (e.g., starts with some number of 0-bits).
+
+**Properties:**
+- Easy to test for the peer system
+- Time-consuming up to some level for users to generate
+- Would not allow the operator to profit from the transaction
+- Could rate-limit an otherwise open gateway
+
+# Keeping Mappings and Transactions Available
+
+The system spreads transactions and mappings to a number of peers.
+
+New peers that want to enter the network run in "replicator" mode—standing by to take over failing peers.
+
+**Availability Contract:**
+The general contract with users is that:
+- **Main priority**: Keep the head-of-chains available
+- **Secondary**: Some level of history can be expected
+
+Use cases should try to work with this—for example, providing history of documents and hashing them to new tokens such that the head-of-chain also proves that previous versions existed as stated.
+
+**TODO:** It's an open question to test and qualify how well this will work or if further processes are needed to keep availability at desired levels.
 
 # Security
-Since transaction chains are hashed like blockchains and transactions are signed by commen crypto schemes - isolated client behaviour does not seem to be the biggest threat to the system.
 
-Tokens in this system are also not valuable by themselfs (unlike other blockchain-style networks). So it does not make sense to "steal" random tokens without knowing what they are. And since related data is not in the system, it does not reveal such properties by itself.
+Since transaction chains are hashed like blockchains and transactions are signed by common crypto schemes, isolated client behavior does not seem to be the biggest threat to the system.
 
-Hence the main threat to the system is manipulation of individual tokens with some known (to the manipulators) quality. Collution between malisious clients and operators poses the greatest threat.
+Tokens in this system are also not valuable by themselves (unlike other blockchain-style networks). So it does not make sense to "steal" random tokens without knowing what they are. Since related data is not in the system, it does not reveal such properties by itself.
 
-To take over control of individual token-mappings, an operator needs to contol the neighborhood of such a token. During the scam the peers could be made to report false mappings (maybe even just to a selected user/group).
+**Main Threat:**
+The main threat to the system is manipulation of individual tokens with some known (to the manipulators) quality. Collusion between malicious clients and operators poses the greatest threat.
+
+## Attack Vectors
+
+To take over control of individual token mappings, an operator needs to control the neighborhood of such a token. During the attack, the peers could be made to report false mappings (maybe even just to a selected user/group).
 
 This can be done in two basic ways:
 
-1. Create new peers for the neighborhood.
-2. Take over existing peers and keep them running while the manipulation takes place.
+### 1. Create New Peers for the Neighborhood
 
-Ad.1 The adversary would have to find a suffient number of key-pairs where the public-key has an Argo2 hash in the desired range. This will be a very time and ressource consuming activity also given that maybe 10-20 such pairs are needed to form a majority.
+**Process:**
+- The adversary would have to find a sufficient number of key pairs where the public key has an Argon2 hash in the desired range
+- This will be a very time and resource-consuming activity (maybe 10-20 such pairs are needed to form a majority)
+- The new peers would then have to out-compete the existing peers in the area
+- They must go through the whole process outlined above
 
-The new peers would then have to out-compete the existing peers in the area - going through the whole process outlined above.
+**Assessment:** This is expected to be a very expensive endeavor.
 
-All-in-all this is expected to be a very expensive endvour.
+### 2. Take Over Existing Peers
 
-Ad.2 The adversary seizes control of (hack or bribe) a majority set in the desired area. 
+**Process:**
+The adversary seizes control of (hacks or bribes) a majority set in the desired area.
 
-This is very difficult to completly safegard against and even detect.
+**Assessment:** This is very difficult to completely safeguard against and even detect.
 
-But some mitigations exisits.
+## Mitigations
 
-- Use low-value tokens. If the gain from stealing a specific token is below some limit the cost of stealing it will out-weight it.
-- Short-lived tokens. Given the nature of this network its possible to destroy and create new tokens as part of normal state-changes - effectivly moving the ownership area around the network.
-- Use multiple tokens to represent a valuable asset - thus increase the number of peers that has to be hacked or bribed. Users would then check head-of-chain of all tokens and make sure they align.
+Several mitigations exist:
 
-There might also be signs like:
+**Technical Mitigations:**
+- **Low-value tokens**: If the gain from stealing a specific token is below some limit, the cost of stealing it will outweigh it
+- **Short-lived tokens**: Given the nature of this network, it's possible to destroy and create new tokens as part of normal state changes—effectively moving the ownership area around the network
+- **Multiple tokens**: Use multiple tokens to represent a valuable asset, thus increasing the number of peers that have to be hacked or bribed. Users would then check the head-of-chain of all tokens and ensure they align
 
-- Hacks and bribe are illegal and lawinforcement or other autherteries could intervene or warn of the fact.
-- Conflicting mappings when doing get-mapping should be rare after a short settlement period. So seeing different values from otherwice trusted peers could be a warning-sign - so wait with critical transactions or perform further investigations etc.
+**Detection Indicators:**
+- **Legal consequences**: Hacks and bribes are illegal, and law enforcement or other authorities could intervene or warn of the fact
+- **Conflicting mappings**: When doing get-mapping, conflicting results should be rare after a short settlement period. Seeing different values from otherwise trusted peers could be a warning sign—wait with critical transactions or perform further investigations
 
 
 # Performance
-TODO
 
-# Example usecases
-The general nature of the system allows it to support many different usecases together with in some cases parallel storage-networks.
+**TODO:** Performance analysis and benchmarks need to be conducted and documented.
+
+# Example Use Cases
+
+The general nature of the system allows it to support many different use cases, together with parallel storage networks in some cases.
 
 ## Tickets
-Create a token for each ticket and give ownership. Can be transfered. When used destroy the token.
+
+**Process:**
+1. Create a token for each ticket and assign ownership
+2. Token can be transferred
+3. When used, destroy the token
 
 ## Payment
+
+**Setup:**
 A trusted issuer creates a "note" with value v. The note itself is a document that lives in a parallel network (as described).
 
-To use a note split it. Destroy the original token - and in the same transaction create 2 documents each with the value on both sides. Each document must contain the history leading up to that point (so no more than logaritmic). Hash the new documents and in the same transaction that destroyes the original create these new tokens.
+**Usage Process:**
+1. **Split the note:**
+   - Destroy the original token
+   - In the same transaction, create 2 documents each with value on both sides
+   - Each document must contain the history leading up to that point (logarithmic complexity)
+   - Hash the new documents and create these new tokens in the same transaction that destroys the original
 
-To validate a "note" look through the history and validate that it correctly splits the value at each point - and checking the state of recent transactions with the network.
+2. **Validation:**
+   - Look through the history and validate that it correctly splits the value at each point
+   - Check the state of recent transactions with the network
 
-To redeem the value of a split document - go to the issuer and destroy a "note" together.
+3. **Redemption:**
+   - Go to the issuer and destroy a "note" together
 
 ## Identity
-Create an identity token - SHA of some name/id - and submit a founding transaction to set the first public-key hash. Then submit a next-transaction on the token to register the real public key and a signature. 
 
-Now the token points to a SHA of the next public key and the previous transaction. Fetch the previous transaction and use the visible public-key to verify signatures from the identity.
+**Setup Process:**
+1. Create an identity token—SHA of some name/ID
+2. Submit a founding transaction to set the first public key hash
+3. Submit a next-transaction on the token to register the real public key and a signature
 
-To roll the key - submit a new transaction. This forms a new "current-next" pair.
+**Usage:**
+- The token now points to a SHA of the next public key and the previous transaction
+- Fetch the previous transaction and use the visible public key to verify signatures from the identity
+
+**Key Rotation:**
+- Submit a new transaction
+- This forms a new "current-next" pair
 
 ## DNS
-Use the fact that a token-id is 32 bytes (256 bits). This is large enough to contain either an IP4 or IP6 address plus port, plus a random-part.
 
-Then create a token as the e.g. SHA of a domain-name. Users lookup the last transaction of this token and gets the IP/Ports of the host as some of the other tokens in the transaction.
+**Concept:**
+Use the fact that a token ID is 32 bytes (256 bits)—large enough to contain either an IPv4 or IPv6 address plus port, plus a random part.
 
-Like in the Identity case the public keys of previous transactions can be used for signing.
+**Process:**
+1. Create a token as the SHA of a domain name
+2. Users look up the last transaction of this token
+3. Get the IP/ports of the host as some of the other tokens in the transaction
 
-## Process/Document flow
-For some process or document that must be tracable to parties for which the id (token) makes sense. Register the first version.
-Then for each step/change - destroy the old token - and create the new state.
+**Authentication:**
+Like in the Identity case, the public keys of previous transactions can be used for signing.
 
-Possibly keeping a stable id across all transactions to find the last update.
+## Process/Document Flow
+
+**Use Case:**
+For processes or documents that must be traceable to parties for which the ID (token) makes sense.
+
+**Process:**
+1. Register the first version
+2. For each step/change:
+   - Destroy the old token
+   - Create the new state
+3. Possibly keep a stable ID across all transactions to find the last update

@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **ecRust** (echo-consent), a Rust implementation of a distributed consensus protocol for token-based transactions. The system simulates a network of peers that vote on and commit transaction blocks containing token transfers.
 
+## Claude Code guidelines
+
+Ignore content under the folder "Scratch" - its outdated.
+WHen asked to make design documents DO NOT include any work schedule or rollout plans. DO NOT compare to the current implementation - just focus on the concept and provide analasis and mathematical proofs.
+
+Diagrams should be in "mermaid".
+
+Formulas should use Latex formatting.
+
 ## Core Architecture
 
 The system consists of several key components:
