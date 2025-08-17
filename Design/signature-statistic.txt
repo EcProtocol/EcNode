@@ -1,0 +1,569 @@
+/usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: 48804aaa93e9b4a905464a529
+Signature chunks (10 bits each): [297, 297, 326, 577, 842, 934, 659, 682, 4, 290]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [99, 99, 99, 99, 98, 98, 97, 96, 96, 95]
+  median width: 4.185142e+75 min: 4.185142e+75 max: 4.185142e+75
+
+Testing density: 95%
+  freq: [98, 96, 95, 95, 92, 92, 88, 86, 83, 79]
+  median width: 4.185142e+75 min: 4.185142e+75 max: 6.605674e+75
+
+Testing density: 90%
+  freq: [94, 89, 88, 87, 81, 80, 80, 71, 65, 62]
+  median width: 4.185142e+75 min: 4.185142e+75 max: 7.260326e+75
+
+Testing density: 80%
+  freq: [82, 81, 80, 76, 65, 60, 56, 56, 43, 39]
+  median width: 6.179695e+75 min: 4.185142e+75 max: 8.065585e+75
+
+Testing density: 50%
+  freq: [54, 48, 46, 36, 36, 31, 29, 29, 27, 25]
+  median width: 1.048612e+76 min: 6.605674e+75 max: 1.543683e+76
+
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: d704e542efb8dbaf9c0f32c5a
+Signature chunks (10 bits each): [90, 203, 15, 999, 442, 739, 751, 336, 78, 860]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 100, 99, 99, 99, 98, 98, 96, 96]
+  median width: 5.880426e+75 min: 5.880426e+75 max: 5.880426e+75
+
+Testing density: 95%
+  freq: [96, 96, 92, 91, 91, 91, 91, 89, 87, 87]
+  median width: 5.880426e+75 min: 5.880426e+75 max: 6.840691e+75
+
+Testing density: 90%
+  freq: [90, 90, 89, 89, 86, 81, 81, 78, 78, 75]
+  median width: 5.880426e+75 min: 5.880426e+75 max: 8.037849e+75
+
+Testing density: 80%
+  freq: [86, 81, 79, 78, 70, 66, 66, 66, 66, 49]
+  median width: 6.010287e+75 min: 5.880426e+75 max: 8.062394e+75
+
+Testing density: 50%
+  freq: [55, 36, 34, 28, 27, 25, 25, 24, 23, 23]
+  median width: 8.082310e+75 min: 3.395089e+75 max: 1.252700e+76
+
+Testing density: 40%
+  freq: [44, 32, 27, 26, 21, 20, 20, 20, 19, 18]
+  median width: 8.057766e+75 min: 3.395089e+75 max: 1.322754e+76
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: 32cc02934b8b1fffbf40993d5
+Signature chunks (10 bits each): [981, 612, 832, 1007, 511, 556, 843, 164, 192, 203]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 100, 100, 100, 99, 99, 99, 98, 98]
+  median width: 8.345887e+75 q80: 8.345887e+75 q90: 8.345887e+75
+
+Testing density: 95%
+  freq: [100, 99, 97, 95, 95, 95, 94, 93, 93, 89]
+  median width: 8.345887e+75 q80: 8.345887e+75 q90: 8.490705e+75
+
+Testing density: 90%
+  freq: [95, 93, 92, 90, 88, 88, 87, 86, 85, 80]
+  median width: 8.345887e+75 q80: 8.490705e+75 q90: 8.715919e+75
+
+Testing density: 80%
+  freq: [84, 81, 80, 80, 70, 63, 63, 57, 56, 54]
+  median width: 8.860762e+75 q80: 1.196757e+76 q90: 1.312707e+76
+
+Testing density: 50%
+  freq: [52, 52, 47, 38, 32, 29, 29, 29, 26, 26]
+  median width: 1.649163e+76 q80: 1.867480e+76 q90: 2.103098e+76
+
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: 315d72d5085188982bfafb164
+Signature chunks (10 bits each): [356, 1004, 1018, 522, 137, 326, 264, 181, 471, 197]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 99, 99, 99, 99, 99, 98, 98, 98]
+  median width: 5.426596e+75 q80: 5.426596e+75 q90: 5.426596e+75
+
+Testing density: 95%
+  freq: [97, 96, 96, 95, 94, 93, 92, 90, 90, 88]
+  median width: 5.426596e+75 q80: 5.426596e+75 q90: 5.813598e+75
+
+Testing density: 90%
+  freq: [94, 92, 91, 91, 90, 89, 89, 87, 82, 79]
+  median width: 5.426596e+75 q80: 5.539876e+75 q90: 7.872283e+75
+
+Testing density: 80%
+  freq: [84, 81, 81, 76, 75, 75, 73, 67, 49, 48]
+  median width: 5.813598e+75 q80: 7.985563e+75 q90: 8.143821e+75
+
+Testing density: 50%
+  freq: [59, 45, 43, 43, 41, 36, 32, 30, 30, 29]
+  median width: 1.054097e+76 q80: 1.470503e+76 q90: 1.795293e+76
+
+Testing density: 40%
+  freq: [48, 38, 31, 30, 30, 30, 29, 27, 27, 25]
+  median width: 1.466780e+76 q80: 1.824826e+76 q90: 1.964676e+76
+vscode ➜ /workspaces/ecRust (master) $ 
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: 0b69d136e0620c28810a5f414
+Signature chunks (10 bits each): [20, 381, 266, 544, 194, 392, 736, 77, 669, 45]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [99, 99, 99, 99, 99, 98, 98, 98, 97, 95]
+  median width: 1.041287e+76 q80: 1.041287e+76 q90: 1.041287e+76
+  median steps: 17677 q80: 17689 q90: 17698
+
+Testing density: 95%
+  freq: [97, 96, 96, 95, 94, 94, 93, 91, 90, 88]
+  median width: 1.041287e+76 q80: 1.041287e+76 q90: 1.067440e+76
+  median steps: 16968 q80: 17015 q90: 17375
+
+Testing density: 90%
+  freq: [96, 93, 93, 91, 89, 88, 88, 88, 85, 77]
+  median width: 1.041287e+76 q80: 1.041287e+76 q90: 1.067440e+76
+  median steps: 16073 q80: 16125 q90: 16474
+
+Testing density: 80%
+  freq: [82, 80, 79, 76, 74, 72, 70, 67, 62, 54]
+  median width: 1.067440e+76 q80: 1.146100e+76 q90: 1.341245e+76
+  median steps: 14606 q80: 15738 q90: 18430
+
+Testing density: 50%
+  freq: [57, 55, 45, 30, 29, 28, 28, 27, 26, 25]
+  median width: 1.658545e+76 q80: 1.933512e+76 q90: 2.103380e+76
+  median steps: 14220 q80: 16746 q90: 18262
+
+Testing density: 40%
+  freq: [45, 39, 32, 28, 26, 24, 22, 22, 20, 19]
+  median width: 1.861392e+76 q80: 2.261018e+76 q90: 2.779362e+76
+  median steps: 12892 q80: 15603 q90: 19227
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: e10a91f4e55ddc570e34ce2d3
+Signature chunks (10 bits each): [723, 824, 564, 451, 453, 375, 229, 125, 169, 900]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 99, 98, 98, 98, 97, 96, 95, 95]
+  median width: 5.118330e+75 q80: 5.118330e+75 q90: 5.118330e+75
+  median steps: 8833 q80: 8841 q90: 8845
+
+Testing density: 95%
+  freq: [96, 96, 94, 93, 92, 91, 90, 89, 87, 86]
+  median width: 5.118330e+75 q80: 5.658482e+75 q90: 7.901197e+75
+  median steps: 8482 q80: 9327 q90: 13131
+
+Testing density: 90%
+  freq: [94, 92, 92, 88, 88, 82, 78, 75, 73, 72]
+  median width: 5.118330e+75 q80: 7.901197e+75 q90: 7.901197e+75
+  median steps: 8055 q80: 12420 q90: 12501
+
+Testing density: 80%
+  freq: [82, 80, 71, 70, 66, 66, 57, 53, 53, 49]
+  median width: 7.901197e+75 q80: 8.247347e+75 q90: 8.441349e+75
+  median steps: 10964 q80: 11641 q90: 11848
+
+Testing density: 50%
+  freq: [50, 42, 33, 28, 28, 27, 26, 26, 24, 24]
+  median width: 1.138538e+76 q80: 1.379265e+76 q90: 1.471948e+76
+  median steps: 9959 q80: 12017 q90: 12801
+
+Testing density: 40%
+  freq: [38, 34, 30, 27, 26, 24, 23, 22, 21, 21]
+  median width: 1.346890e+76 q80: 1.707319e+76 q90: 1.833467e+76
+  median steps: 9406 q80: 11791 q90: 12702
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 100000 random 256-bit tokens...
+
+Generated 100-bit signature: 3c8758e92589af67cc083508d
+Signature chunks (10 bits each): [141, 212, 8, 499, 758, 550, 293, 570, 117, 242]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 99, 99, 99, 98, 98, 98, 98, 97]
+  median width: 2.335878e+76 q80: 2.335878e+76 q90: 2.335878e+76
+  median steps: 19977 q80: 19989 q90: 19999
+
+Testing density: 95%
+  freq: [99, 97, 95, 95, 93, 92, 92, 87, 87, 86]
+  median width: 2.335878e+76 q80: 2.335878e+76 q90: 2.536804e+76
+  median steps: 19175 q80: 19231 q90: 20837
+
+Testing density: 90%
+  freq: [95, 93, 92, 92, 90, 87, 84, 83, 80, 79]
+  median width: 2.335878e+76 q80: 2.415604e+76 q90: 2.536804e+76
+  median steps: 18195 q80: 18828 q90: 19789
+
+Testing density: 80%
+  freq: [84, 83, 81, 79, 75, 75, 64, 61, 60, 58]
+  median width: 2.415604e+76 q80: 3.134679e+76 q90: 3.373837e+76
+  median steps: 16684 q80: 21740 q90: 23179
+
+Testing density: 50%
+Traceback (most recent call last):
+  File "/workspaces/ecRust/signature_proof_of_storage.py", line 111, in <module>
+    run_signature_proof_test()
+  File "/workspaces/ecRust/signature_proof_of_storage.py", line 88, in run_signature_proof_test
+    width_dist.append(extracted_tokens[4] - extracted_tokens[9])
+                                            ~~~~~~~~~~~~~~~~^^^
+IndexError: list index out of range
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 100000 random 256-bit tokens...
+
+Generated 100-bit signature: a2f9ba5f1d76a9d37782d664c
+Signature chunks (10 bits each): [588, 857, 898, 221, 669, 474, 797, 663, 923, 651]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 99, 99, 99, 98, 98, 98, 96, 95]
+  median width: 8.140792e+75 q80: 8.140792e+75 q90: 8.140792e+75
+  median steps: 6842 q80: 6848 q90: 6853
+
+Testing density: 95%
+  freq: [97, 96, 96, 96, 95, 93, 92, 91, 90, 90]
+  median width: 8.140792e+75 q80: 8.140792e+75 q90: 8.689489e+75
+  median steps: 6565 q80: 6583 q90: 7008
+
+Testing density: 90%
+  freq: [90, 89, 89, 89, 86, 85, 85, 77, 76, 71]
+  median width: 8.140792e+75 q80: 8.689489e+75 q90: 9.535923e+75
+  median steps: 6234 q80: 6670 q90: 7335
+
+Testing density: 80%
+  freq: [86, 82, 76, 76, 75, 75, 74, 63, 59, 48]
+  median width: 8.689489e+75 q80: 1.166134e+76 q90: 1.308130e+76
+  median steps: 5889 q80: 8013 q90: 9063
+
+Testing density: 50%
+  freq: [50, 46, 43, 38, 29, 28, 25, 24, 22, 20]
+  median width: 1.974933e+76 q80: 2.712097e+76 q90: 3.073590e+76
+  median steps: 8496 q80: 11641 q90: 13291
+
+Testing density: 40%
+  freq: [49, 38, 28, 28, 26, 23, 20, 19, 19, 18]
+  median width: 2.483263e+76 q80: 3.812764e+76 q90: 4.210390e+76
+  median steps: 8617 q80: 13153 q90: 14519
+vscode ➜ /workspaces/ecRust (master) $ 
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 1000000 random 256-bit tokens...
+
+Generated 100-bit signature: 68a71f02d9c86e77c9940b95b
+Signature chunks (10 bits each): [347, 46, 404, 498, 743, 801, 729, 960, 625, 418]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 99, 99, 99, 98, 97, 97, 97, 97, 96]
+  median width: 5.097569e+74 q80: 5.097569e+74 q90: 5.097569e+74
+  median steps: 4291 q80: 4298 q90: 4303
+
+Testing density: 95%
+  freq: [99, 94, 92, 90, 90, 87, 86, 84, 83, 80]
+  median width: 5.097569e+74 q80: 7.192287e+74 q90: 1.055331e+75
+  median steps: 4122 q80: 5832 q90: 8572
+
+Testing density: 90%
+  freq: [90, 86, 85, 80, 76, 74, 69, 69, 65, 63]
+  median width: 6.978791e+74 q80: 1.055331e+75 q90: 1.055331e+75
+  median steps: 5430 q80: 8096 q90: 8181
+
+Testing density: 80%
+  freq: [79, 79, 69, 66, 64, 57, 56, 47, 45, 44]
+  median width: 9.938510e+74 q80: 1.535982e+75 q90: 1.901122e+75
+  median steps: 6820 q80: 10732 q90: 13195
+
+Testing density: 50%
+  freq: [55, 51, 28, 28, 25, 23, 21, 21, 21, 20]
+  median width: 2.228486e+75 q80: 2.809668e+75 q90: 3.025588e+75
+  median steps: 9551 q80: 12284 q90: 13112
+
+Testing density: 40%
+  freq: [44, 39, 24, 21, 19, 18, 16, 16, 15, 15]
+  median width: 2.935578e+75 q80: 3.762134e+75 q90: 4.440881e+75
+  median steps: 10220 q80: 13123 q90: 15459
+
+==================================================
+Generating 1000000 random 256-bit tokens...
+
+Generated 100-bit signature: b752edb0b75693a361d057c49
+Signature chunks (10 bits each): [73, 351, 464, 216, 314, 346, 183, 876, 302, 733]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [99, 98, 98, 98, 98, 98, 97, 97, 96, 96]
+  median width: 4.091715e+74 q80: 4.091715e+74 q90: 4.091715e+74
+  median steps: 3507 q80: 3513 q90: 3519
+
+Testing density: 95%
+  freq: [96, 95, 94, 92, 90, 89, 88, 87, 87, 82]
+  median width: 4.091715e+74 q80: 4.269301e+74 q90: 9.713449e+74
+  median steps: 3370 q80: 3527 q90: 7980
+
+Testing density: 90%
+  freq: [88, 87, 78, 77, 77, 77, 75, 71, 70, 62]
+  median width: 4.181335e+74 q80: 9.713449e+74 q90: 1.063872e+75
+  median steps: 3276 q80: 7564 q90: 8316
+
+Testing density: 80%
+  freq: [79, 72, 65, 64, 64, 57, 54, 53, 49, 42]
+  median width: 9.713449e+74 q80: 1.128805e+75 q90: 1.268346e+75
+  median steps: 6689 q80: 7813 q90: 8872
+
+Testing density: 50%
+  freq: [51, 48, 43, 33, 31, 27, 27, 24, 24, 24]
+  median width: 1.907327e+75 q80: 2.761052e+75 q90: 3.121446e+75
+  median steps: 8339 q80: 12112 q90: 13699
+
+Testing density: 40%
+  freq: [47, 40, 26, 25, 24, 23, 21, 19, 19, 19]
+  median width: 2.408865e+75 q80: 3.365244e+75 q90: 3.643432e+75
+  median steps: 8461 q80: 11622 q90: 12775
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: 75a21955025eb062e673ca952
+Signature chunks (10 bits each): [338, 810, 627, 185, 774, 378, 258, 597, 545, 470]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 100, 100, 100, 100, 99, 98, 98, 98]
+  median width: 6.045816e+75 q80: 6.045816e+75 q90: 6.045816e+75
+  median steps: 10451 q80: 10459 q90: 10465
+  freq ALL: [100, 100, 100, 100, 100, 100, 99, 98, 98, 98, 2, 2, 2, 1]
+
+Testing density: 95%
+  freq: [95, 93, 92, 90, 89, 88, 88, 86, 85, 82]
+  median width: 6.045816e+75 q80: 7.759623e+75 q90: 7.759623e+75
+  median steps: 10035 q80: 12746 q90: 12789
+  freq ALL: [195, 193, 192, 188, 188, 188, 188, 184, 183, 182, 17, 12, 9, 7, 7, 7, 7, 7, 7, 6]
+
+Testing density: 90%
+  freq: [93, 87, 87, 81, 80, 80, 79, 74, 74, 72]
+  median width: 6.045816e+75 q80: 7.759623e+75 q90: 9.355874e+75
+  median steps: 9525 q80: 12109 q90: 14642
+  freq ALL: [286, 282, 275, 271, 269, 268, 268, 258, 256, 255, 40, 29, 25, 17, 17, 16, 16, 15, 15, 14]
+
+Testing density: 80%
+  freq: [88, 84, 68, 65, 64, 60, 55, 54, 53, 49]
+  median width: 7.759623e+75 q80: 9.355874e+75 q90: 1.106968e+76
+  median steps: 10765 q80: 13059 q90: 15404
+  freq ALL: [370, 370, 337, 335, 335, 333, 321, 313, 310, 304, 75, 52, 45, 37, 35, 33, 33, 32, 32, 29]
+
+Testing density: 50%
+  freq: [59, 45, 35, 33, 29, 26, 25, 24, 22, 21]
+  median width: 1.399267e+76 q80: 1.801264e+76 q90: 2.104404e+76
+  median steps: 12109 q80: 15542 q90: 18178
+  freq ALL: [429, 415, 361, 355, 355, 342, 335, 329, 319, 315, 96, 76, 72, 60, 56, 54, 52, 46, 45, 43]
+
+Testing density: 40%
+  freq: [42, 36, 28, 27, 26, 25, 25, 24, 21, 18]
+  median width: 1.704927e+76 q80: 2.237758e+76 q90: 2.538669e+76
+  median steps: 11850 q80: 15644 q90: 17630
+  freq ALL: [471, 451, 374, 372, 365, 346, 338, 333, 323, 322, 109, 97, 90, 88, 79, 64, 61, 57, 54, 52]
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 200000 random 256-bit tokens...
+
+Generated 100-bit signature: 2b3eef7efbfde0fb1355c18a8
+Signature chunks (10 bits each): [168, 774, 853, 708, 527, 1015, 763, 991, 1006, 172]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 100, 100, 99, 99, 99, 99, 98, 95]
+  median width: 5.764085e+75 q80: 5.764085e+75 q90: 5.764085e+75
+  median steps: 9813 q80: 9822 q90: 9824
+  freq ALL: [100, 100, 100, 100, 99, 99, 99, 99, 98, 95, 4, 1, 1, 1, 1, 1, 1, 1]
+
+Testing density: 95%
+  freq: [96, 94, 93, 92, 91, 88, 87, 83, 82, 78]
+  median width: 5.764085e+75 q80: 5.833864e+75 q90: 6.510013e+75
+  median steps: 9429 q80: 9567 q90: 10604
+  freq ALL: [196, 194, 193, 192, 190, 187, 186, 181, 181, 173, 17, 13, 13, 12, 11, 9, 8, 7, 7, 5]
+
+Testing density: 90%
+  freq: [93, 89, 88, 84, 79, 79, 78, 71, 67, 65]
+  median width: 5.764085e+75 q80: 6.510013e+75 q90: 6.579792e+75
+  median steps: 8972 q80: 10060 q90: 10180
+  freq ALL: [289, 282, 280, 278, 269, 266, 264, 252, 248, 238, 39, 29, 29, 29, 28, 23, 20, 17, 16, 16]
+
+Testing density: 80%
+  freq: [82, 78, 78, 74, 66, 65, 65, 51, 45, 36]
+  median width: 6.510013e+75 q80: 7.580875e+75 q90: 8.436088e+75
+  median steps: 8916 q80: 10427 q90: 11618
+  freq ALL: [364, 363, 358, 356, 334, 331, 330, 303, 293, 274, 68, 54, 53, 52, 51, 45, 35, 33, 32, 32]
+
+Testing density: 50%
+  freq: [47, 44, 35, 32, 29, 27, 26, 26, 24, 23]
+  median width: 1.098816e+76 q80: 1.440036e+76 q90: 1.511984e+76
+  median steps: 9354 q80: 12402 q90: 13010
+  freq ALL: [408, 405, 395, 376, 355, 352, 339, 311, 299, 277, 82, 78, 69, 69, 67, 65, 58, 54, 54, 53]
+
+Testing density: 40%
+  freq: [48, 36, 30, 29, 28, 27, 26, 26, 23, 23]
+  median width: 1.301465e+76 q80: 1.664343e+76 q90: 1.918852e+76
+  median steps: 8935 q80: 11428 q90: 13224
+  freq ALL: [456, 434, 431, 395, 372, 368, 345, 319, 301, 278, 98, 97, 83, 81, 81, 78, 77, 74, 71, 69]
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 100000 random 256-bit tokens...
+
+Generated 100-bit signature: b4a30e9ae53db7a62993221a0
+Signature chunks (10 bits each): [416, 136, 403, 394, 890, 246, 741, 934, 560, 722]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 99, 98, 98, 98, 98, 97, 97, 97, 97]
+  median width: 7.403070e+75 q80: 7.403070e+75 q90: 7.403070e+75
+  median steps: 6273 q80: 6282 q90: 6287
+  freq ALL: [100, 99, 98, 98, 98, 98, 97, 97, 97, 97, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1]
+
+Testing density: 95%
+  freq: [94, 94, 94, 90, 89, 85, 85, 83, 80, 77]
+  median width: 7.403070e+75 q80: 8.629552e+75 q90: 1.284697e+76
+  median steps: 6031 q80: 6947 q90: 10502
+  freq ALL: [194, 192, 192, 188, 188, 182, 182, 181, 177, 174, 20, 20, 17, 10, 10, 10, 8, 7, 6, 6]
+
+Testing density: 90%
+  freq: [91, 90, 88, 84, 78, 77, 72, 69, 68, 66]
+  median width: 7.403070e+75 q80: 1.284697e+76 q90: 1.284697e+76
+  median steps: 5716 q80: 9908 q90: 9961
+  freq ALL: [285, 282, 280, 272, 266, 258, 251, 250, 249, 240, 38, 37, 37, 31, 30, 26, 18, 17, 16, 15]
+
+Testing density: 80%
+  freq: [79, 73, 73, 60, 59, 53, 51, 47, 41, 40]
+  median width: 9.951020e+75 q80: 1.352915e+76 q90: 1.619671e+76
+  median steps: 6770 q80: 9340 q90: 11135
+  freq ALL: [364, 355, 353, 332, 325, 311, 302, 291, 288, 287, 78, 72, 68, 67, 60, 59, 36, 30, 29, 29]
+
+
+==================================================
+Generating 1000000 random 256-bit tokens...
+
+Generated 100-bit signature: 9a1591fa5f5395023b441b2fd
+Signature chunks (10 bits each): [765, 108, 836, 142, 336, 334, 607, 126, 345, 616]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 100, 100, 100, 99, 99, 98, 98, 98]
+  median width: 1.888535e+75 q80: 1.888535e+75 q90: 1.888535e+75
+  median steps: 16114 q80: 16123 q90: 16129
+  freq ALL: [100, 100, 100, 100, 100, 99, 99, 98, 98, 98, 2, 2, 2, 1, 1]
+
+Testing density: 95%
+  freq: [97, 96, 96, 95, 95, 94, 94, 93, 90, 89]
+  median width: 1.888535e+75 q80: 1.888535e+75 q90: 1.909740e+75
+  median steps: 15469 q80: 15501 q90: 15618
+  freq ALL: [197, 196, 194, 194, 193, 193, 193, 193, 190, 188, 7, 7, 7, 7, 6, 6, 6, 4, 4, 4]
+
+Testing density: 90%
+  freq: [93, 91, 90, 90, 89, 88, 88, 88, 84, 81]
+  median width: 1.888535e+75 q80: 1.909740e+75 q90: 2.045504e+75
+  median steps: 14675 q80: 14807 q90: 15807
+  freq ALL: [287, 287, 284, 284, 283, 282, 282, 281, 274, 269, 17, 16, 15, 15, 15, 14, 14, 14, 14, 11]
+
+Testing density: 80%
+  freq: [83, 82, 80, 77, 73, 73, 73, 70, 68, 66]
+  median width: 1.905518e+75 q80: 2.045504e+75 q90: 2.066709e+75
+  median steps: 13110 q80: 14076 q90: 14222
+  freq ALL: [370, 369, 364, 360, 355, 355, 354, 354, 342, 335, 38, 35, 34, 33, 32, 31, 28, 26, 26, 24]
+
+Testing density: 50%
+  freq: [58, 50, 45, 41, 39, 32, 30, 30, 29, 29]
+  median width: 2.464072e+75 q80: 3.042909e+75 q90: 3.353967e+75
+  median steps: 10703 q80: 13065 q90: 14356
+  freq ALL: [422, 420, 405, 399, 395, 393, 387, 373, 355, 346, 67, 63, 58, 53, 49, 49, 49, 49, 46, 36]
+
+Testing density: 40%
+  freq: [44, 43, 39, 33, 32, 24, 22, 21, 20, 20]
+  median width: 2.986611e+75 q80: 3.986254e+75 q90: 4.363837e+75
+  median steps: 10461 q80: 13650 q90: 15062
+  freq ALL: [463, 461, 437, 437, 432, 415, 411, 388, 367, 352, 83, 83, 71, 70, 66, 65, 63, 58, 52, 50]
+vscode ➜ /workspaces/ecRust (master) $ /usr/bin/python3 /workspaces/ecRust/signature_proof_of_storage.py
+Signature-Based Proof of Storage Analysis
+==================================================
+Generating 10000000 random 256-bit tokens...
+
+Generated 100-bit signature: 365ca4a8de5ffc7915d9ef41a
+Signature chunks (10 bits each): [26, 957, 473, 581, 967, 383, 222, 298, 458, 217]
+
+Running 100 test scenarios...
+
+Testing density: 99%
+  freq: [100, 100, 99, 99, 99, 98, 98, 98, 98, 97]
+  median width: 8.263608e+73 q80: 8.263608e+73 q90: 8.263608e+73
+  median steps: 7173 q80: 7182 q90: 7187
+  freq ALL: [100, 100, 99, 99, 99, 98, 98, 98, 98, 97, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1]
+
+Testing density: 95%
+  freq: [98, 98, 95, 95, 92, 92, 90, 87, 86, 80]
+  median width: 8.263608e+73 q80: 1.108533e+74 q90: 1.260455e+74
+  median steps: 6889 q80: 9174 q90: 10455
+  freq ALL: [197, 196, 195, 194, 190, 190, 190, 185, 185, 177, 15, 15, 11, 10, 9, 8, 7, 5, 5, 4]
+
+Testing density: 90%
+  freq: [94, 94, 92, 92, 89, 88, 83, 79, 72, 70]
+  median width: 8.705376e+73 q80: 1.260455e+74 q90: 1.375303e+74
+  median steps: 6811 q80: 9875 q90: 10829
+  freq ALL: [291, 289, 285, 282, 282, 282, 269, 268, 255, 249, 32, 32, 30, 19, 19, 17, 16, 15, 15, 11]
+
+Testing density: 80%
+  freq: [78, 78, 78, 75, 75, 73, 61, 61, 50, 48]
+  median width: 1.260455e+74 q80: 1.809398e+74 q90: 1.859963e+74
+  median steps: 8747 q80: 12553 q90: 13041
+  freq ALL: [369, 363, 362, 360, 357, 357, 330, 329, 305, 297, 63, 58, 54, 39, 38, 37, 33, 33, 32, 30]
+
+Testing density: 50%
+  freq: [52, 47, 45, 39, 38, 37, 35, 29, 28, 27]
+  median width: 2.344695e+74 q80: 2.817320e+74 q90: 3.297750e+74
+  median steps: 10048 q80: 12255 q90: 14352
+  freq ALL: [414, 407, 406, 402, 398, 384, 356, 343, 315, 303, 102, 79, 76, 68, 63, 62, 61, 56, 45, 42]
+
+Testing density: 40%
+  freq: [47, 37, 30, 26, 26, 26, 25, 24, 23, 22]
+  median width: 2.883810e+74 q80: 3.755144e+74 q90: 4.404683e+74
+  median steps: 10113 q80: 13055 q90: 15428
+  freq ALL: [461, 444, 432, 427, 423, 406, 360, 349, 318, 304, 125, 102, 89, 89, 87, 82, 74, 71, 66, 63]
