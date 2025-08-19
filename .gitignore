@@ -4,3 +4,4 @@
 *.iml
 .vscode/
 /Scratch
+__pycache__
