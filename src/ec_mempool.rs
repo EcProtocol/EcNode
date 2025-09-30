@@ -2,6 +2,7 @@
 
 use log::info;
 use std::cell::RefCell;
+use std::clone;
 use std::rc::Rc;
 
 use hashbrown::HashMap;
@@ -21,19 +22,16 @@ pub enum BlockState {
 }
 
 pub enum MessageRequest {
-    VOTE(BlockId, TokenId, u8, bool),
-    PARENT(BlockId, BlockId),
-    COMMIT(BlockId, PeerId),
+    VOTE(BlockId, TokenId, u8, EcTime),
+    PARENT(BlockId, BlockId, EcTime),
 }
 
 impl MessageRequest {
-    pub fn sort_key(&self) -> (&TokenId, u8) {
+    pub fn sort_key(&self) -> (TokenId, EcTime) {
         match self {
-            MessageRequest::VOTE(_, token_id, _, matching) => {
-                (token_id, if *matching { 1 } else { 0 })
-            }
-            MessageRequest::PARENT(_, parent_id) => (parent_id, 0),
-            MessageRequest::COMMIT(_, peer_id) => (peer_id, 0),
+            // group equal token_id and get possitive votes first
+            MessageRequest::VOTE(_, token_id, _, time) => (*token_id, *time),
+            MessageRequest::PARENT(_, parent_id, time) => (*parent_id, *time),
         }
     }
 }
@@ -220,8 +218,8 @@ impl EcMemPool {
                         {
                             state.validate ^= 1 << i;
                         }
-                        break;
                     }
+                    // can be parent for more than one token
                 }
             }
         }
@@ -240,7 +238,6 @@ impl EcMemPool {
                 }
 
                 // TODO same token only once
-                // TODO same parent/last only once
 
                 // TODO verify that block-id is the SHA of block content (INCL (?) /not(?) signatures)
 
@@ -260,6 +257,8 @@ impl EcMemPool {
         self.pool.retain(|_, s| time - s.time < 100);
 
         let mut tokens = self.tokens.borrow_mut();
+
+        let my_range = peers.peer_range(&id);
 
         for (block_id, block_state) in self
             .pool
@@ -281,22 +280,13 @@ impl EcMemPool {
 
                     // test all votes for range and sum up
                     for (peer_id, peer_vote) in &block_state.votes {
-                        let mut effect = false;
-
                         for (i, range) in ranges.iter().enumerate() {
                             if range.in_range(&peer_id) {
                                 balance[i] += if peer_vote.vote & 1 << i == 0 { -1 } else { 1 };
-                                effect = true
                             }
                         }
                         if witness.in_range(&peer_id) {
                             witness_balance += 1;
-                            effect = true
-                        }
-
-                        if !effect {
-                            // TODO will probably not work ... but the idea
-                            //block_state.votes.remove(&peer_id);
                         }
                     }
 
@@ -315,69 +305,83 @@ impl EcMemPool {
                     block_state.updated = false;
                 }
 
-                // if no remaining votes AND all is validated - commit
-                if block_state.remaining == 0 && block_state.validate == 0 {
-                    // TODO should it be kept in mempool for a while - can it be rolled back ever?
+                let mut vote = 0;
+                let mut no_skip_or_reorg = true;
+                for i in 0..block.used as usize {
+                    let current_mapping =
+                        tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block);
 
-                    // commit / update
-                    for i in 0..block.used as usize {
-                        // TODO announce for next iteration to update vote
-                        tokens.set(&block.parts[i].token, &block.id, block.time);
+                    if current_mapping == block.parts[i].last {
+                        vote |= 1 << i
+                    } else if current_mapping != 0 {
+                        // Never allow missing links or re-orgs on committed tokens
+                        no_skip_or_reorg = false;
                     }
+                }
+
+                // if no remaining votes AND all is validated - commit
+                // no_skip_or_reorg &&
+                if block_state.remaining == 0 && block_state.validate == 0 {
+                    // TODO should it be kept in mempool for a while - can it be rolled back ever? -> NO
+
+                    // TODO should the commit-chain be the responsiblity of token-store - or a seperate manager?
 
                     // save block in permanent store
                     self.blocks.borrow_mut().save(&block);
 
+                    // commit / update
+                    for i in 0..block.used as usize {
+                        // TODO (ok?) only tokens in my range -> together with "no_skip_or_reorg" lock
+                        if my_range.in_range(&block.parts[i].token) {
+                            
+                            if !no_skip_or_reorg {
+                                let current_mapping =
+                                tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block);
+                                
+                                println!(
+                                    "{} reorg b:{} p:{}: {} <-> {}",
+                                    time,
+                                    block_id & 0xFF,
+                                    id & 0xFF,
+                                    current_mapping & 0xFF,
+                                    block.parts[i].last & 0xFF
+                                );
+                            } else {
+                                println!("{} cmt: p:{} b:{}", time, id & 0xFF, block_id & 0xFF);
+                            }
+
+                            tokens.set(&block.parts[i].token, &block.id, block.time);
+                        }
+                    }
+
                     block_state.state = BlockState::Commit;
-
-                    block_state.votes.iter().for_each(|(peer_id, vote)| {
-                        //messages.push(MessageRequest::COMMIT(*block_id, *peer_id));
-                    });
-
-                 /*   info!(
-                        "{} B: {} P: {} vs: {}",
-                        time,
-                        block.id & 0xFF,
-                        id & 0xFF,
-                        block_state.votes.len()
-                    );*/
-
                     continue;
                 }
 
-                //if block.time & 1 == 0
-                {
-                    // TODO optimize - only update if changed
-                    let mut vote = 0;
-                    for i in 0..block.used as usize {
-                        if tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block)
-                            == block.parts[i].last
-                        {
-                            vote |= 1 << i
-                        }
+                for i in 0..block.used as usize {
+                    if (block_state.validate & 1 << i) != 0 {
+                        // fetch a parent
+                        messages.push(MessageRequest::PARENT(
+                            *block_id,
+                            block.parts[i].last,
+                            block.time,
+                        ));
                     }
 
-                    for i in 0..block.used as usize {
-                        if (block_state.validate & 1 << i) != 0 {
-                            // fetch a parent
-                            messages.push(MessageRequest::PARENT(*block_id, block.parts[i].last));
-                        }
-
-                        if (block_state.remaining & 1 << i) != 0 {
-                            // request vote
-                            messages.push(MessageRequest::VOTE(
-                                *block_id,
-                                block.parts[i].token,
-                                vote,
-                                true,
-                            ));
-                        }
+                    if (block_state.remaining & 1 << i) != 0 {
+                        // request vote
+                        messages.push(MessageRequest::VOTE(
+                            *block_id,
+                            block.parts[i].token,
+                            vote,
+                            block.time,
+                        ));
                     }
+                }
 
-                    // vote witness
-                    if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
-                        messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, true));
-                    }
+                // vote witness
+                if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
+                    messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, block.time));
                 }
             }
         }

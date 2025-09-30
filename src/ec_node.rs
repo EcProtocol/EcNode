@@ -44,7 +44,7 @@ impl EcNode {
     pub fn seed_peer(&mut self, peer: &PeerId) {
         self.peers.update_peer(peer, self.time);
     }
-    
+
     pub fn num_peers(&self) -> usize {
         self.peers.num_peers()
     }
@@ -57,15 +57,29 @@ impl EcNode {
         self.blocks.borrow().lookup(block_id)
     }
 
-    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>, send: bool) {
+    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
         self.time += 1;
-        // TODO sort requests - and detect CONFLICT (multiple positive vores for same token)
-        // could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
-        // also work on earlier blocks before later
-        for request in self.mem_pool.tick(&self.peers, self.time, self.peer_id) {
-            // TODO pack messages in Message2 style
+        // TODO pack messages in Message2 style
+        // - idea: the oldest transaction (longest in mempool) "sucks" all overlapping into message - sync. on roll.
+        // (when commited or timeout - this schedule of a neighborhood is then "freed" of the next oldest etc)
+        // TODO could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
+        let mut messages = self.mem_pool.tick(&self.peers, self.time, self.peer_id);
+        messages.sort_unstable_by_key(MessageRequest::sort_key);
+
+        // work on earlier blocks before later
+        // TODO check - and also applied to parent - oldest ref first
+        let mut last = 0;
+        for request in messages {
             match request {
-                MessageRequest::VOTE(block_id, token_id, vote, reply) => {
+                MessageRequest::VOTE(block_id, token_id, mut vote, _) => {
+                    if token_id == last {
+                        // sort requests - and detect CONFLICT (multiple positive vores for same token)
+                        println!("skipping");
+
+                        continue;
+                    }
+                    last = token_id;
+
                     for peer_id in self.peers.peers_for(&token_id, self.time) {
                         responses.push(MessageEnvelope {
                             sender: self.peer_id,
@@ -75,12 +89,18 @@ impl EcNode {
                             message: Message::Vote {
                                 block_id,
                                 vote,
-                                reply,
+                                reply: true,
                             },
                         })
                     }
                 }
-                MessageRequest::PARENT(block_id, parent_id) => {
+                MessageRequest::PARENT(block_id, parent_id, _) => {
+                    // only request the same block once each round
+                    if parent_id == last {
+                        continue;
+                    }
+                    last = parent_id;
+
                     // TODO a work around. Should be handled in mem_pool
                     if let Some(parent) = self.mem_pool.query(&parent_id) {
                         self.mem_pool.validate_with(&parent, &block_id);
@@ -95,13 +115,10 @@ impl EcNode {
                             message: Message::Query {
                                 token: parent_id,
                                 target: 0,
-                                ticket: block_id, // TODO calc ticket with SHA
+                                ticket: block_id,
                             },
                         })
                     }
-                }
-                MessageRequest::COMMIT(block_id, peer_id) => {
-                    responses.push(self.reply_direct(&peer_id, &block_id, false))
                 }
             }
         }
@@ -184,7 +201,10 @@ impl EcNode {
                     // self.peers.peers_for(token, 1)
                 }
             }
-            Message::Answer { .. } => {}
+            Message::Answer { answer, signature } => {
+                self.peers
+                    .handle_answer(answer, signature, msg.ticket, msg.sender);
+            }
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
                 if msg.ticket == self.block_req_ticket ^ block.id {

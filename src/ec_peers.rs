@@ -1,5 +1,4 @@
-use crate::ec_interface::{EcTime, PeerId, TokenId};
-use rand::Rng;
+use crate::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
 
 struct MemPeer {
     id: PeerId,
@@ -46,6 +45,16 @@ impl EcPeers {
         }
 
         res as usize
+    }
+
+    /// responding to neighborhood 
+    pub(crate) fn handle_answer(
+        &self,
+        answer: &TokenMapping,
+        signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
+        ticket: MessageTicket,
+        peer_id: PeerId
+    ) {
     }
 
     pub(crate) fn peers_for(&self, key: &TokenId, time: EcTime) -> [PeerId; 2] {
@@ -126,6 +135,7 @@ impl EcPeers {
             };
         }
 
+        // TODO width of peer-range +/- 4 or 6 ?
         match self.active.binary_search_by(|p| p.id.cmp(key)) {
             Ok(idx) | Err(idx) => PeerRange {
                 low: self.active[self.idx_adj(idx, -4)].id,
@@ -145,7 +155,7 @@ impl EcPeers {
             active: Vec::new(),
         }
     }
-    
+
     pub fn num_peers(&self) -> usize {
         self.active.len()
     }

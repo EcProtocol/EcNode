@@ -36,6 +36,8 @@ fn main() {
     let mut seed = [0u8; 32];
     rand::thread_rng().fill(&mut seed);
 
+    info!("let seed = {:?};", seed);
+
     let mut rng = StdRng::from_seed(seed);
 
     // create starting peers
@@ -58,10 +60,12 @@ fn main() {
         // for add_peer in peers.choose_multiple(&mut rng, 35 * num_of_peers / 100) {
         //     node.seed_peer(add_peer);
         // }
+
+        // gradient like selection of peers around own-id
         for p in &peers {
             let d = peer_id.abs_diff(*p);
             let r = rng.next_u64();
-            if r > d && d & 3 == 0 {
+            if r > d  {
                 node.seed_peer(p);
             }
         }
@@ -193,7 +197,7 @@ fn main() {
 
         // next round
         for (_, node) in &mut nodes {
-            node.tick(&mut next, true); //rng.gen_bool(0.9));
+            node.tick(&mut next);
         }
 
         //info!("{}: next round {} msgs {} blocks - {}", i, next.len(), blocks.len(), committed);
@@ -223,7 +227,6 @@ fn main() {
         stats.2 / nodes.len()
     );
 
-    info!("let seed = {:?};", seed);
     if committed > 0 {
         info!(
             "done. Messages {}. commit: {},  avg: {} rounds/commit, {} messeage/commit, {:?} dist",

@@ -11,7 +11,8 @@
         "vscode": {
             "extensions": [
                 "rust-lang.rust-analyzer",
-                "mermaidchart.vscode-mermaid-chart"
+                "mermaidchart.vscode-mermaid-chart",
+                "ms-python.python"
             ]
         }
     },
