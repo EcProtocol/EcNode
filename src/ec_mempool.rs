@@ -24,7 +24,7 @@ pub enum BlockState {
 pub enum MessageRequest {
     VOTE(BlockId, TokenId, u8, bool),
     PARENT(BlockId, BlockId),
-    PARENTCOMMIT(BlockId), 
+    PARENTCOMMIT(BlockId),
 }
 
 impl MessageRequest {
@@ -89,12 +89,12 @@ impl PoolBlockState {
             self.updated = true;
         }
 
-        if self.block.is_none() {
-            println!("vote {} on empty", self.votes.len());
-        }
+        //if self.block.is_none() {
+        //    println!("vote {} on empty", self.votes.len());
+        //}
     }
 
-    fn put_block<F>(&mut self, block: &Block, validate: F)
+    fn put_block<F>(&mut self, block: &Block, validate: F) -> bool
     where
         F: Fn() -> (bool, u8, u8),
     {
@@ -111,7 +111,11 @@ impl PoolBlockState {
                 // TODO check
                 self.state = BlockState::Blocked
             }
+
+            return true;
         }
+
+        return false;
     }
 }
 
@@ -231,7 +235,7 @@ impl EcMemPool {
         }
     }
 
-    pub(crate) fn block(&mut self, block: &Block, time: EcTime) {
+    pub(crate) fn block(&mut self, block: &Block, time: EcTime) -> bool {
         self.pool
             .entry(block.id)
             .or_insert_with(|| PoolBlockState::new(time))
@@ -248,7 +252,7 @@ impl EcMemPool {
                 // TODO verify that block-id is the SHA of block content (INCL (?) /not(?) signatures)
 
                 (true, 0, 0)
-            });
+            })
     }
 
     pub(crate) fn tick(
@@ -260,7 +264,7 @@ impl EcMemPool {
         let mut messages = Vec::new();
 
         // TODO clean out expired elements - how old?
-        self.pool.retain(|_, s| time - s.time < 100);
+        self.pool.retain(|_, s| time - s.time < 50);
 
         let mut tokens = self.tokens.borrow_mut();
 
@@ -325,20 +329,27 @@ impl EcMemPool {
                         no_skip_or_reorg = false;
 
                         // request predessor block
-                        messages.push(MessageRequest::PARENTCOMMIT(
-                            last_mapping,
-                        ));
+                        messages.push(MessageRequest::PARENTCOMMIT(last_mapping));
+
+                        println!(
+                            "{} reorg b:{} p:{}: {} <-> {}",
+                            time,
+                            block_id & 0xFF,
+                            id & 0xFFF,
+                            current_mapping & 0xFF,
+                            last_mapping & 0xFF
+                        );
                     }
                 }
 
                 // TODO this?
                 if !no_skip_or_reorg {
-                    block_state.votes.clear();
+                    //block_state.votes.clear();
                 }
 
                 // if no remaining votes AND all is validated - commit
-                // no_skip_or_reorg &&
-                if block_state.remaining == 0 && block_state.validate == 0 {
+                //no_skip_or_reorg = true;
+                if no_skip_or_reorg && block_state.remaining == 0 && block_state.validate == 0 {
                     // TODO should it be kept in mempool for a while - can it be rolled back ever? -> NO
 
                     // TODO should the commit-chain be the responsiblity of token-store - or a seperate manager?
@@ -350,11 +361,11 @@ impl EcMemPool {
                     for i in 0..block.used as usize {
                         // TODO (ok?) only tokens in my range -> together with "no_skip_or_reorg" lock
                         if my_range.in_range(&block.parts[i].token) {
-                            
+                            /*
                             if !no_skip_or_reorg {
                                 let current_mapping =
                                 tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block);
-                                
+
                                 println!(
                                     "{} reorg b:{} p:{}: {} <-> {}",
                                     time,
@@ -363,8 +374,9 @@ impl EcMemPool {
                                     current_mapping & 0xFF,
                                     block.parts[i].last & 0xFF
                                 );
-                            } else {
-                                println!("{} cmt: p:{} b:{}", time, id & 0xFF, block_id & 0xFF);
+                            } else */
+                            {
+                                println!("{} cmt: p:{} b:{}", time, id & 0xFFF, block_id & 0xFF);
                             }
 
                             tokens.set(&block.parts[i].token, &block.id, block.time);
@@ -375,29 +387,29 @@ impl EcMemPool {
                     continue;
                 }
 
-                for i in 0..block.used as usize {
-                    if (block_state.validate & 1 << i) != 0 {
-                        // fetch a parent
-                        messages.push(MessageRequest::PARENT(
-                            *block_id,
-                            block.parts[i].last
-                        ));
+                if no_skip_or_reorg
+                {
+                    for i in 0..block.used as usize {
+                        if (block_state.validate & 1 << i) != 0 {
+                            // fetch a parent
+                            messages.push(MessageRequest::PARENT(*block_id, block.parts[i].last));
+                        }
+
+                        if (block_state.remaining & 1 << i) != 0 {
+                            // request vote
+                            messages.push(MessageRequest::VOTE(
+                                *block_id,
+                                block.parts[i].token,
+                                vote,
+                                vote & 1 << i != 0,
+                            ));
+                        }
                     }
 
-                    if (block_state.remaining & 1 << i) != 0 {
-                        // request vote
-                        messages.push(MessageRequest::VOTE(
-                            *block_id,
-                            block.parts[i].token,
-                            vote,
-                            vote & 1 << i != 0,
-                        ));
+                    // vote witness
+                    if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
+                        messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, false));
                     }
-                }
-
-                // vote witness
-                if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
-                    messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, false));
                 }
             }
         }

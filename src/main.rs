@@ -29,9 +29,9 @@ mod ec_tokens;
 fn main() {
     SimpleLogger::new().init().unwrap();
 
-    info!("starting");
+    info!("setup");
 
-    let rounds = 5000;
+    let rounds = 2000;
     let num_of_peers = 2000;
     let mut seed = [0u8; 32];
     rand::thread_rng().fill(&mut seed);
@@ -61,17 +61,43 @@ fn main() {
         //     node.seed_peer(add_peer);
         // }
 
-        // gradient like selection of peers around own-id
+        // Bell-shaped (Gaussian) selection centered on own peer_id
+        let ring_size = u64::MAX;
+        let sigma = (ring_size / 8) as f64; // Controls width of the bell curve
+
         for p in &peers {
-            let d = peer_id.abs_diff(*p);
-            let r = rng.next_u64();
-            if r > d  {
+            // Calculate shortest distance on the ring (wraps around)
+            let forward_dist = if *p >= *peer_id {
+                *p - peer_id
+            } else {
+                ring_size - peer_id + *p
+            };
+            let backward_dist = if peer_id >= p {
+                peer_id - *p
+            } else {
+                ring_size - *p + peer_id
+            };
+            let ring_dist = forward_dist.min(backward_dist);
+
+            // Scale probability: closest ≈0.9, farthest ≈0.1
+            let normalized_dist = (ring_dist as f64) / ((ring_size / 2) as f64);
+            let probability = 0.7 - (0.6 * normalized_dist);
+
+            // Gaussian probability: exp(-d²/2σ²)
+            let d = ring_dist as f64;
+            let exponent = -(d * d) / (2.0 * sigma * sigma);
+            //let probability = exponent.exp();
+
+            let r = rng.next_u64() as f64 / u64::MAX as f64;
+            if r < probability {
                 node.seed_peer(p);
             }
         }
 
         nodes.insert(*peer_id, node);
     }
+
+    info!("starting");
 
     let mut blocks: BTreeMap<BlockId, PeerId> = BTreeMap::new();
 

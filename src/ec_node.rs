@@ -79,6 +79,7 @@ impl EcNode {
                     // TODO mark as blocked 
 
                     blocked.insert(block_id);
+                    println!("BLOCKED {} {}", self.peer_id & 0xFFF, block_id & 0xFF)
                 }
                 token = *token_id
             }
@@ -187,18 +188,35 @@ impl EcNode {
                 target,
                 ticket,
             } => {
+                let respond_to = if *target == 0 { msg.sender } else { *target };
+
                 // TODO also for me ? And forwarding
                 if let Some(me) = self.mem_pool.query(token).map(|block| MessageEnvelope {
                     sender: self.peer_id,
-                    receiver: if *target == 0 { msg.sender } else { *target },
+                    receiver: respond_to,
                     ticket: *ticket,
                     time: self.time,
                     message: Message::Block { block },
                 }) {
                     responses.push(me)
-                } else {
+                } else if (token ^ self.time) & 0x3 == 0  {
                     // TODO P(forwarding)
-                    // self.peers.peers_for(token, 1)
+                    let peer_id = self.peers.peer_for(token, self.time);
+
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: peer_id,
+                        ticket: 0,
+                        time: self.time,
+                        message: Message::Query {
+                            token: *token,
+                            target: respond_to,
+                            ticket: *ticket,
+                        },
+                    });
+
+                    //self.peers.peer_for(token, self.time)
+                    println!("{} not-found p {} b {} (from {} -> fwd {})", self.time, self.peer_id & 0xFFF, token & 0xFF, respond_to & 0xFFF, peer_id & 0xFFF);
                 }
             }
             Message::Answer { answer, signature } => {
@@ -211,7 +229,11 @@ impl EcNode {
                 // TODO in this case the block must have "commit-at-history-id"
                 msg.ticket == self.parent_block_req_ticket ^ block.id  {
                     // TODO DOS-protection
-                    self.mem_pool.block(block, self.time)
+                    
+                    if self.mem_pool.block(block, self.time) {
+                        let is_reorg = msg.ticket == self.parent_block_req_ticket ^ block.id;
+                        //println!("{} recv p {} b {} (re {})", self.time, self.peer_id & 0xFFF, block.id & 0xFF, is_reorg);
+                    }
                 } else {
                     // else other req for blocks - or discard
                     self.mem_pool.validate_with(block, &msg.ticket)

@@ -1,4 +1,8 @@
-use crate::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
+use rand::{self, RngCore};
+
+use crate::ec_interface::{
+    EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
+};
 
 struct MemPeer {
     id: PeerId,
@@ -8,7 +12,7 @@ struct MemPeer {
 
 pub struct EcPeers {
     pub peer_id: PeerId,
-    active: Vec<MemPeer>,
+    active: Vec<MemPeer>
 }
 
 pub struct PeerRange {
@@ -47,13 +51,13 @@ impl EcPeers {
         res as usize
     }
 
-    /// responding to neighborhood 
+    /// responding to neighborhood
     pub(crate) fn handle_answer(
         &self,
         answer: &TokenMapping,
         signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
         ticket: MessageTicket,
-        peer_id: PeerId
+        peer_id: PeerId,
     ) {
     }
 
@@ -78,10 +82,11 @@ impl EcPeers {
             Err(i) => i,
         };
 
-        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize + 1;
-        //let start = self.idx_sub(idx, 4);
-        // rotating peers
-        return self.active.get(self.idx_adj(idx, -adj)).unwrap().id;
+        //let adj = (rand::thread_rng().next_u32() & 0x7) as isize - 3;
+
+        let adj = (((key ^ self.peer_id) + time) & 0x7) as isize - 3;
+
+        return self.active.get(self.idx_adj(idx, adj)).unwrap().id;
     }
 
     pub(crate) fn peers_idx_for(&self, key: &TokenId, time: EcTime) -> Vec<usize> {
