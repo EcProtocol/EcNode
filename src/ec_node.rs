@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use hashbrown::{HashMap, HashSet};
+
 use crate::ec_interface::{
     Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, MessageTicket, PeerId,
 };
@@ -17,6 +19,7 @@ pub struct EcNode {
     peer_id: PeerId,
     time: EcTime,
     block_req_ticket: MessageTicket,
+    parent_block_req_ticket: MessageTicket,
 }
 
 impl EcNode {
@@ -34,6 +37,7 @@ impl EcNode {
             peer_id: id,
             time,
             block_req_ticket: 2, // TODO shuffle
+            parent_block_req_ticket: 3
         }
     }
 
@@ -66,19 +70,26 @@ impl EcNode {
         let mut messages = self.mem_pool.tick(&self.peers, self.time, self.peer_id);
         messages.sort_unstable_by_key(MessageRequest::sort_key);
 
-        // work on earlier blocks before later
-        // TODO check - and also applied to parent - oldest ref first
-        let mut last = 0;
-        for request in messages {
-            match request {
-                MessageRequest::VOTE(block_id, token_id, mut vote, _) => {
-                    if token_id == last {
-                        // sort requests - and detect CONFLICT (multiple positive vores for same token)
-                        println!("skipping");
+        // loop through and find any conflicting votes (true, true) - and block them.
+        let mut token = 0;
+        let mut blocked = HashSet::new();
+        for request in &messages {
+            if let MessageRequest::VOTE(block_id, token_id, _, true) = request {
+                if token == *token_id {
+                    // TODO mark as blocked 
 
-                        continue;
-                    }
-                    last = token_id;
+                    blocked.insert(block_id);
+                }
+                token = *token_id
+            }
+        }
+
+        // TODO check - and also applied to parent - oldest ref first
+        for request in &messages {
+            match request {
+                MessageRequest::VOTE(block_id, token_id, vote, _) => {
+                    // blocked then all negative
+                    let vote = if blocked.contains(&block_id) {0} else {*vote};
 
                     for peer_id in self.peers.peers_for(&token_id, self.time) {
                         responses.push(MessageEnvelope {
@@ -87,38 +98,27 @@ impl EcNode {
                             ticket: 0,
                             time: self.time,
                             message: Message::Vote {
-                                block_id,
+                                block_id: *block_id,
                                 vote,
                                 reply: true,
                             },
                         })
                     }
                 }
-                MessageRequest::PARENT(block_id, parent_id, _) => {
-                    // only request the same block once each round
-                    if parent_id == last {
-                        continue;
-                    }
-                    last = parent_id;
-
+                MessageRequest::PARENT(block_id, parent_id) => {
                     // TODO a work around. Should be handled in mem_pool
                     if let Some(parent) = self.mem_pool.query(&parent_id) {
                         self.mem_pool.validate_with(&parent, &block_id);
                     } else {
                         let peer_id = self.peers.peer_for(&parent_id, self.time);
 
-                        responses.push(MessageEnvelope {
-                            sender: self.peer_id,
-                            receiver: peer_id,
-                            ticket: 0,
-                            time: self.time,
-                            message: Message::Query {
-                                token: parent_id,
-                                target: 0,
-                                ticket: block_id,
-                            },
-                        })
+                        responses.push(self.request_block(&peer_id, &block_id, 0))
                     }
+                }
+                MessageRequest::PARENTCOMMIT(block_id) => {
+                        let peer_id = self.peers.peer_for(&block_id, self.time);
+
+                        responses.push(self.request_block(&peer_id, &block_id, self.parent_block_req_ticket))
                 }
             }
         }
@@ -167,12 +167,12 @@ impl EcNode {
                         // TODO check load-balancing count for this peer
                         self.mem_pool.vote(block, *vote, &msg.sender, msg.time);
                         // better ask the sender for it - while propagating towards the "witness"
-                        responses.push(self.request_block(&msg.sender, block))
+                        responses.push(self.request_block(&msg.sender, block, self.block_req_ticket))
                     }
                     (None, None) => {
                         // TODO test ticket is from subscribed client + DOS protection
                         if msg.ticket > 0 {
-                            responses.push(self.request_block(&msg.sender, block))
+                            responses.push(self.request_block(&msg.sender, block, self.block_req_ticket))
                         }
 
                         // TODO this should be handled by "introduction" messages - linking peers
@@ -207,7 +207,9 @@ impl EcNode {
             }
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
-                if msg.ticket == self.block_req_ticket ^ block.id {
+                if msg.ticket == self.block_req_ticket ^ block.id || 
+                // TODO in this case the block must have "commit-at-history-id"
+                msg.ticket == self.parent_block_req_ticket ^ block.id  {
                     // TODO DOS-protection
                     self.mem_pool.block(block, self.time)
                 } else {
@@ -232,7 +234,7 @@ impl EcNode {
         }
     }
 
-    fn request_block(&self, receiver: &PeerId, block: &BlockId) -> MessageEnvelope {
+    fn request_block(&self, receiver: &PeerId, block: &BlockId, ticket: MessageTicket) -> MessageEnvelope {
         MessageEnvelope {
             sender: self.peer_id,
             receiver: *receiver,
@@ -241,7 +243,7 @@ impl EcNode {
             message: Message::Query {
                 token: *block,
                 target: 0,
-                ticket: self.block_req_ticket ^ block, // TODO calc ticket with SHA
+                ticket: ticket ^ block, // TODO calc ticket with SHA
             },
         }
     }

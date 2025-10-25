@@ -22,16 +22,18 @@ pub enum BlockState {
 }
 
 pub enum MessageRequest {
-    VOTE(BlockId, TokenId, u8, EcTime),
-    PARENT(BlockId, BlockId, EcTime),
+    VOTE(BlockId, TokenId, u8, bool),
+    PARENT(BlockId, BlockId),
+    PARENTCOMMIT(BlockId), 
 }
 
 impl MessageRequest {
-    pub fn sort_key(&self) -> (TokenId, EcTime) {
+    pub fn sort_key(&self) -> (TokenId, bool) {
         match self {
             // group equal token_id and get possitive votes first
-            MessageRequest::VOTE(_, token_id, _, time) => (*token_id, *time),
-            MessageRequest::PARENT(_, parent_id, time) => (*parent_id, *time),
+            MessageRequest::VOTE(_, token_id, _, possitive) => (*token_id, *possitive),
+            MessageRequest::PARENT(_, parent_id) => (*parent_id, false),
+            MessageRequest::PARENTCOMMIT(block_id) => (*block_id, false),
         }
     }
 }
@@ -85,6 +87,10 @@ impl PoolBlockState {
         // did we change anything ? then it might be time to check the votes again
         if pv.time == time {
             self.updated = true;
+        }
+
+        if self.block.is_none() {
+            println!("vote {} on empty", self.votes.len());
         }
     }
 
@@ -310,13 +316,24 @@ impl EcMemPool {
                 for i in 0..block.used as usize {
                     let current_mapping =
                         tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block);
+                    let last_mapping = block.parts[i].last;
 
-                    if current_mapping == block.parts[i].last {
+                    if current_mapping == last_mapping {
                         vote |= 1 << i
                     } else if current_mapping != 0 {
                         // Never allow missing links or re-orgs on committed tokens
                         no_skip_or_reorg = false;
+
+                        // request predessor block
+                        messages.push(MessageRequest::PARENTCOMMIT(
+                            last_mapping,
+                        ));
                     }
+                }
+
+                // TODO this?
+                if !no_skip_or_reorg {
+                    block_state.votes.clear();
                 }
 
                 // if no remaining votes AND all is validated - commit
@@ -363,8 +380,7 @@ impl EcMemPool {
                         // fetch a parent
                         messages.push(MessageRequest::PARENT(
                             *block_id,
-                            block.parts[i].last,
-                            block.time,
+                            block.parts[i].last
                         ));
                     }
 
@@ -374,14 +390,14 @@ impl EcMemPool {
                             *block_id,
                             block.parts[i].token,
                             vote,
-                            block.time,
+                            vote & 1 << i != 0,
                         ));
                     }
                 }
 
                 // vote witness
                 if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
-                    messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, block.time));
+                    messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, false));
                 }
             }
         }
