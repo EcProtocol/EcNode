@@ -91,6 +91,8 @@ let result = runner.run();
 | `network` | `NetworkConfig` | Network behavior configuration |
 | `topology` | `TopologyConfig` | Peer connectivity topology |
 | `transactions` | `TransactionConfig` | Block/token generation settings |
+| `enable_event_logging` | `bool` | Enable console event logging (default: false) |
+| `csv_output_path` | `Option<String>` | Export events to single CSV file (None = disabled) |
 
 ### NetworkConfig
 
@@ -219,15 +221,110 @@ let result2 = SimRunner::new(config.clone()).run();
 assert_eq!(result1.committed_blocks, result2.committed_blocks);
 ```
 
+## Event Logging and Analysis
+
+The simulator provides multiple event sinks for debugging and analysis:
+
+### Console Logging
+
+Enable real-time console output of consensus events:
+
+```rust
+let config = SimConfig {
+    enable_event_logging: true,
+    ..Default::default()
+};
+```
+
+### CSV Export
+
+Export events to a single CSV file for external analysis:
+
+```rust
+let config = SimConfig {
+    csv_output_path: Some("sim_events.csv".to_string()),  // All events in one file
+    ..Default::default()
+};
+```
+
+All peers write to the same file. Use the `peer` column to filter events by peer:
+
+```bash
+# Count total commits
+grep BlockCommitted sim_events.csv | wc -l
+
+# Find events from a specific peer
+grep ",7061981662790029469," sim_events.csv
+
+# Analysis with awk
+awk -F',' '$3=="BlockCommitted"' sim_events.csv
+
+# Import to Python
+df = pd.read_csv('sim_events.csv')
+commits = df[df['event_type'] == 'BlockCommitted']
+per_peer = df.groupby('peer')['event_type'].value_counts()
+```
+
+### Programmatic Analysis
+
+Use `CollectorEventSink` for in-memory event collection:
+
+```rust
+use simulator::CollectorEventSink;
+use ec_rust::EcNode;
+
+let collector = CollectorEventSink::new();
+let node = EcNode::new_with_sink(
+    tokens,
+    blocks,
+    peer_id,
+    0,
+    Box::new(collector)
+);
+
+// After simulation...
+let commits = collector.commits().count();
+let reorgs = collector.reorgs().count();
+let counts = collector.count_by_type();
+
+// Export collected events
+collector.export_to_csv("analysis.csv")?;
+```
+
+### Available Event Types
+
+- **BlockReceived**: Block propagation events
+- **VoteCast**: Individual vote events with token/vote details
+- **BlockCommitted**: Block commitment events with vote counts
+- **Reorg**: Chain reorganization events
+- **BlockNotFound**: Missing block queries
+- **BlockStateChange**: State transitions (Pending → Commit, etc.)
+
+### Multi-Sink
+
+Combine multiple sinks (e.g., console + CSV):
+
+```rust
+use simulator::MultiEventSink;
+
+let mut multi = MultiEventSink::new();
+multi.add_sink(Box::new(ConsoleEventSink::new(true)));
+multi.add_sink(Box::new(CsvEventSink::new("events.csv")?));
+```
+
+See `examples/csv_export_test.rs` and `examples/event_analysis.rs` for complete examples.
+
 ## Module Structure
 
 ```
 simulator/
-├── mod.rs       # Public API and documentation
-├── config.rs    # Configuration structures
-├── runner.rs    # Simulation execution engine
-├── stats.rs     # Results and statistics
-└── README.md    # This file
+├── mod.rs         # Public API and documentation
+├── config.rs      # Configuration structures
+├── runner.rs      # Simulation execution engine
+├── stats.rs       # Results and statistics
+├── event_sink.rs  # Simple logging sink
+├── event_sinks.rs # Advanced sink implementations
+└── README.md      # This file
 ```
 
 ## Future Enhancements

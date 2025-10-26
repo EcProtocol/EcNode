@@ -19,7 +19,10 @@ use ec_rust::ec_tokens::MemTokens;
 
 use super::config::{SimConfig, TopologyConfig, TopologyMode};
 use super::event_sink::LoggingEventSink;
+use super::event_sinks::{ConsoleEventSink, CsvEventSink, MultiEventSink};
 use super::stats::{MessageCounts, PeerStats, SimResult, SimStatistics};
+
+use std::sync::{Arc, Mutex};
 
 /// Simulation runner that executes consensus simulation
 pub struct SimRunner {
@@ -58,14 +61,45 @@ impl SimRunner {
             tokens.push((rng.next_u64(), 0, 0));
         }
 
+        // Create shared CSV sink if path is provided
+        let shared_csv_sink: Option<Arc<Mutex<CsvEventSink>>> = if let Some(ref csv_path) = config.csv_output_path {
+            match CsvEventSink::new(csv_path) {
+                Ok(sink) => Some(Arc::new(Mutex::new(sink))),
+                Err(e) => {
+                    eprintln!("Warning: Could not create CSV file '{}': {}", csv_path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Create nodes with topology
         let mut nodes: BTreeMap<PeerId, EcNode> = BTreeMap::new();
         for peer_id in &peers {
             let token_store = Rc::new(RefCell::new(MemTokens::new()));
             let block_store = Rc::new(RefCell::new(MemBlocks::new()));
 
-            // Create node with logging event sink (configurable via SimConfig)
-            let event_sink = Box::new(LoggingEventSink::new(config.enable_event_logging));
+            // Create event sink based on configuration
+            let event_sink: Box<dyn ec_rust::EventSink> = if shared_csv_sink.is_some() || config.enable_event_logging {
+                let mut multi = MultiEventSink::new();
+
+                if config.enable_event_logging {
+                    multi.add_sink(Box::new(ConsoleEventSink::new(true)));
+                }
+
+                if let Some(ref csv_sink_arc) = shared_csv_sink {
+                    multi.add_sink(Box::new(SharedCsvSink {
+                        sink: csv_sink_arc.clone(),
+                    }));
+                }
+
+                Box::new(multi)
+            } else {
+                // Simple console logging (disabled)
+                Box::new(LoggingEventSink::new(false))
+            };
+
             let mut node = EcNode::new_with_sink(token_store, block_store, *peer_id, 0, event_sink);
 
             // Apply topology configuration
@@ -307,6 +341,19 @@ impl SimRunner {
             committed_blocks: self.committed,
             total_messages: self.message_count,
             seed_used: self.seed_used,
+        }
+    }
+}
+
+/// Wrapper to share a single CsvEventSink across multiple nodes
+struct SharedCsvSink {
+    sink: Arc<Mutex<CsvEventSink>>,
+}
+
+impl ec_rust::EventSink for SharedCsvSink {
+    fn log(&mut self, round: ec_rust::EcTime, peer: ec_rust::PeerId, event: ec_rust::Event) {
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.log(round, peer, event);
         }
     }
 }

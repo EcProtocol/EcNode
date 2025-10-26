@@ -19,6 +19,9 @@ impl EventSink for LoggingEventSink {
             return;
         }
 
+        // Format: round peer_id event_type event_details
+        let peer_fmt = format!("{:x}", peer & 0xFFFF);
+
         match event {
             Event::BlockReceived {
                 block_id,
@@ -26,11 +29,11 @@ impl EventSink for LoggingEventSink {
                 size,
             } => {
                 println!(
-                    "{} recv: p:{} b:{} from:{} size:{}",
+                    "{:>5} {:>6} BlockReceived    block:{:x} from:{:x} size:{}",
                     round,
-                    peer & 0xFFF,
-                    block_id & 0xFF,
-                    from_peer & 0xFFF,
+                    peer_fmt,
+                    block_id & 0xFFFF,
+                    from_peer & 0xFFFF,
                     size
                 );
             }
@@ -41,13 +44,13 @@ impl EventSink for LoggingEventSink {
                 positive,
             } => {
                 println!(
-                    "{} vote: p:{} b:{} t:{} v:{} pos:{}",
+                    "{:>5} {:>6} VoteCast         block:{:x} token:{:x} vote:{} {}",
                     round,
-                    peer & 0xFFF,
-                    block_id & 0xFF,
-                    token & 0xFF,
+                    peer_fmt,
+                    block_id & 0xFFFF,
+                    token & 0xFFFF,
                     vote,
-                    positive
+                    if positive { "✓" } else { "✗" }
                 );
             }
             Event::BlockCommitted {
@@ -56,10 +59,10 @@ impl EventSink for LoggingEventSink {
                 votes,
             } => {
                 println!(
-                    "{} cmt: p:{} b:{} votes:{}",
+                    "{:>5} {:>6} BlockCommitted   block:{:x} votes:{}",
                     round,
-                    committed_peer & 0xFFF,
-                    block_id & 0xFF,
+                    format!("{:x}", committed_peer & 0xFFFF),
+                    block_id & 0xFFFF,
                     votes
                 );
             }
@@ -70,12 +73,12 @@ impl EventSink for LoggingEventSink {
                 to,
             } => {
                 println!(
-                    "{} reorg b:{} p:{}: {} <-> {}",
+                    "{:>5} {:>6} Reorg            block:{:x} from:{:x} to:{:x}",
                     round,
-                    block_id & 0xFF,
-                    affected_peer & 0xFFF,
-                    from & 0xFF,
-                    to & 0xFF
+                    format!("{:x}", affected_peer & 0xFFFF),
+                    block_id & 0xFFFF,
+                    from & 0xFFFF,
+                    to & 0xFFFF
                 );
             }
             Event::BlockNotFound {
@@ -84,11 +87,11 @@ impl EventSink for LoggingEventSink {
                 from_peer,
             } => {
                 println!(
-                    "{} not-found p:{} b:{} (from:{})",
+                    "{:>5} {:>6} BlockNotFound    block:{:x} from:{:x}",
                     round,
-                    local_peer & 0xFFF,
-                    block_id & 0xFF,
-                    from_peer & 0xFFF
+                    format!("{:x}", local_peer & 0xFFFF),
+                    block_id & 0xFFFF,
+                    from_peer & 0xFFFF
                 );
             }
             Event::BlockStateChange {
@@ -97,10 +100,10 @@ impl EventSink for LoggingEventSink {
                 to_state,
             } => {
                 println!(
-                    "{} state: p:{} b:{} {} -> {}",
+                    "{:>5} {:>6} StateChange      block:{:x} {} -> {}",
                     round,
-                    peer & 0xFFF,
-                    block_id & 0xFF,
+                    peer_fmt,
+                    block_id & 0xFFFF,
                     from_state,
                     to_state
                 );

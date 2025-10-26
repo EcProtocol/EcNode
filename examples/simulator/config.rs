@@ -10,6 +10,7 @@ pub struct SimConfig {
     pub topology: TopologyConfig,
     pub transactions: TransactionConfig,
     pub enable_event_logging: bool,
+    pub csv_output_path: Option<String>,
 }
 
 /// Network behavior configuration
@@ -57,6 +58,7 @@ impl Default for SimConfig {
             topology: TopologyConfig::default(),
             transactions: TransactionConfig::default(),
             enable_event_logging: false,
+            csv_output_path: None,
         }
     }
 }

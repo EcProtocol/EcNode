@@ -19,9 +19,10 @@ fn main() {
     // Small simulation to see events clearly
     let config = SimConfig {
         rounds: 50,
-        num_peers: 50, // Minimum ~20 peers needed for topology to work
-        seed: Some([42u8; 32]), // Fixed seed for reproducibility
+        num_peers: 50,              // Minimum ~20 peers needed for topology to work
+        seed: Some([42u8; 32]),     // Fixed seed for reproducibility
         enable_event_logging: true, // Enable event logging
+        csv_output_path: None,      // Set to Some("event_test.csv") for CSV export
         ..Default::default()
     };
 

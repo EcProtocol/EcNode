@@ -12,10 +12,20 @@
 
 mod config;
 mod event_sink;
+mod event_sinks;
 mod runner;
 mod stats;
 
+#[allow(unused_imports)]
 pub use config::{NetworkConfig, SimConfig, TopologyConfig, TopologyMode, TransactionConfig};
+#[allow(unused_imports)]
 pub use event_sink::LoggingEventSink;
+#[allow(unused_imports)]
+pub use event_sinks::{
+    CollectorEventSink, ConsoleEventSink, CsvEventSink, EventRecord, EventTypeCounts,
+    MultiEventSink,
+};
+#[allow(unused_imports)]
 pub use runner::SimRunner;
+#[allow(unused_imports)]
 pub use stats::{MessageCounts, PeerStats, SimResult, SimStatistics};

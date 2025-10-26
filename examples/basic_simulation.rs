@@ -33,6 +33,7 @@ fn main() {
             block_size_range: (1, 3),
         },
         enable_event_logging: true, // Enable to see consensus events
+        csv_output_path: None,      // Set to Some("events.csv") to export all events
     };
 
     info!("Starting simulation...");
