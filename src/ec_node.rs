@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 
 use crate::ec_interface::{
     Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, MessageTicket, PeerId,

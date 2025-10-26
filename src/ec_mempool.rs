@@ -1,8 +1,6 @@
 // track the state of transactions
 
-use log::info;
 use std::cell::RefCell;
-use std::clone;
 use std::rc::Rc;
 
 use hashbrown::HashMap;

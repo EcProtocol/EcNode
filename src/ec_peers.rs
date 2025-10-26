@@ -1,4 +1,3 @@
-use rand::{self, RngCore};
 
 use crate::ec_interface::{
     EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
