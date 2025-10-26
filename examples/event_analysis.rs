@@ -9,15 +9,9 @@
 
 use log::info;
 use simple_logger::SimpleLogger;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 mod simulator;
-use simulator::{CollectorEventSink, SimConfig, SimRunner};
-
-use ec_rust::ec_blocks::MemBlocks;
-use ec_rust::ec_node::EcNode;
-use ec_rust::ec_tokens::MemTokens;
+use simulator::{SimConfig, SimRunner};
 
 fn main() {
     SimpleLogger::new().init().unwrap();

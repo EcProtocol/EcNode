@@ -11,7 +11,6 @@
 //! See `examples/basic_simulation.rs` for a complete example.
 
 mod config;
-mod event_sink;
 mod event_sinks;
 mod runner;
 mod stats;
@@ -19,7 +18,6 @@ mod stats;
 #[allow(unused_imports)]
 pub use config::{NetworkConfig, SimConfig, TopologyConfig, TopologyMode, TransactionConfig};
 #[allow(unused_imports)]
-pub use event_sink::LoggingEventSink;
 #[allow(unused_imports)]
 pub use event_sinks::{
     CollectorEventSink, ConsoleEventSink, CsvEventSink, EventRecord, EventTypeCounts,

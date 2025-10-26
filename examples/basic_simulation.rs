@@ -32,8 +32,8 @@ fn main() {
             initial_tokens: 1,
             block_size_range: (1, 3),
         },
-        enable_event_logging: true, // Enable to see consensus events
-        csv_output_path: None,      // Set to Some("events.csv") to export all events
+        enable_event_logging: false, // Enable to see consensus events
+        csv_output_path: Some("sim_events.csv".to_string()),      // Set to Some("events.csv") to export all events
     };
 
     info!("Starting simulation...");

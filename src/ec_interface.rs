@@ -174,6 +174,10 @@ pub enum Event {
         from_state: &'static str,
         to_state: &'static str,
     },
+    VoteReceived {
+        block_id: BlockId,
+        from_peer: PeerId,
+    },
 }
 
 /// Trait for consuming events from the consensus system

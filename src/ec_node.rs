@@ -169,6 +169,11 @@ impl EcNode {
                 vote,
                 reply,
             } => {
+                self.event_sink.log(self.time, self.peer_id, Event::VoteReceived { 
+                    block_id: *block, 
+                    from_peer: msg.sender 
+                } );
+
                 match (
                     self.mem_pool.status(block),
                     self.peers.trusted_peer(&msg.sender),

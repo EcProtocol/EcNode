@@ -1,7 +1,9 @@
 // track the state of transactions
 
 use std::cell::RefCell;
+use std::io::SeekFrom;
 use std::rc::Rc;
+use std::thread::sleep;
 
 use hashbrown::HashMap;
 
@@ -86,10 +88,6 @@ impl PoolBlockState {
         if pv.time == time {
             self.updated = true;
         }
-
-        //if self.block.is_none() {
-        //    println!("vote {} on empty", self.votes.len());
-        //}
     }
 
     fn put_block<F>(&mut self, block: &Block, validate: F) -> bool
@@ -343,13 +341,7 @@ impl EcMemPool {
                     }
                 }
 
-                // TODO this?
-                if !no_skip_or_reorg {
-                    //block_state.votes.clear();
-                }
-
                 // if no remaining votes AND all is validated - commit
-                //no_skip_or_reorg = true;
                 if no_skip_or_reorg && block_state.remaining == 0 && block_state.validate == 0 {
                     // TODO should it be kept in mempool for a while - can it be rolled back ever? -> NO
 
@@ -362,21 +354,6 @@ impl EcMemPool {
                     for i in 0..block.used as usize {
                         // TODO (ok?) only tokens in my range -> together with "no_skip_or_reorg" lock
                         if my_range.in_range(&block.parts[i].token) {
-                            /*
-                            if !no_skip_or_reorg {
-                                let current_mapping =
-                                tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block);
-
-                                println!(
-                                    "{} reorg b:{} p:{}: {} <-> {}",
-                                    time,
-                                    block_id & 0xFF,
-                                    id & 0xFF,
-                                    current_mapping & 0xFF,
-                                    block.parts[i].last & 0xFF
-                                );
-                            } else */
-                            {
                                 event_sink.log(
                                     time,
                                     id,
@@ -386,7 +363,6 @@ impl EcMemPool {
                                         votes: block_state.votes.len(),
                                     },
                                 );
-                            }
 
                             tokens.set(&block.parts[i].token, &block.id, block.time);
                         }

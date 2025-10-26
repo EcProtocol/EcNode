@@ -18,7 +18,6 @@ use ec_rust::ec_node::EcNode;
 use ec_rust::ec_tokens::MemTokens;
 
 use super::config::{SimConfig, TopologyConfig, TopologyMode};
-use super::event_sink::LoggingEventSink;
 use super::event_sinks::{ConsoleEventSink, CsvEventSink, MultiEventSink};
 use super::stats::{MessageCounts, PeerStats, SimResult, SimStatistics};
 
@@ -97,7 +96,7 @@ impl SimRunner {
                 Box::new(multi)
             } else {
                 // Simple console logging (disabled)
-                Box::new(LoggingEventSink::new(false))
+                Box::new(ConsoleEventSink::new(false))
             };
 
             let mut node = EcNode::new_with_sink(token_store, block_store, *peer_id, 0, event_sink);
