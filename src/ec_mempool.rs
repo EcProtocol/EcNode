@@ -264,7 +264,7 @@ impl EcMemPool {
         let mut messages = Vec::new();
 
         // TODO clean out expired elements - how old?
-        self.pool.retain(|_, s| time - s.time < 50);
+        self.pool.retain(|_, s| time - s.time < 200);
 
         let mut tokens = self.tokens.borrow_mut();
 
