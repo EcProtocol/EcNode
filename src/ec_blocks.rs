@@ -26,8 +26,4 @@ impl EcBlocks for MemBlocks {
     fn save(&mut self, block: &Block) {
         self.blocks.insert(block.id, *block);
     }
-
-    fn remove(&mut self, block: &BlockId) {
-        self.blocks.remove(block);
-    }
 }

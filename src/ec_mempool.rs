@@ -439,10 +439,6 @@ mod tests {
             self.blocks.insert(block.id, *block);
         }
 
-        fn remove(&mut self, _block: &BlockId) {
-            // Not needed for this test
-        }
-
         fn exists(&self, block: &BlockId) -> bool {
             self.blocks.contains_key(block)
         }

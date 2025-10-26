@@ -127,6 +127,4 @@ pub trait EcBlocks {
     fn exists(&self, block: &BlockId) -> bool;
 
     fn save(&mut self, block: &Block);
-
-    fn remove(&mut self, block: &BlockId);
 }
