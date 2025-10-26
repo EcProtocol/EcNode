@@ -18,6 +18,7 @@ use ec_rust::ec_node::EcNode;
 use ec_rust::ec_tokens::MemTokens;
 
 use super::config::{SimConfig, TopologyConfig, TopologyMode};
+use super::event_sink::LoggingEventSink;
 use super::stats::{MessageCounts, PeerStats, SimResult, SimStatistics};
 
 /// Simulation runner that executes consensus simulation
@@ -62,7 +63,10 @@ impl SimRunner {
         for peer_id in &peers {
             let token_store = Rc::new(RefCell::new(MemTokens::new()));
             let block_store = Rc::new(RefCell::new(MemBlocks::new()));
-            let mut node = EcNode::new(token_store, block_store, *peer_id, 0);
+
+            // Create node with logging event sink (configurable via SimConfig)
+            let event_sink = Box::new(LoggingEventSink::new(config.enable_event_logging));
+            let mut node = EcNode::new_with_sink(token_store, block_store, *peer_id, 0, event_sink);
 
             // Apply topology configuration
             Self::apply_topology(&mut node, peer_id, &peers, &config.topology, &mut rng);

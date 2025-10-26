@@ -128,3 +128,65 @@ pub trait EcBlocks {
 
     fn save(&mut self, block: &Block);
 }
+
+// ============================================================================
+// Event Logging System
+// ============================================================================
+
+/// Events emitted by the consensus system for debugging and analysis
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// Block received from another peer
+    BlockReceived {
+        block_id: BlockId,
+        peer: PeerId,
+        size: u8,
+    },
+    /// Vote cast on a block
+    VoteCast {
+        block_id: BlockId,
+        token: TokenId,
+        vote: u8,
+        positive: bool,
+    },
+    /// Block committed to storage
+    BlockCommitted {
+        block_id: BlockId,
+        peer: PeerId,
+        votes: usize,
+    },
+    /// Reorganization detected
+    Reorg {
+        block_id: BlockId,
+        peer: PeerId,
+        from: BlockId,
+        to: BlockId,
+    },
+    /// Block not found during query
+    BlockNotFound {
+        block_id: BlockId,
+        peer: PeerId,
+        from_peer: PeerId,
+    },
+    /// Block state change
+    BlockStateChange {
+        block_id: BlockId,
+        from_state: &'static str,
+        to_state: &'static str,
+    },
+}
+
+/// Trait for consuming events from the consensus system
+pub trait EventSink {
+    fn log(&mut self, round: EcTime, peer: PeerId, event: Event);
+}
+
+/// No-op event sink for production use (zero overhead)
+pub struct NoOpSink;
+
+impl EventSink for NoOpSink {
+    #[inline(always)]
+    fn log(&mut self, _round: EcTime, _peer: PeerId, _event: Event) {
+        // Intentionally empty - compiler should optimize this away
+    }
+}

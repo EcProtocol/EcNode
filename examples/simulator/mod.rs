@@ -11,9 +11,11 @@
 //! See `examples/basic_simulation.rs` for a complete example.
 
 mod config;
+mod event_sink;
 mod runner;
 mod stats;
 
 pub use config::{NetworkConfig, SimConfig, TopologyConfig, TopologyMode, TransactionConfig};
+pub use event_sink::LoggingEventSink;
 pub use runner::SimRunner;
 pub use stats::{MessageCounts, PeerStats, SimResult, SimStatistics};

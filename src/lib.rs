@@ -55,5 +55,6 @@ pub mod ec_tokens;
 // Re-export commonly used types
 pub use ec_node::EcNode;
 pub use ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, PeerId, TokenId,
+    Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, Message, MessageEnvelope,
+    NoOpSink, PeerId, TokenId,
 };

@@ -4,7 +4,8 @@ use std::rc::Rc;
 use hashbrown::HashSet;
 
 use crate::ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, Message, MessageEnvelope, MessageTicket, PeerId,
+    Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, Message, MessageEnvelope,
+    MessageTicket, NoOpSink, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
 use crate::ec_peers::EcPeers;
@@ -20,14 +21,27 @@ pub struct EcNode {
     time: EcTime,
     block_req_ticket: MessageTicket,
     parent_block_req_ticket: MessageTicket,
+    event_sink: Box<dyn EventSink>,
 }
 
 impl EcNode {
+    /// Create a new node with default NoOpSink (zero overhead)
     pub fn new(
         tokens: Rc<RefCell<dyn EcTokens>>,
         blocks: Rc<RefCell<dyn EcBlocks>>,
         id: PeerId,
         time: EcTime,
+    ) -> Self {
+        Self::new_with_sink(tokens, blocks, id, time, Box::new(NoOpSink))
+    }
+
+    /// Create a new node with a custom event sink for debugging/analysis
+    pub fn new_with_sink(
+        tokens: Rc<RefCell<dyn EcTokens>>,
+        blocks: Rc<RefCell<dyn EcBlocks>>,
+        id: PeerId,
+        time: EcTime,
+        event_sink: Box<dyn EventSink>,
     ) -> Self {
         Self {
             tokens: tokens.clone(),
@@ -37,7 +51,8 @@ impl EcNode {
             peer_id: id,
             time,
             block_req_ticket: 2, // TODO shuffle
-            parent_block_req_ticket: 3
+            parent_block_req_ticket: 3,
+            event_sink,
         }
     }
 
@@ -67,7 +82,9 @@ impl EcNode {
         // - idea: the oldest transaction (longest in mempool) "sucks" all overlapping into message - sync. on roll.
         // (when commited or timeout - this schedule of a neighborhood is then "freed" of the next oldest etc)
         // TODO could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
-        let mut messages = self.mem_pool.tick(&self.peers, self.time, self.peer_id);
+        let mut messages = self
+            .mem_pool
+            .tick(&self.peers, self.time, self.peer_id, &mut *self.event_sink);
         messages.sort_unstable_by_key(MessageRequest::sort_key);
 
         // loop through and find any conflicting votes (true, true) - and block them.
@@ -76,10 +93,18 @@ impl EcNode {
         for request in &messages {
             if let MessageRequest::VOTE(block_id, token_id, _, true) = request {
                 if token == *token_id {
-                    // TODO mark as blocked 
+                    // TODO mark as blocked
 
                     blocked.insert(block_id);
-                    println!("BLOCKED {} {}", self.peer_id & 0xFFF, block_id & 0xFF)
+                    self.event_sink.log(
+                        self.time,
+                        self.peer_id,
+                        Event::BlockStateChange {
+                            block_id: *block_id,
+                            from_state: "pending",
+                            to_state: "blocked",
+                        },
+                    );
                 }
                 token = *token_id
             }
@@ -215,8 +240,15 @@ impl EcNode {
                         },
                     });
 
-                    //self.peers.peer_for(token, self.time)
-                    println!("{} not-found p {} b {} (from {} -> fwd {})", self.time, self.peer_id & 0xFFF, token & 0xFF, respond_to & 0xFFF, peer_id & 0xFFF);
+                    self.event_sink.log(
+                        self.time,
+                        self.peer_id,
+                        Event::BlockNotFound {
+                            block_id: *token,
+                            peer: self.peer_id,
+                            from_peer: respond_to,
+                        },
+                    );
                 }
             }
             Message::Answer { answer, signature } => {
@@ -229,10 +261,18 @@ impl EcNode {
                 // TODO in this case the block must have "commit-at-history-id"
                 msg.ticket == self.parent_block_req_ticket ^ block.id  {
                     // TODO DOS-protection
-                    
+
                     if self.mem_pool.block(block, self.time) {
-                        let is_reorg = msg.ticket == self.parent_block_req_ticket ^ block.id;
-                        //println!("{} recv p {} b {} (re {})", self.time, self.peer_id & 0xFFF, block.id & 0xFF, is_reorg);
+                        let _is_reorg = msg.ticket == self.parent_block_req_ticket ^ block.id;
+                        self.event_sink.log(
+                            self.time,
+                            self.peer_id,
+                            Event::BlockReceived {
+                                block_id: block.id,
+                                peer: msg.sender,
+                                size: block.used,
+                            },
+                        );
                     }
                 } else {
                     // else other req for blocks - or discard

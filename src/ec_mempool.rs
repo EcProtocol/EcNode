@@ -6,8 +6,8 @@ use std::rc::Rc;
 use hashbrown::HashMap;
 
 use crate::ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, PeerId, PublicKeyReference, Signature, TokenId,
-    SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK, VOTE_THRESHOLD,
+    Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, PeerId, PublicKeyReference,
+    Signature, TokenId, SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK, VOTE_THRESHOLD,
 };
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
@@ -258,6 +258,7 @@ impl EcMemPool {
         peers: &EcPeers,
         time: EcTime,
         id: PeerId,
+        event_sink: &mut dyn EventSink,
     ) -> Vec<MessageRequest> {
         let mut messages = Vec::new();
 
@@ -329,13 +330,15 @@ impl EcMemPool {
                         // request predessor block
                         messages.push(MessageRequest::PARENTCOMMIT(last_mapping));
 
-                        println!(
-                            "{} reorg b:{} p:{}: {} <-> {}",
+                        event_sink.log(
                             time,
-                            block_id & 0xFF,
-                            id & 0xFFF,
-                            current_mapping & 0xFF,
-                            last_mapping & 0xFF
+                            id,
+                            Event::Reorg {
+                                block_id: *block_id,
+                                peer: id,
+                                from: current_mapping,
+                                to: last_mapping,
+                            },
                         );
                     }
                 }
@@ -374,7 +377,15 @@ impl EcMemPool {
                                 );
                             } else */
                             {
-                                println!("{} cmt: p:{} b:{}", time, id & 0xFFF, block_id & 0xFF);
+                                event_sink.log(
+                                    time,
+                                    id,
+                                    Event::BlockCommitted {
+                                        block_id: *block_id,
+                                        peer: id,
+                                        votes: block_state.votes.len(),
+                                    },
+                                );
                             }
 
                             tokens.set(&block.parts[i].token, &block.id, block.time);
