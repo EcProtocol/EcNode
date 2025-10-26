@@ -4,7 +4,8 @@
     "allow": [
       "WebFetch(domain:datatracker.ietf.org)",
       "WebFetch(domain:csrc.nist.gov)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(cargo build:*)"
     ],
     "deny": [],
     "defaultMode": "acceptEdits"
