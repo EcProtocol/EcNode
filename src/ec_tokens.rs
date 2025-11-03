@@ -28,13 +28,19 @@ impl EcTokens for MemTokens {
     }
 
     fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-        self.tokens.entry(*token)
+        self.tokens
+            .entry(*token)
             // only update if existing mapping is older than the proposed update
-            .and_modify(|m| if m.time < time {
-                m.time = time;
-                m.block = *block;
+            .and_modify(|m| {
+                if m.time < time {
+                    m.time = time;
+                    m.block = *block;
+                }
             })
-            .or_insert_with(|| BlockTime { block: *block, time });
+            .or_insert_with(|| BlockTime {
+                block: *block,
+                time,
+            });
     }
 
     fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<Message> {
@@ -106,4 +112,3 @@ impl MemTokens {
 
 #[cfg(test)]
 mod tests {}
-

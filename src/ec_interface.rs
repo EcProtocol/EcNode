@@ -63,6 +63,11 @@ pub enum Message {
     Block {
         block: Block,
     },
+    Referral {
+        token: TokenId,
+        high: PeerId,
+        low: PeerId,
+    },
 }
 
 pub enum RequestMessage {

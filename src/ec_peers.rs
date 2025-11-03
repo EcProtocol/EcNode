@@ -1,4 +1,3 @@
-
 use crate::ec_interface::{
     EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
 };
@@ -11,7 +10,7 @@ struct MemPeer {
 
 pub struct EcPeers {
     pub peer_id: PeerId,
-    active: Vec<MemPeer>
+    active: Vec<MemPeer>,
 }
 
 pub struct PeerRange {
@@ -59,6 +58,8 @@ impl EcPeers {
         peer_id: PeerId,
     ) {
     }
+
+    pub(crate) fn handle_referral(&self, sender: PeerId, high: PeerId, low: PeerId) {}
 
     pub(crate) fn peers_for(&self, key: &TokenId, time: EcTime) -> [PeerId; 2] {
         let idx = match self.active.binary_search_by(|p| p.id.cmp(key)) {

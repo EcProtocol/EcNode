@@ -61,17 +61,18 @@ impl SimRunner {
         }
 
         // Create shared CSV sink if path is provided
-        let shared_csv_sink: Option<Arc<Mutex<CsvEventSink>>> = if let Some(ref csv_path) = config.csv_output_path {
-            match CsvEventSink::new(csv_path) {
-                Ok(sink) => Some(Arc::new(Mutex::new(sink))),
-                Err(e) => {
-                    eprintln!("Warning: Could not create CSV file '{}': {}", csv_path, e);
-                    None
+        let shared_csv_sink: Option<Arc<Mutex<CsvEventSink>>> =
+            if let Some(ref csv_path) = config.csv_output_path {
+                match CsvEventSink::new(csv_path) {
+                    Ok(sink) => Some(Arc::new(Mutex::new(sink))),
+                    Err(e) => {
+                        eprintln!("Warning: Could not create CSV file '{}': {}", csv_path, e);
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Create nodes with topology
         let mut nodes: BTreeMap<PeerId, EcNode> = BTreeMap::new();
@@ -80,24 +81,25 @@ impl SimRunner {
             let block_store = Rc::new(RefCell::new(MemBlocks::new()));
 
             // Create event sink based on configuration
-            let event_sink: Box<dyn ec_rust::EventSink> = if shared_csv_sink.is_some() || config.enable_event_logging {
-                let mut multi = MultiEventSink::new();
+            let event_sink: Box<dyn ec_rust::EventSink> =
+                if shared_csv_sink.is_some() || config.enable_event_logging {
+                    let mut multi = MultiEventSink::new();
 
-                if config.enable_event_logging {
-                    multi.add_sink(Box::new(ConsoleEventSink::new(true)));
-                }
+                    if config.enable_event_logging {
+                        multi.add_sink(Box::new(ConsoleEventSink::new(true)));
+                    }
 
-                if let Some(ref csv_sink_arc) = shared_csv_sink {
-                    multi.add_sink(Box::new(SharedCsvSink {
-                        sink: csv_sink_arc.clone(),
-                    }));
-                }
+                    if let Some(ref csv_sink_arc) = shared_csv_sink {
+                        multi.add_sink(Box::new(SharedCsvSink {
+                            sink: csv_sink_arc.clone(),
+                        }));
+                    }
 
-                Box::new(multi)
-            } else {
-                // Simple console logging (disabled)
-                Box::new(ConsoleEventSink::new(false))
-            };
+                    Box::new(multi)
+                } else {
+                    // Simple console logging (disabled)
+                    Box::new(ConsoleEventSink::new(false))
+                };
 
             let mut node = EcNode::new_with_sink(token_store, block_store, *peer_id, 0, event_sink);
 
@@ -220,9 +222,10 @@ impl SimRunner {
         let mut x = 0;
         while x < self.tokens.len() {
             let used = min(
-                self.rng
-                    .gen_range(self.config.transactions.block_size_range.0
-                        ..=self.config.transactions.block_size_range.1),
+                self.rng.gen_range(
+                    self.config.transactions.block_size_range.0
+                        ..=self.config.transactions.block_size_range.1,
+                ),
                 self.tokens.len() - x,
             );
 
@@ -262,7 +265,8 @@ impl SimRunner {
             self.messages.shuffle(&mut self.rng);
 
             // Delay: push a fraction to next round
-            let delay_count = (number_of_messages as f64 * self.config.network.delay_fraction) as usize;
+            let delay_count =
+                (number_of_messages as f64 * self.config.network.delay_fraction) as usize;
             next.extend_from_slice(&self.messages[delay_count..]);
 
             // Loss: drop a fraction

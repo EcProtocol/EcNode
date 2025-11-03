@@ -6,7 +6,9 @@ use log::info;
 use simple_logger::SimpleLogger;
 
 mod simulator;
-use simulator::{NetworkConfig, SimConfig, SimRunner, TopologyConfig, TopologyMode, TransactionConfig};
+use simulator::{
+    NetworkConfig, SimConfig, SimRunner, TopologyConfig, TopologyMode, TransactionConfig,
+};
 
 fn main() {
     SimpleLogger::new().init().unwrap();
@@ -33,7 +35,7 @@ fn main() {
             block_size_range: (1, 3),
         },
         enable_event_logging: false, // Enable to see consensus events
-        csv_output_path: Some("sim_events.csv".to_string()),      // Set to Some("events.csv") to export all events
+        csv_output_path: Some("sim_events.csv".to_string()), // Set to Some("events.csv") to export all events
     };
 
     info!("Starting simulation...");
@@ -68,10 +70,7 @@ fn main() {
             result.statistics.message_counts.answer
         );
     } else {
-        info!(
-            "Messages: {}. Commits: NONE",
-            result.total_messages
-        );
+        info!("Messages: {}. Commits: NONE", result.total_messages);
         info!(
             "Message distribution: Query: {}, Vote: {}, Block: {}, Answer: {}",
             result.statistics.message_counts.query,

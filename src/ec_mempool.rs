@@ -354,15 +354,15 @@ impl EcMemPool {
                     for i in 0..block.used as usize {
                         // TODO (ok?) only tokens in my range -> together with "no_skip_or_reorg" lock
                         if my_range.in_range(&block.parts[i].token) {
-                                event_sink.log(
-                                    time,
-                                    id,
-                                    Event::BlockCommitted {
-                                        block_id: *block_id,
-                                        peer: id,
-                                        votes: block_state.votes.len(),
-                                    },
-                                );
+                            event_sink.log(
+                                time,
+                                id,
+                                Event::BlockCommitted {
+                                    block_id: *block_id,
+                                    peer: id,
+                                    votes: block_state.votes.len(),
+                                },
+                            );
 
                             tokens.set(&block.parts[i].token, &block.id, block.time);
                         }
@@ -372,8 +372,7 @@ impl EcMemPool {
                     continue;
                 }
 
-                if no_skip_or_reorg
-                {
+                if no_skip_or_reorg {
                     for i in 0..block.used as usize {
                         if (block_state.validate & 1 << i) != 0 {
                             // fetch a parent

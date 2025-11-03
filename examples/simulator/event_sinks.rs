@@ -116,14 +116,17 @@ impl EventSink for ConsoleEventSink {
                     to_state
                 );
             }
-            Event::VoteReceived { block_id, from_peer } => {
+            Event::VoteReceived {
+                block_id,
+                from_peer,
+            } => {
                 println!(
                     "{:>5} {:>6} VoteReceived    block:{:x} from:{:x}",
                     round,
                     peer_fmt,
                     block_id & 0xFFFF,
                     from_peer & 0xFFFF,
-                );   
+                );
             }
         }
     }
@@ -216,7 +219,9 @@ impl EventSink for CsvEventSink {
                 "{},{},StateChange,{},0,0,0,{}->{}",
                 round, peer, block_id, from_state, to_state
             ),
-            Event::VoteReceived { block_id, from_peer 
+            Event::VoteReceived {
+                block_id,
+                from_peer,
             } => writeln!(
                 self.writer,
                 "{},{},VoteReceived,{},{}",

@@ -82,9 +82,9 @@ impl EcNode {
         // - idea: the oldest transaction (longest in mempool) "sucks" all overlapping into message - sync. on roll.
         // (when commited or timeout - this schedule of a neighborhood is then "freed" of the next oldest etc)
         // TODO could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
-        let mut messages = self
-            .mem_pool
-            .tick(&self.peers, self.time, self.peer_id, &mut *self.event_sink);
+        let mut messages =
+            self.mem_pool
+                .tick(&self.peers, self.time, self.peer_id, &mut *self.event_sink);
         messages.sort_unstable_by_key(MessageRequest::sort_key);
 
         // loop through and find any conflicting votes (true, true) - and block them.
@@ -115,7 +115,11 @@ impl EcNode {
             match request {
                 MessageRequest::VOTE(block_id, token_id, vote, _) => {
                     // blocked then all negative
-                    let vote = if blocked.contains(&block_id) {0} else {*vote};
+                    let vote = if blocked.contains(&block_id) {
+                        0
+                    } else {
+                        *vote
+                    };
 
                     for peer_id in self.peers.peers_for(&token_id, self.time) {
                         responses.push(MessageEnvelope {
@@ -142,9 +146,13 @@ impl EcNode {
                     }
                 }
                 MessageRequest::PARENTCOMMIT(block_id) => {
-                        let peer_id = self.peers.peer_for(&block_id, self.time);
+                    let peer_id = self.peers.peer_for(&block_id, self.time);
 
-                        responses.push(self.request_block(&peer_id, &block_id, self.parent_block_req_ticket))
+                    responses.push(self.request_block(
+                        &peer_id,
+                        &block_id,
+                        self.parent_block_req_ticket,
+                    ))
                 }
             }
         }
@@ -169,10 +177,14 @@ impl EcNode {
                 vote,
                 reply,
             } => {
-                self.event_sink.log(self.time, self.peer_id, Event::VoteReceived { 
-                    block_id: *block, 
-                    from_peer: msg.sender 
-                } );
+                self.event_sink.log(
+                    self.time,
+                    self.peer_id,
+                    Event::VoteReceived {
+                        block_id: *block,
+                        from_peer: msg.sender,
+                    },
+                );
 
                 match (
                     self.mem_pool.status(block),
@@ -198,12 +210,20 @@ impl EcNode {
                         // TODO check load-balancing count for this peer
                         self.mem_pool.vote(block, *vote, &msg.sender, msg.time);
                         // better ask the sender for it - while propagating towards the "witness"
-                        responses.push(self.request_block(&msg.sender, block, self.block_req_ticket))
+                        responses.push(self.request_block(
+                            &msg.sender,
+                            block,
+                            self.block_req_ticket,
+                        ))
                     }
                     (None, None) => {
                         // TODO test ticket is from subscribed client + DOS protection
                         if msg.ticket > 0 {
-                            responses.push(self.request_block(&msg.sender, block, self.block_req_ticket))
+                            responses.push(self.request_block(
+                                &msg.sender,
+                                block,
+                                self.block_req_ticket,
+                            ))
                         }
 
                         // TODO this should be handled by "introduction" messages - linking peers
@@ -220,7 +240,6 @@ impl EcNode {
             } => {
                 let respond_to = if *target == 0 { msg.sender } else { *target };
 
-                // TODO also for me ? And forwarding
                 if let Some(me) = self.mem_pool.query(token).map(|block| MessageEnvelope {
                     sender: self.peer_id,
                     receiver: respond_to,
@@ -228,9 +247,25 @@ impl EcNode {
                     time: self.time,
                     message: Message::Block { block },
                 }) {
+                    // this node has this block
                     responses.push(me)
-                } else if (token ^ self.time) & 0x3 == 0  {
-                    // TODO P(forwarding)
+                } else if let None = self.peers.trusted_peer(&msg.sender) {
+                    // this is not a trusted peer
+                    let peers = self.peers.peers_for(token, self.time);
+
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: msg.sender,
+                        ticket: *ticket,
+                        time: self.time,
+                        message: Message::Referral {
+                            token: *token,
+                            high: peers[1],
+                            low: peers[0],
+                        },
+                    });
+                } else if (token ^ self.time) & 0x3 == 0 {
+                    // forwarding for trusted peers
                     let peer_id = self.peers.peer_for(token, self.time);
 
                     responses.push(MessageEnvelope {
@@ -262,9 +297,9 @@ impl EcNode {
             }
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
-                if msg.ticket == self.block_req_ticket ^ block.id || 
-                // TODO in this case the block must have "commit-at-history-id"
-                msg.ticket == self.parent_block_req_ticket ^ block.id  {
+                if msg.ticket == self.block_req_ticket ^ block.id
+                    || msg.ticket == self.parent_block_req_ticket ^ block.id
+                {
                     // TODO DOS-protection
 
                     if self.mem_pool.block(block, self.time) {
@@ -284,6 +319,14 @@ impl EcNode {
                     self.mem_pool.validate_with(block, &msg.ticket)
                 }
             }
+            Message::Referral { token, high, low } => {
+                // TODO basic common block-validation (like SHA of content match block.id)
+                if msg.ticket == self.block_req_ticket ^ token
+                    || msg.ticket == self.parent_block_req_ticket ^ token
+                {
+                    self.peers.handle_referral(msg.sender, *high, *low);
+                }
+            }
         }
     }
 
@@ -301,7 +344,12 @@ impl EcNode {
         }
     }
 
-    fn request_block(&self, receiver: &PeerId, block: &BlockId, ticket: MessageTicket) -> MessageEnvelope {
+    fn request_block(
+        &self,
+        receiver: &PeerId,
+        block: &BlockId,
+        ticket: MessageTicket,
+    ) -> MessageEnvelope {
         MessageEnvelope {
             sender: self.peer_id,
             receiver: *receiver,
