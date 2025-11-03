@@ -1,9 +1,7 @@
 // track the state of transactions
 
 use std::cell::RefCell;
-use std::io::SeekFrom;
 use std::rc::Rc;
-use std::thread::sleep;
 
 use hashbrown::HashMap;
 

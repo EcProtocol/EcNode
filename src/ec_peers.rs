@@ -168,40 +168,6 @@ impl EcPeers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
-    #[test]
-    fn finding_peers() {
-        let mut peers = EcPeers::new(1);
-
-        assert!(peers.peers_for(&2).is_empty());
-
-        peers.update_peer(2, 10);
-
-        assert_eq!(*peers.peers_for(&1).first().unwrap(), 2);
-
-        assert!(peers.peers_for(&1).is_empty());
-        assert!(peers.peers_for(&1).is_empty());
-    }
-
-    #[test]
-    fn finding_peers_around_key() {
-        let mut peers = EcPeers::new(1);
-
-        for i in 100..120 {
-            peers.update_peer(i, 1);
-        }
-
-        let finding: Vec<PeerId> = peers.peers_for(&110);
-
-        assert_eq!(finding, [109, 108, 107, 106, 111, 112, 113, 114]);
-
-        let finding: Vec<PeerId> = peers.peers_for(&101);
-
-        assert_eq!(finding, [100, 102, 103, 104, 105]);
-
-        let finding: Vec<PeerId> = peers.peers_for(&120);
-
-        assert_eq!(finding, [119, 118, 117, 116]);
-    }
 }

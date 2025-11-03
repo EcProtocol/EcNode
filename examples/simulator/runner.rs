@@ -283,6 +283,7 @@ impl SimRunner {
                     Message::Vote { .. } => self.message_counters.1 += 1,
                     Message::Block { .. } => self.message_counters.2 += 1,
                     Message::Answer { .. } => self.message_counters.3 += 1,
+                    Message::Referral { .. } => (),
                 };
                 node.handle_message(m, &mut next);
             }
