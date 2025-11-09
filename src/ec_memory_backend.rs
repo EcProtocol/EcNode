@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ec_interface::{
-    Block, BlockId, BlockTime, EcBlocks, EcTime, EcTokens, PeerId, TokenId, TokenSignature,
+    BatchedBackend, Block, BlockId, BlockTime, EcBlocks, EcTime, EcTokens, PeerId, StorageBatch,
+    TokenId, TokenSignature,
 };
 use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
 
@@ -282,32 +283,93 @@ impl MemoryBackend {
     pub fn blocks_mut(&mut self) -> &mut MemBlocks {
         &mut self.blocks
     }
-
-    /// Atomically "commit" a block and update associated token mappings
-    ///
-    /// Note: This is not truly atomic in the memory backend (no rollback on failure),
-    /// but it mimics the API of the RocksDB backend for consistency.
-    ///
-    /// # Example
-    /// ```rust
-    /// backend.commit_block(&block);
-    /// // Block is saved AND all token mappings are updated
-    /// ```
-    pub fn commit_block(&mut self, block: &Block) {
-        // Save the block
-        self.blocks.save(block);
-
-        // Update all token mappings
-        for i in 0..block.used as usize {
-            let token_block = &block.parts[i];
-            TokenStorageBackend::set(&mut self.tokens, &token_block.token, &block.id, block.time);
-        }
-    }
 }
 
 impl Default for MemoryBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// Batched Commit Support
+// ============================================================================
+
+/// Batch for memory backend
+///
+/// Collects operations in memory and applies them all at commit time.
+/// Not truly atomic (no rollback), but matches the API for consistency.
+pub struct MemoryBatch<'a> {
+    backend: &'a mut MemoryBackend,
+    blocks: Vec<Block>,
+    tokens: Vec<(TokenId, BlockId, EcTime)>,
+}
+
+impl<'a> StorageBatch for MemoryBatch<'a> {
+    fn save_block(&mut self, block: &Block) {
+        self.blocks.push(*block);
+    }
+
+    fn update_token(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+        self.tokens.push((*token, *block, time));
+    }
+
+    fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        // Apply all blocks
+        for block in &self.blocks {
+            self.backend.blocks.save(block);
+        }
+
+        // Apply all token updates
+        for (token, block, time) in &self.tokens {
+            TokenStorageBackend::set(&mut self.backend.tokens, token, block, *time);
+        }
+
+        Ok(())
+    }
+
+    fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+impl BatchedBackend for MemoryBackend {
+    fn begin_batch(&mut self) -> Box<dyn StorageBatch + '_> {
+        Box::new(MemoryBatch {
+            backend: self,
+            blocks: Vec::new(),
+            tokens: Vec::new(),
+        })
+    }
+}
+
+// Implement EcTokens for MemoryBackend (delegates to tokens field)
+impl EcTokens for MemoryBackend {
+    fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
+        EcTokens::lookup(&self.tokens, token)
+    }
+
+    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+        EcTokens::set(&mut self.tokens, token, block, time)
+    }
+
+    fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature> {
+        EcTokens::tokens_signature(&self.tokens, token, peer)
+    }
+}
+
+// Implement EcBlocks for MemoryBackend (delegates to blocks field)
+impl EcBlocks for MemoryBackend {
+    fn lookup(&self, block: &BlockId) -> Option<Block> {
+        self.blocks.lookup(block)
+    }
+
+    fn exists(&self, block: &BlockId) -> bool {
+        self.blocks.exists(block)
+    }
+
+    fn save(&mut self, block: &Block) {
+        self.blocks.save(block)
     }
 }
 
@@ -494,64 +556,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_memory_backend_commit_block() {
-        let mut backend = MemoryBackend::new();
-
-        let block = Block {
-            id: 999,
-            time: 5000,
-            used: 3,
-            parts: [
-                TokenBlock {
-                    token: 10,
-                    last: 0,
-                    key: 1000,
-                },
-                TokenBlock {
-                    token: 20,
-                    last: 0,
-                    key: 2000,
-                },
-                TokenBlock {
-                    token: 30,
-                    last: 0,
-                    key: 3000,
-                },
-                TokenBlock::default(),
-                TokenBlock::default(),
-                TokenBlock::default(),
-            ],
-            signatures: [None, None, None, None, None, None],
-        };
-
-        // Commit block atomically
-        backend.commit_block(&block);
-
-        // Verify block was saved
-        assert!(backend.blocks().exists(&999));
-
-        // Verify all tokens were updated
-        assert_eq!(
-            TokenStorageBackend::lookup(backend.tokens(), &10)
-                .unwrap()
-                .block,
-            999
-        );
-        assert_eq!(
-            TokenStorageBackend::lookup(backend.tokens(), &20)
-                .unwrap()
-                .block,
-            999
-        );
-        assert_eq!(
-            TokenStorageBackend::lookup(backend.tokens(), &30)
-                .unwrap()
-                .block,
-            999
-        );
-    }
-
-    #[test]
     fn test_memory_backend_separate_access() {
         let mut backend = MemoryBackend::new();
 
@@ -572,5 +576,190 @@ mod tests {
         // Verify both are accessible
         assert_eq!(TokenStorageBackend::len(backend.tokens()), 2);
         assert!(backend.blocks().exists(&1));
+    }
+
+    // ========================================================================
+    // Batch Operations Tests
+    // ========================================================================
+
+    #[test]
+    fn test_memory_batch_single_block() {
+        let mut backend = MemoryBackend::new();
+
+        let block = Block {
+            id: 100,
+            time: 1000,
+            used: 2,
+            parts: [
+                TokenBlock {
+                    token: 10,
+                    last: 0,
+                    key: 1000,
+                },
+                TokenBlock {
+                    token: 20,
+                    last: 0,
+                    key: 2000,
+                },
+                TokenBlock::default(),
+                TokenBlock::default(),
+                TokenBlock::default(),
+                TokenBlock::default(),
+            ],
+            signatures: [None; 6],
+        };
+
+        // Use batch
+        {
+            let mut batch = backend.begin_batch();
+            batch.save_block(&block);
+            // Add token updates
+            for i in 0..block.used as usize {
+                batch.update_token(&block.parts[i].token, &block.id, block.time);
+            }
+            assert_eq!(batch.block_count(), 1);
+            batch.commit().unwrap();
+        }
+
+        // Verify block was saved
+        assert!(backend.blocks().exists(&100));
+
+        // Verify tokens were updated
+        assert_eq!(
+            TokenStorageBackend::lookup(backend.tokens(), &10)
+                .unwrap()
+                .block,
+            100
+        );
+        assert_eq!(
+            TokenStorageBackend::lookup(backend.tokens(), &20)
+                .unwrap()
+                .block,
+            100
+        );
+    }
+
+    #[test]
+    fn test_memory_batch_multiple_blocks() {
+        let mut backend = MemoryBackend::new();
+
+        let blocks = vec![
+            Block {
+                id: 1,
+                time: 100,
+                used: 1,
+                parts: [
+                    TokenBlock {
+                        token: 10,
+                        last: 0,
+                        key: 100,
+                    },
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                ],
+                signatures: [None; 6],
+            },
+            Block {
+                id: 2,
+                time: 200,
+                used: 2,
+                parts: [
+                    TokenBlock {
+                        token: 20,
+                        last: 0,
+                        key: 200,
+                    },
+                    TokenBlock {
+                        token: 30,
+                        last: 0,
+                        key: 300,
+                    },
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                ],
+                signatures: [None; 6],
+            },
+            Block {
+                id: 3,
+                time: 300,
+                used: 1,
+                parts: [
+                    TokenBlock {
+                        token: 40,
+                        last: 0,
+                        key: 400,
+                    },
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                ],
+                signatures: [None; 6],
+            },
+        ];
+
+        // Batch commit all blocks
+        {
+            let mut batch = backend.begin_batch();
+            for block in &blocks {
+                batch.save_block(block);
+                // Add token updates for this block
+                for i in 0..block.used as usize {
+                    batch.update_token(&block.parts[i].token, &block.id, block.time);
+                }
+            }
+            assert_eq!(batch.block_count(), 3);
+            batch.commit().unwrap();
+        }
+
+        // Verify all blocks saved
+        assert!(backend.blocks().exists(&1));
+        assert!(backend.blocks().exists(&2));
+        assert!(backend.blocks().exists(&3));
+
+        // Verify all tokens updated
+        assert_eq!(
+            TokenStorageBackend::lookup(backend.tokens(), &10)
+                .unwrap()
+                .block,
+            1
+        );
+        assert_eq!(
+            TokenStorageBackend::lookup(backend.tokens(), &20)
+                .unwrap()
+                .block,
+            2
+        );
+        assert_eq!(
+            TokenStorageBackend::lookup(backend.tokens(), &30)
+                .unwrap()
+                .block,
+            2
+        );
+        assert_eq!(
+            TokenStorageBackend::lookup(backend.tokens(), &40)
+                .unwrap()
+                .block,
+            3
+        );
+    }
+
+    #[test]
+    fn test_memory_batch_empty_commit() {
+        let mut backend = MemoryBackend::new();
+
+        {
+            let batch = backend.begin_batch();
+            assert_eq!(batch.block_count(), 0);
+            batch.commit().unwrap();
+        }
+
+        // Should succeed with no changes
     }
 }

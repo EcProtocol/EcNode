@@ -4,17 +4,16 @@ use std::rc::Rc;
 use hashbrown::HashSet;
 
 use crate::ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, Message, MessageEnvelope,
-    MessageTicket, NoOpSink, PeerId,
+    BatchedBackend, Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, Message,
+    MessageEnvelope, MessageTicket, NoOpSink, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
 use crate::ec_peers::EcPeers;
 
 use crate::ec_mempool::MessageRequest;
 
-pub struct EcNode {
-    tokens: Rc<RefCell<dyn EcTokens>>,
-    blocks: Rc<RefCell<dyn EcBlocks>>,
+pub struct EcNode<B: BatchedBackend + EcTokens + EcBlocks + 'static> {
+    backend: Rc<RefCell<B>>,
     peers: EcPeers,
     mem_pool: EcMemPool,
     peer_id: PeerId,
@@ -24,30 +23,23 @@ pub struct EcNode {
     event_sink: Box<dyn EventSink>,
 }
 
-impl EcNode {
+impl<B: BatchedBackend + EcTokens + EcBlocks + 'static> EcNode<B> {
     /// Create a new node with default NoOpSink (zero overhead)
-    pub fn new(
-        tokens: Rc<RefCell<dyn EcTokens>>,
-        blocks: Rc<RefCell<dyn EcBlocks>>,
-        id: PeerId,
-        time: EcTime,
-    ) -> Self {
-        Self::new_with_sink(tokens, blocks, id, time, Box::new(NoOpSink))
+    pub fn new(backend: Rc<RefCell<B>>, id: PeerId, time: EcTime) -> Self {
+        Self::new_with_sink(backend, id, time, Box::new(NoOpSink))
     }
 
     /// Create a new node with a custom event sink for debugging/analysis
     pub fn new_with_sink(
-        tokens: Rc<RefCell<dyn EcTokens>>,
-        blocks: Rc<RefCell<dyn EcBlocks>>,
+        backend: Rc<RefCell<B>>,
         id: PeerId,
         time: EcTime,
         event_sink: Box<dyn EventSink>,
     ) -> Self {
         Self {
-            tokens: tokens.clone(),
-            blocks: blocks.clone(),
+            mem_pool: EcMemPool::new(),
+            backend,
             peers: EcPeers::new(id),
-            mem_pool: EcMemPool::new(tokens.clone(), blocks.clone()),
             peer_id: id,
             time,
             block_req_ticket: 2, // TODO shuffle
@@ -73,7 +65,7 @@ impl EcNode {
     }
 
     pub fn committed_block(&self, block_id: &BlockId) -> Option<Block> {
-        self.blocks.borrow().lookup(block_id)
+        EcBlocks::lookup(&*self.backend.borrow(), block_id)
     }
 
     /**
@@ -92,9 +84,54 @@ impl EcNode {
      */
     pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
         self.time += 1;
-        let mut messages =
-            self.mem_pool
-                .tick(&self.peers, self.time, self.peer_id, &mut *self.event_sink);
+
+        // Process mempool in phases
+        let mut messages = {
+            // Phase 0: Cleanup expired blocks
+            self.mem_pool.cleanup_expired(self.time);
+
+            // Phase 1: Evaluate pending blocks (immutable borrow)
+            // This checks token chains and generates parent requests for reorg/skip scenarios
+            let (evaluations, reorg_messages) = {
+                let backend = self.backend.borrow();
+                self.mem_pool.evaluate_pending_blocks(
+                    &*backend,
+                    self.time,
+                    self.peer_id,
+                    &mut *self.event_sink,
+                )
+            };
+
+            let mut all_messages = reorg_messages;
+
+            // Phase 2: Process committable blocks (mutable borrow + batch)
+            let commit_messages = {
+                let mut backend_ref = self.backend.borrow_mut();
+                let mut batch = backend_ref.begin_batch();
+
+                let messages = self.mem_pool.tick_with_evaluations(
+                    &self.peers,
+                    self.time,
+                    self.peer_id,
+                    &mut *self.event_sink,
+                    &evaluations,
+                    &mut *batch,
+                );
+
+                // Commit the batch - all blocks and tokens committed atomically
+                if let Err(e) = batch.commit() {
+                    // Infrastructure error - log and continue (batch is discarded)
+                    eprintln!("Failed to commit batch at time {}: {}", self.time, e);
+                }
+
+                messages
+            };
+
+            // Combine reorg requests (phase 1) with vote requests (phase 2)
+            all_messages.extend(commit_messages);
+            all_messages
+        };
+
         messages.sort_unstable_by_key(MessageRequest::sort_key);
 
         // loop through and find any conflicting votes (true, true) - and block them.
@@ -147,7 +184,8 @@ impl EcNode {
                 }
                 MessageRequest::PARENT(block_id, parent_id) => {
                     // TODO a work around. Should be handled in mem_pool
-                    if let Some(parent) = self.mem_pool.query(&parent_id) {
+                    let backend = self.backend.borrow();
+                    if let Some(parent) = self.mem_pool.query(&parent_id, &*backend) {
                         self.mem_pool.validate_with(&parent, &block_id);
                     } else {
                         let peer_id = self.peers.peer_for(&parent_id, self.time);
@@ -196,8 +234,9 @@ impl EcNode {
                     },
                 );
 
+                let backend = self.backend.borrow();
                 match (
-                    self.mem_pool.status(block),
+                    self.mem_pool.status(block, &*backend),
                     self.peers.trusted_peer(&msg.sender),
                 ) {
                     (Some(BlockState::Pending), Some(_)) => {
@@ -250,7 +289,8 @@ impl EcNode {
             } => {
                 let respond_to = if *target == 0 { msg.sender } else { *target };
 
-                if let Some(me) = self.mem_pool.query(token).map(|block| MessageEnvelope {
+                let backend = self.backend.borrow();
+                if let Some(me) = self.mem_pool.query(token, &*backend).map(|block| MessageEnvelope {
                     sender: self.peer_id,
                     receiver: respond_to,
                     ticket: *ticket,

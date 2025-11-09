@@ -159,6 +159,68 @@ pub trait EcBlocks {
 }
 
 // ============================================================================
+// Batch Commit Abstraction
+// ============================================================================
+
+/// Represents a batch of pending storage operations
+///
+/// This abstraction allows accumulating blocks and token updates during a tick,
+/// then committing them all atomically at the end.
+///
+/// # Design
+/// - Mempool adds blocks and individual token updates to the batch
+/// - Backends don't need to know about block internal structure
+/// - Memory backend: Collects operations, applies on commit
+/// - RocksDB backend: Uses WriteBatch for atomic multi-operation commits
+///
+/// # Error Handling
+/// Errors are expected to be rare infrastructure failures (disk full, corruption).
+/// On error, the entire batch is discarded and caller should retry.
+///
+/// # Example
+/// ```rust
+/// let mut batch = backend.begin_batch();
+///
+/// // Mempool adds blocks and tokens during tick
+/// batch.save_block(&block);
+/// batch.update_token(&token_id, &block_id, time);
+///
+/// // End of tick: commit everything atomically
+/// batch.commit()?;
+/// ```
+pub trait StorageBatch {
+    /// Save a block to the batch
+    fn save_block(&mut self, block: &Block);
+
+    /// Update a single token mapping
+    ///
+    /// Updates the token to point to the specified block at the given time.
+    fn update_token(&mut self, token: &TokenId, block: &BlockId, time: EcTime);
+
+    /// Commit all batched operations atomically
+    ///
+    /// # Errors
+    /// Returns error only on infrastructure failures (disk I/O, corruption, etc.)
+    /// On error, all operations in the batch are discarded.
+    fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Get the number of blocks in this batch
+    fn block_count(&self) -> usize;
+}
+
+/// Backend that supports batched commits
+///
+/// Backends implementing this trait can create batch objects that accumulate
+/// operations and commit them atomically.
+pub trait BatchedBackend {
+    /// Begin a new batch of operations
+    ///
+    /// The returned batch accumulates operations until commit() is called.
+    /// Returns a boxed trait object to avoid lifetime issues.
+    fn begin_batch(&mut self) -> Box<dyn StorageBatch + '_>;
+}
+
+// ============================================================================
 // Event Logging System
 // ============================================================================
 

@@ -15,7 +15,9 @@ use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBat
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::ec_interface::{Block, BlockId, BlockTime, EcTime, TokenId, TOKENS_PER_BLOCK};
+use crate::ec_interface::{
+    BatchedBackend, Block, BlockId, BlockTime, EcTime, StorageBatch, TokenId, TOKENS_PER_BLOCK,
+};
 use crate::ec_proof_of_storage::TokenStorageBackend;
 
 // Column family names
@@ -186,42 +188,6 @@ impl EcRocksDb {
         if let Some(cf) = self.db.cf_handle(CF_BLOCKS) {
             self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
         }
-    }
-
-    /// Atomically commit a block and update all associated token mappings
-    ///
-    /// This is a critical operation for consensus - both the block save and
-    /// token updates must succeed or both must fail.
-    ///
-    /// # Example
-    /// ```rust
-    /// db.commit_block_atomic(&block)?;
-    /// // Block is saved AND all token mappings are updated atomically
-    /// ```
-    pub fn commit_block_atomic(&self, block: &Block) -> Result<(), rocksdb::Error> {
-        let mut batch = WriteBatch::default();
-
-        let tokens_cf = self.db.cf_handle(CF_TOKENS).expect("tokens CF exists");
-        let blocks_cf = self.db.cf_handle(CF_BLOCKS).expect("blocks CF exists");
-
-        // 1. Save the block
-        let block_key = RocksDbBlocks::encode_key(&block.id);
-        let block_value = RocksDbBlocks::encode_value(block);
-        batch.put_cf(blocks_cf, &block_key, &block_value);
-
-        // 2. Update all token mappings in the block
-        for i in 0..block.used as usize {
-            let token_block = &block.parts[i];
-            let token_key = RocksDbTokens::encode_key(&token_block.token);
-            let token_value = RocksDbTokens::encode_value(&BlockTime {
-                block: block.id,
-                time: block.time,
-            });
-            batch.put_cf(tokens_cf, &token_key, &token_value);
-        }
-
-        // 3. Atomic write - all or nothing
-        self.db.write(batch)
     }
 }
 
@@ -521,6 +487,61 @@ impl crate::ec_interface::EcBlocks for RocksDbBlocks {
     }
 }
 
+// ============================================================================
+// Batched Commit Support
+// ============================================================================
+
+/// Batch for RocksDB backend
+///
+/// Uses RocksDB's WriteBatch for true atomic multi-operation commits.
+/// All operations are accumulated in the batch and committed atomically
+/// with a single WAL sync.
+pub struct RocksDbBatch {
+    db: Arc<DB>,
+    batch: WriteBatch,
+    block_count: usize,
+}
+
+impl StorageBatch for RocksDbBatch {
+    fn save_block(&mut self, block: &Block) {
+        let blocks_cf = self.db.cf_handle(CF_BLOCKS).expect("blocks CF exists");
+        let block_key = RocksDbBlocks::encode_key(&block.id);
+        let block_value = RocksDbBlocks::encode_value(block);
+        self.batch.put_cf(blocks_cf, &block_key, &block_value);
+        self.block_count += 1;
+    }
+
+    fn update_token(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+        let tokens_cf = self.db.cf_handle(CF_TOKENS).expect("tokens CF exists");
+        let token_key = RocksDbTokens::encode_key(token);
+        let token_value = RocksDbTokens::encode_value(&BlockTime {
+            block: *block,
+            time,
+        });
+        self.batch.put_cf(tokens_cf, &token_key, &token_value);
+    }
+
+    fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        // Single atomic write - all or nothing
+        self.db.write(self.batch)?;
+        Ok(())
+    }
+
+    fn block_count(&self) -> usize {
+        self.block_count
+    }
+}
+
+impl BatchedBackend for EcRocksDb {
+    fn begin_batch(&mut self) -> Box<dyn StorageBatch + '_> {
+        Box::new(RocksDbBatch {
+            db: Arc::clone(&self.db),
+            batch: WriteBatch::default(),
+            block_count: 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,14 +634,26 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_commit() {
+    fn test_encoding_preserves_order() {
+        let tokens = [1u64, 100, 1000, 10000, 100000];
+
+        let encoded: Vec<_> = tokens.iter().map(|t| RocksDbTokens::encode_key(t)).collect();
+
+        // Encoded bytes should maintain sort order
+        for i in 1..encoded.len() {
+            assert!(encoded[i - 1] < encoded[i]);
+        }
+    }
+
+    #[test]
+    fn test_rocksdb_batch_single_block() {
         let dir = TempDir::new().unwrap();
-        let db = EcRocksDb::open(dir.path()).unwrap();
+        let mut db = EcRocksDb::open(dir.path()).unwrap();
 
         let block = Block {
-            id: 999,
-            time: 5000,
-            used: 3,
+            id: 100,
+            time: 1000,
+            used: 2,
             parts: [
                 TokenBlock {
                     token: 10,
@@ -632,41 +665,141 @@ mod tests {
                     last: 0,
                     key: 2000,
                 },
-                TokenBlock {
-                    token: 30,
-                    last: 0,
-                    key: 3000,
-                },
+                TokenBlock::default(),
                 TokenBlock::default(),
                 TokenBlock::default(),
                 TokenBlock::default(),
             ],
-            signatures: [None, None, None, None, None, None],
+            signatures: [None; 6],
         };
 
-        // Atomic commit
-        db.commit_block_atomic(&block).unwrap();
+        // Use batch
+        {
+            let mut batch = db.begin_batch();
+            batch.save_block(&block);
+            // Add token updates
+            for i in 0..block.used as usize {
+                batch.update_token(&block.parts[i].token, &block.id, block.time);
+            }
+            assert_eq!(batch.block_count(), 1);
+            batch.commit().unwrap();
+        }
 
         // Verify block was saved
         let blocks = db.blocks_backend();
-        assert!(blocks.exists(&999));
+        assert!(blocks.exists(&100));
 
-        // Verify all tokens were updated
+        // Verify tokens were updated
         let tokens = db.tokens_backend();
-        assert_eq!(tokens.lookup(&10).unwrap().block, 999);
-        assert_eq!(tokens.lookup(&20).unwrap().block, 999);
-        assert_eq!(tokens.lookup(&30).unwrap().block, 999);
+        assert_eq!(tokens.lookup(&10).unwrap().block, 100);
+        assert_eq!(tokens.lookup(&20).unwrap().block, 100);
     }
 
     #[test]
-    fn test_encoding_preserves_order() {
-        let tokens = [1u64, 100, 1000, 10000, 100000];
+    fn test_rocksdb_batch_multiple_blocks() {
+        let dir = TempDir::new().unwrap();
+        let mut db = EcRocksDb::open(dir.path()).unwrap();
 
-        let encoded: Vec<_> = tokens.iter().map(|t| RocksDbTokens::encode_key(t)).collect();
+        let blocks = vec![
+            Block {
+                id: 1,
+                time: 100,
+                used: 1,
+                parts: [
+                    TokenBlock {
+                        token: 10,
+                        last: 0,
+                        key: 100,
+                    },
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                ],
+                signatures: [None; 6],
+            },
+            Block {
+                id: 2,
+                time: 200,
+                used: 2,
+                parts: [
+                    TokenBlock {
+                        token: 20,
+                        last: 0,
+                        key: 200,
+                    },
+                    TokenBlock {
+                        token: 30,
+                        last: 0,
+                        key: 300,
+                    },
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                ],
+                signatures: [None; 6],
+            },
+            Block {
+                id: 3,
+                time: 300,
+                used: 1,
+                parts: [
+                    TokenBlock {
+                        token: 40,
+                        last: 0,
+                        key: 400,
+                    },
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                    TokenBlock::default(),
+                ],
+                signatures: [None; 6],
+            },
+        ];
 
-        // Encoded bytes should maintain sort order
-        for i in 1..encoded.len() {
-            assert!(encoded[i - 1] < encoded[i]);
+        // Batch commit all blocks
+        {
+            let mut batch = db.begin_batch();
+            for block in &blocks {
+                batch.save_block(block);
+                // Add token updates for this block
+                for i in 0..block.used as usize {
+                    batch.update_token(&block.parts[i].token, &block.id, block.time);
+                }
+            }
+            assert_eq!(batch.block_count(), 3);
+            batch.commit().unwrap();
         }
+
+        // Verify all blocks saved
+        let blocks_backend = db.blocks_backend();
+        assert!(blocks_backend.exists(&1));
+        assert!(blocks_backend.exists(&2));
+        assert!(blocks_backend.exists(&3));
+
+        // Verify all tokens updated
+        let tokens = db.tokens_backend();
+        assert_eq!(tokens.lookup(&10).unwrap().block, 1);
+        assert_eq!(tokens.lookup(&20).unwrap().block, 2);
+        assert_eq!(tokens.lookup(&30).unwrap().block, 2);
+        assert_eq!(tokens.lookup(&40).unwrap().block, 3);
+    }
+
+    #[test]
+    fn test_rocksdb_batch_empty_commit() {
+        let dir = TempDir::new().unwrap();
+        let mut db = EcRocksDb::open(dir.path()).unwrap();
+
+        {
+            let batch = db.begin_batch();
+            assert_eq!(batch.block_count(), 0);
+            batch.commit().unwrap();
+        }
+
+        // Should succeed with no changes
     }
 }

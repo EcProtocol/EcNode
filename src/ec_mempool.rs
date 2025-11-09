@@ -7,8 +7,7 @@ use hashbrown::HashMap;
 
 use crate::ec_interface::{
     Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, PeerId, PublicKeyReference,
-    Signature, TokenId, TokenSignature, SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK,
-    VOTE_THRESHOLD,
+    Signature, TokenId, SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK, VOTE_THRESHOLD,
 };
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
@@ -114,11 +113,16 @@ impl PoolBlockState {
     }
 }
 
+/// Result of evaluating a pending block
+/// Contains only blocks that passed reorg checks and can proceed to voting/commit
+pub struct BlockEvaluation {
+    pub block_id: BlockId,  // Include block_id for future flexibility
+    pub block: Block,
+    pub vote_mask: u8,  // Pre-calculated vote bits (1 = can verify, 0 = cannot verify)
+}
+
 pub struct EcMemPool {
     pool: HashMap<BlockId, PoolBlockState>,
-
-    tokens: Rc<RefCell<dyn EcTokens>>,
-    blocks: Rc<RefCell<dyn EcBlocks>>,
 }
 
 fn validate_signature(key: &PublicKeyReference, signature: &Signature) -> bool {
@@ -149,25 +153,101 @@ fn validate_with_parent(parent: &Block, block: &Block, i: usize) -> bool {
 }
 
 impl EcMemPool {
-    pub fn new(tokens: Rc<RefCell<dyn EcTokens>>, blocks: Rc<RefCell<dyn EcBlocks>>) -> Self {
+    pub fn new() -> Self {
         Self {
             pool: HashMap::new(),
-            tokens,
-            blocks,
         }
     }
 
-    pub(crate) fn status(&self, block: &BlockId) -> Option<BlockState> {
+    /// Clean up expired blocks from the pool
+    ///
+    /// Removes blocks that are too old (haven't committed within the timeout period).
+    /// Should be called at the start of each tick before evaluation.
+    pub(crate) fn cleanup_expired(&mut self, time: EcTime) {
+        // TODO: Make timeout configurable? Currently 200 ticks
+        self.pool.retain(|_, state| time - state.time < 200);
+    }
+
+    /// Evaluate all pending blocks and determine which can proceed to commit
+    ///
+    /// This phase does all token lookups with an immutable borrow and:
+    /// - Calculates vote masks (positive vote only if we can verify the chain)
+    /// - Detects reorgs/missing history and generates PARENTCOMMIT requests
+    /// - Filters out blocks that cannot commit this tick
+    ///
+    /// Returns:
+    /// - Vec of blocks that can proceed (no reorg detected)
+    /// - Vec of messages for reorg parent requests
+    pub(crate) fn evaluate_pending_blocks(
+        &self,
+        tokens: &dyn EcTokens,
+        time: EcTime,
+        id: PeerId,
+        event_sink: &mut dyn EventSink,
+    ) -> (Vec<BlockEvaluation>, Vec<MessageRequest>) {
+        let mut evaluations = Vec::new();
+        let mut messages = Vec::new();
+
+        for (block_id, block_state) in self.pool.iter().filter(|(_, state)| state.state == Pending) {
+            if let Some(block) = block_state.block {
+                let mut vote = 0;
+                let mut can_commit = true;
+
+                // Check each token in the block
+                for i in 0..block.used as usize {
+                    let token_id = block.parts[i].token;
+                    let last_mapping = block.parts[i].last;
+                    let current_mapping = tokens.lookup(&token_id).map_or(0, |t| t.block);
+
+                    if current_mapping == last_mapping {
+                        // Chain is correct - we can verify this
+                        vote |= 1 << i;
+                    } else if current_mapping == 0 {
+                        // We don't have this token - cannot verify
+                        // vote bit stays 0 (negative vote)
+                        // This forces the block to find nodes that CAN verify
+                    } else {
+                        // We have a different mapping!
+                        // Either we're missing history (skip) or client is attempting reorg
+                        // Request parent to build our history / detect reorg
+                        can_commit = false;
+
+                        messages.push(MessageRequest::PARENTCOMMIT(last_mapping));
+
+                        event_sink.log(
+                            time,
+                            id,
+                            Event::Reorg {
+                                block_id: *block_id,
+                                peer: id,
+                                from: current_mapping,
+                                to: last_mapping,
+                            },
+                        );
+                    }
+                }
+
+                // Only add blocks that can potentially commit this tick
+                if can_commit {
+                    evaluations.push(BlockEvaluation {
+                        block_id: *block_id,
+                        block,
+                        vote_mask: vote,
+                    });
+                }
+                // Blocks with reorg/missing history stay in mempool but won't be processed this tick
+            }
+        }
+
+        (evaluations, messages)
+    }
+
+    pub(crate) fn status(&self, block: &BlockId, blocks: &dyn EcBlocks) -> Option<BlockState> {
         self.pool
             .get(block)
             .map(|b| b.state.clone())
             // else check if its already committed
-            .or_else(|| {
-                self.blocks
-                    .borrow()
-                    .exists(block)
-                    .then_some(BlockState::Commit)
-            })
+            .or_else(|| blocks.exists(block).then_some(BlockState::Commit))
     }
 
     pub(crate) fn vote(&mut self, block: &BlockId, vote: u8, msg_sender: &PeerId, time: EcTime) {
@@ -181,7 +261,7 @@ impl EcMemPool {
         }
     }
 
-    pub(crate) fn query(&self, block: &BlockId) -> Option<Block> {
+    pub(crate) fn query(&self, block: &BlockId, blocks: &dyn EcBlocks) -> Option<Block> {
         if *block == 0 {
             return None;
         }
@@ -189,7 +269,7 @@ impl EcMemPool {
             .pool
             .get(block)
             .and_then(|b| b.block)
-            .or_else(|| self.blocks.borrow().lookup(block));
+            .or_else(|| blocks.lookup(block));
     }
 
     /// Validates a block in the memory pool against its parent block.
@@ -250,150 +330,116 @@ impl EcMemPool {
             })
     }
 
-    pub(crate) fn tick(
+    /// Process evaluated blocks for voting and committing
+    ///
+    /// This phase only receives blocks that passed reorg checks.
+    /// It handles voting logic and commits blocks to the batch when ready.
+    pub(crate) fn tick_with_evaluations(
         &mut self,
         peers: &EcPeers,
         time: EcTime,
         id: PeerId,
         event_sink: &mut dyn EventSink,
+        evaluations: &[BlockEvaluation],
+        batch: &mut dyn crate::ec_interface::StorageBatch,
     ) -> Vec<MessageRequest> {
         let mut messages = Vec::new();
-
-        // TODO clean out expired elements - how old?
-        self.pool.retain(|_, s| time - s.time < 200);
-
-        let mut tokens = self.tokens.borrow_mut();
-
         let my_range = peers.peer_range(&id);
 
-        for (block_id, block_state) in self
-            .pool
-            .iter_mut()
-            .filter(|(_, state)| state.state == Pending)
-        {
-            // only consider blocks we hold. Requesting blocks is left to the node on vote-request for blank states
-            if let Some(block) = block_state.block {
-                // only check for Commit if updated
-                if block_state.updated {
-                    let ranges: Vec<PeerRange> = (0..block.used as usize)
-                        // balance voting on all tokens
-                        .map(|i| peers.peer_range(&block.parts[i].token))
-                        .collect();
-                    let mut balance = [0; TOKENS_PER_BLOCK];
+        // Only process blocks that passed evaluation (no reorg detected)
+        for evaluation in evaluations {
+            let block_id = evaluation.block_id;
+            let block_state = self.pool.get_mut(&block_id).unwrap();
+            let block = &evaluation.block;
+            // Check for Commit if updated
+            if block_state.updated {
+                let ranges: Vec<PeerRange> = (0..block.used as usize)
+                    .map(|i| peers.peer_range(&block.parts[i].token))
+                    .collect();
+                let mut balance = [0; TOKENS_PER_BLOCK];
 
-                    let witness = peers.peer_range(block_id);
-                    let mut witness_balance = 0;
+                let witness = peers.peer_range(&block_id);
+                let mut witness_balance = 0;
 
-                    // test all votes for range and sum up
-                    for (peer_id, peer_vote) in &block_state.votes {
-                        for (i, range) in ranges.iter().enumerate() {
-                            if range.in_range(&peer_id) {
-                                balance[i] += if peer_vote.vote & 1 << i == 0 { -1 } else { 1 };
-                            }
-                        }
-                        if witness.in_range(&peer_id) {
-                            witness_balance += 1;
+                // Test all votes for range and sum up
+                for (peer_id, peer_vote) in &block_state.votes {
+                    for (i, range) in ranges.iter().enumerate() {
+                        if range.in_range(&peer_id) {
+                            balance[i] += if peer_vote.vote & 1 << i == 0 { -1 } else { 1 };
                         }
                     }
-
-                    block_state.remaining = if witness_balance <= VOTE_THRESHOLD {
-                        1 << TOKENS_PER_BLOCK
-                    } else {
-                        0
-                    };
-
-                    for i in 0..ranges.len() {
-                        if balance[i] <= VOTE_THRESHOLD && balance[i] >= -VOTE_THRESHOLD {
-                            block_state.remaining |= 1 << i
-                        }
+                    if witness.in_range(&peer_id) {
+                        witness_balance += 1;
                     }
-
-                    block_state.updated = false;
                 }
 
-                let mut vote = 0;
-                let mut no_skip_or_reorg = true;
+                block_state.remaining = if witness_balance <= VOTE_THRESHOLD {
+                    1 << TOKENS_PER_BLOCK
+                } else {
+                    0
+                };
+
+                for i in 0..ranges.len() {
+                    if balance[i] <= VOTE_THRESHOLD && balance[i] >= -VOTE_THRESHOLD {
+                        block_state.remaining |= 1 << i
+                    }
+                }
+
+                block_state.updated = false;
+            }
+
+            // Check if ready to commit (all votes collected and validated)
+            if block_state.remaining == 0 && block_state.validate == 0 {
+                // COMMIT!
+                batch.save_block(block);
+
+                // Update tokens in batch (only those in our range)
                 for i in 0..block.used as usize {
-                    let current_mapping =
-                        tokens.lookup(&block.parts[i].token).map_or(0, |t| t.block);
-                    let last_mapping = block.parts[i].last;
-
-                    if current_mapping == last_mapping {
-                        vote |= 1 << i
-                    } else if current_mapping != 0 {
-                        // Never allow missing links or re-orgs on committed tokens
-                        no_skip_or_reorg = false;
-
-                        // request predessor block
-                        messages.push(MessageRequest::PARENTCOMMIT(last_mapping));
-
+                    if my_range.in_range(&block.parts[i].token) {
                         event_sink.log(
                             time,
                             id,
-                            Event::Reorg {
-                                block_id: *block_id,
+                            Event::BlockCommitted {
+                                block_id,
                                 peer: id,
-                                from: current_mapping,
-                                to: last_mapping,
+                                votes: block_state.votes.len(),
                             },
                         );
+
+                        batch.update_token(&block.parts[i].token, &block.id, block.time);
                     }
                 }
 
-                // if no remaining votes AND all is validated - commit
-                if no_skip_or_reorg && block_state.remaining == 0 && block_state.validate == 0 {
-                    // TODO should it be kept in mempool for a while - can it be rolled back ever? -> NO
+                block_state.state = BlockState::Commit;
+                continue;
+            }
 
-                    // TODO should the commit-chain be the responsiblity of token-store - or a seperate manager?
-
-                    // save block in permanent store
-                    self.blocks.borrow_mut().save(&block);
-
-                    // commit / update
-                    for i in 0..block.used as usize {
-                        // TODO (ok?) only tokens in my range -> together with "no_skip_or_reorg" lock
-                        if my_range.in_range(&block.parts[i].token) {
-                            event_sink.log(
-                                time,
-                                id,
-                                Event::BlockCommitted {
-                                    block_id: *block_id,
-                                    peer: id,
-                                    votes: block_state.votes.len(),
-                                },
-                            );
-
-                            tokens.set(&block.parts[i].token, &block.id, block.time);
-                        }
-                    }
-
-                    block_state.state = BlockState::Commit;
-                    continue;
+            // Not ready to commit - request validation or votes
+            for i in 0..block.used as usize {
+                if (block_state.validate & 1 << i) != 0 {
+                    // Fetch parent for signature validation
+                    messages.push(MessageRequest::PARENT(block_id, block.parts[i].last));
                 }
 
-                if no_skip_or_reorg {
-                    for i in 0..block.used as usize {
-                        if (block_state.validate & 1 << i) != 0 {
-                            // fetch a parent
-                            messages.push(MessageRequest::PARENT(*block_id, block.parts[i].last));
-                        }
-
-                        if (block_state.remaining & 1 << i) != 0 {
-                            // request vote
-                            messages.push(MessageRequest::VOTE(
-                                *block_id,
-                                block.parts[i].token,
-                                vote,
-                                vote & 1 << i != 0,
-                            ));
-                        }
-                    }
-
-                    // vote witness
-                    if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
-                        messages.push(MessageRequest::VOTE(*block_id, *block_id, vote, false));
-                    }
+                if (block_state.remaining & 1 << i) != 0 {
+                    // Request vote using pre-calculated vote_mask
+                    messages.push(MessageRequest::VOTE(
+                        block_id,
+                        block.parts[i].token,
+                        evaluation.vote_mask,
+                        evaluation.vote_mask & 1 << i != 0,
+                    ));
                 }
+            }
+
+            // Vote witness
+            if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
+                messages.push(MessageRequest::VOTE(
+                    block_id,
+                    block_id,
+                    evaluation.vote_mask,
+                    false,
+                ));
             }
         }
 
@@ -404,7 +450,7 @@ impl EcMemPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, TokenId};
+    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, TokenId, TokenSignature};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -471,17 +517,17 @@ mod tests {
             tokens: HashMap::new(),
         }));
 
-        let mut mem_pool = EcMemPool::new(tokens.clone(), blocks.clone());
+        let mut mem_pool = EcMemPool::new();
 
         // Test that querying a non-existent block returns None
-        assert!(mem_pool.query(&block_id).is_none());
+        assert!(mem_pool.query(&block_id, &*blocks.borrow()).is_none());
 
         // Save the block and test that it can be queried
         blocks.borrow_mut().save(&block);
-        assert_eq!(mem_pool.query(&block_id), Some(block));
+        assert_eq!(mem_pool.query(&block_id, &*blocks.borrow()), Some(block));
 
         // Test that querying a block in the mempool also works
         mem_pool.block(&block, 0);
-        assert_eq!(mem_pool.query(&block_id), Some(block));
+        assert_eq!(mem_pool.query(&block_id, &*blocks.borrow()), Some(block));
     }
 }
