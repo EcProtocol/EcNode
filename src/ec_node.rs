@@ -76,12 +76,22 @@ impl EcNode {
         self.blocks.borrow().lookup(block_id)
     }
 
-    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
-        self.time += 1;
+    /**
+     * TODO
+     * Here we need to see all at least vote-for tokens - such that conflicts can be detected. 
+     * In case of competing updates to a token we must BLOCK each valid transactionn competing - and start sending such negative votes.
+     * 
+     * TODO
+     * We should test collecting multi-messages. Such that votes to the same node gets send together.
         // TODO pack messages in Message2 style
         // - idea: the oldest transaction (longest in mempool) "sucks" all overlapping into message - sync. on roll.
         // (when commited or timeout - this schedule of a neighborhood is then "freed" of the next oldest etc)
         // TODO could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
+     * 
+     * We should also investigate if (like in earlier prototypes) we can reduce the votes by only sending to trusted nodes that hasn't responded yet.
+     */
+    pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
+        self.time += 1;
         let mut messages =
             self.mem_pool
                 .tick(&self.peers, self.time, self.peer_id, &mut *self.event_sink);

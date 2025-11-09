@@ -20,7 +20,7 @@
 //! 4. Call `node.tick()` and `node.handle_message()` as messages arrive
 //!
 //! ```no_run
-//! use ec_rust::{EcNode, ec_blocks::MemBlocks, ec_tokens::MemTokens};
+//! use ec_rust::{EcNode, ec_memory_backend::{MemBlocks, MemTokens}};
 //! use std::rc::Rc;
 //! use std::cell::RefCell;
 //!
@@ -45,12 +45,17 @@
 //! framework for protocol validation and performance analysis.
 
 // Core consensus modules
-pub mod ec_blocks;
 pub mod ec_interface;
 pub mod ec_mempool;
 pub mod ec_node;
 pub mod ec_peers;
-pub mod ec_tokens;
+pub mod ec_proof_of_storage;
+
+// Storage backends
+pub mod ec_memory_backend;
+
+#[cfg(feature = "rocksdb-backend")]
+pub mod ec_rocksdb_backend;
 
 // Re-export commonly used types
 pub use ec_interface::{

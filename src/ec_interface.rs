@@ -11,7 +11,9 @@ pub type EcTime = u64;
 pub type MessageTicket = u64;
 
 pub const TOKENS_PER_BLOCK: usize = 6;
-pub const TOKENS_SIGNATURE_SIZE: usize = 8;
+/// Number of tokens in a proof-of-storage signature response
+/// This should match SIGNATURE_CHUNKS in ec_tokens.rs (10 chunks)
+pub const TOKENS_SIGNATURE_SIZE: usize = 10;
 
 // block can not claim to be further into the future
 pub const SOME_STEPS_INTO_THE_FUTURE: EcTime = 100;
@@ -37,10 +39,20 @@ pub struct Block {
     pub signatures: [Option<Signature>; TOKENS_PER_BLOCK],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenMapping {
     pub id: TokenId,
     pub block: BlockId,
+}
+
+/// Result of a signature-based proof of storage query
+/// Contains the queried token's mapping plus signature tokens that prove storage
+#[derive(Clone, Debug)]
+pub struct TokenSignature {
+    /// The main token that was queried
+    pub answer: TokenMapping,
+    /// Array of signature tokens proving storage (proof of storage)
+    pub signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
 }
 
 // TODO make group message of Submit, Query and Validate
@@ -109,6 +121,7 @@ pub struct MessageEnvelope {
 ///
 ///
 
+#[derive(Copy, Clone, Debug)]
 pub struct BlockTime {
     pub(crate) block: BlockId,
     pub(crate) time: EcTime,
@@ -119,11 +132,22 @@ pub trait EcTokens {
 
     fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime);
 
-    /// Challenge: Find the smallest expand around token with tokenIds ending on bytes
-    /// matching the bytes in the key
-    /// Also tokenmappings must not point to blocks older than some threshold
+    /// Generate a proof-of-storage signature for a token
     ///
-    fn tokens_signature(&self, token: &TokenId, key: &PeerId) -> Option<Message>;
+    /// Performs signature-based token search to prove that the node stores tokens.
+    /// The signature is generated from (token, block, peer) and used to find
+    /// matching tokens in storage via bidirectional search.
+    ///
+    /// # Arguments
+    /// * `token` - The token being queried
+    /// * `peer` - The peer requesting the signature (affects signature generation)
+    ///
+    /// # Returns
+    /// * `Some(TokenSignature)` - If the token exists and a complete signature was found
+    /// * `None` - If the token doesn't exist or signature search was incomplete
+    ///
+    /// The returned `TokenSignature` can be wrapped in `Message::Answer` for transmission.
+    fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature>;
 }
 
 pub trait EcBlocks {

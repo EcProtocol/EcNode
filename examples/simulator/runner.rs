@@ -9,13 +9,12 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, RngCore, SeedableRng};
 
-use ec_rust::ec_blocks::MemBlocks;
+use ec_rust::ec_memory_backend::{MemBlocks, MemTokens};
 use ec_rust::ec_interface::{
     Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock, TokenId,
     TOKENS_PER_BLOCK,
 };
 use ec_rust::ec_node::EcNode;
-use ec_rust::ec_tokens::MemTokens;
 
 use super::config::{SimConfig, TopologyConfig, TopologyMode};
 use super::event_sinks::{ConsoleEventSink, CsvEventSink, MultiEventSink};

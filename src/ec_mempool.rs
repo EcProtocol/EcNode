@@ -7,7 +7,8 @@ use hashbrown::HashMap;
 
 use crate::ec_interface::{
     Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, PeerId, PublicKeyReference,
-    Signature, TokenId, SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK, VOTE_THRESHOLD,
+    Signature, TokenId, TokenSignature, SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK,
+    VOTE_THRESHOLD,
 };
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
@@ -403,7 +404,7 @@ impl EcMemPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, Message, TokenId};
+    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, TokenId};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -445,7 +446,7 @@ mod tests {
             );
         }
 
-        fn tokens_signature(&self, _token: &TokenId, _key: &PeerId) -> Option<Message> {
+        fn tokens_signature(&self, _token: &TokenId, _key: &PeerId) -> Option<TokenSignature> {
             // Not needed for this test
             None
         }
