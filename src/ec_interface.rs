@@ -47,7 +47,7 @@ pub struct TokenMapping {
 
 /// Result of a signature-based proof of storage query
 /// Contains the queried token's mapping plus signature tokens that prove storage
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TokenSignature {
     /// The main token that was queried
     pub answer: TokenMapping,
