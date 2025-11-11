@@ -65,9 +65,8 @@ pub use ec_interface::{
 pub use ec_node::EcNode;
 // Public API for peer elections (used by clients to evaluate and discover peers)
 pub use ec_proof_of_storage::{
-    initialize_election_secret, ring_distance, ConsensusCluster, ElectionAttempt, ElectionConfig,
-    ElectionError, ElectionResult, PeerElection,
+    ring_distance, ConsensusCluster, ElectionConfig, ElectionError, PeerElection, WinnerResult,
 };
 
 // Internal utilities (used by ec_peers.rs and ec_node.rs, not exposed to external clients)
-pub(crate) use ec_proof_of_storage::{generate_ticket, ChannelState, ElectionState};
+pub(crate) use ec_proof_of_storage::ChannelState;
