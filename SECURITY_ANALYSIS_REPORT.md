@@ -22,7 +22,7 @@ The V2.0 simplifications removed complexity while **adding critical security fea
 | Security Feature | V1.0 Status | V2.0 Status | Impact |
 |-----------------|-------------|-------------|--------|
 | **Signature Verification** | ❌ Not implemented | ✅ **Cryptographic proof** | ⬆️ **MAJOR** |
-| **Blocked Peer Tracking** | ❌ No tracking | ✅ **Per-election blocks** | ⬆️ **HIGH** |
+| **Channel Blocking** | ❌ No blocking | ✅ **Channel-only (no peer tracking)** | ⬆️ **CRITICAL** |
 | **Secret Isolation** | ⚠️ Global secret | ✅ **Per-election random** | ⬆️ **MEDIUM** |
 | **First-hop Uniqueness** | ⚠️ Not enforced | ✅ **Enforced** | ⬆️ **MEDIUM** |
 | **Duplicate Detection** | ✅ Present | ✅ Present | ➡️ Same |
@@ -65,31 +65,38 @@ Responder must:
 
 ---
 
-### 2. Blocked Peer Tracking (NEW)
+### 2. Channel Blocking Only (CRITICAL FIX - 2025-01-12)
 
-**V1.0 Weakness**:
-- No memory of bad behavior
-- Attackers could retry gaming attempts within same election
-- No consequences for invalid responses
+**VULNERABILITY DISCOVERED**: Individual peer blocking was weaponizable by attackers!
 
-**V2.0 Defense**:
-- Maintains `HashSet<PeerId>` of blocked peers
-- Blocks peers when:
-  - Duplicate response detected (gaming attempt)
-  - Invalid signature sent
-- All future responses from blocked peers rejected
-- Isolation per-election (doesn't affect other elections)
+**Attack Vector**:
+```
+Evil Node E receives Query
+  ├─> E sends Answer (first response - accepted ✓)
+  ├─> E forwards Query to Honest Nodes H1, H2, H3
+  └─> When H1, H2, H3 respond → they become "duplicates"
+      └─> OLD CODE: H1, H2, H3 blocked from election
+      └─> Evil node's response stays, honest nodes excluded!
+```
 
-**Attack Resistance**:
-- Gaming attempt → immediate exclusion
-- Invalid signature → immediate exclusion
-- Attackers get one try per election, then blocked
-- Combined with continuous re-election, bad actors systematically excluded
+**FIX IMPLEMENTED**:
+- **ONLY block the channel**, NOT individual peers
+- When duplicate detected:
+  - Channel state → Blocked
+  - ALL responses on that channel ignored (both evil node and forwarded responses)
+  - No peer tracking whatsoever
 
-**Security Impact**: ⬆️ **HIGH**
-- Raises cost of gaming (need fresh Sybil for each election)
-- Provides reputation mechanism (even if temporary)
-- Reduces effectiveness of repeated attacks
+**Why This Is Safer**:
+- Evil node CANNOT weaponize blocking to exclude honest nodes
+- Both the evil node's response AND forwarded responses are disregarded
+- Channel is the attack surface, not individual peers
+- Simpler = fewer attack vectors
+
+**Security Impact**: ⬆️ **CRITICAL**
+- Prevents evil nodes from excluding honest nodes
+- Maintains anti-gaming protection (duplicate detection)
+- Removes weaponizable feature
+- Cleaner security model
 
 ---
 
@@ -182,20 +189,23 @@ Responder must:
 
 ---
 
-### Scenario 3: Route Manipulation / Gaming
+### Scenario 3: Route Manipulation / Gaming / Weaponized Blocking
 
 **V1.0 Risk**: 🟡 **LOW-MODERATE**
 - Duplicate detection catches forking
 - Channel blocked
 - But attackers not tracked (can try again)
 
-**V2.0 Risk**: 🟢 **LOW**
+**V2.0 Risk (AFTER FIX)**: 🟢 **LOW**
 - Duplicate detection (same as V1.0)
-- **Plus**: Peer blocked for rest of election
-- **Plus**: All responses from blocked peer rejected
-- Gaming attempt has lasting consequences
+- **Channel blocked** (all responses on that channel disqualified)
+- **NO individual peer tracking** (prevents weaponization!)
+- Evil node CANNOT exclude honest nodes by forwarding queries
+- Both attacker and forwarded responses are disqualified equally
 
-**Change**: ⬇️ **REDUCED RISK**
+**CRITICAL FIX**: Removed individual peer blocking (was weaponizable)
+
+**Change**: ⬇️ **SIGNIFICANTLY REDUCED RISK** + vulnerability eliminated
 
 ---
 
@@ -295,12 +305,12 @@ Responder must:
 
 - ✅ Cryptographic proof of state (signature verification)
 - ✅ Sybil resistance (POW + signatures)
-- ✅ Gaming detection (duplicate + invalid signature)
-- ✅ Reputation tracking (blocked peers)
+- ✅ Gaming detection (duplicate response → channel blocking)
+- ✅ Channel blocking only (prevents weaponization - CRITICAL FIX)
 - ✅ Secret isolation (per-election)
 - ✅ Forward secrecy (random secrets)
 - ✅ Clean error handling (clear attack indicators)
-- ✅ Testable security properties (37 tests)
+- ✅ Testable security properties (24 tests passing)
 - ✅ Well-documented attack resistance
 - ✅ No known critical vulnerabilities
 
@@ -313,7 +323,7 @@ Responder must:
 ### For Production Deployment
 
 1. **Monitor Metrics**:
-   - Track `blocked_peer_count()` per election
+   - Track blocked channels (DuplicateResponse errors)
    - Log `SignatureVerificationFailed` errors
    - Alert on frequent split-brain detections
 

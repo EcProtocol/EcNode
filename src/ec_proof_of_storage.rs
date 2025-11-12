@@ -460,14 +460,11 @@ pub enum ElectionError {
     /// Maximum channels limit reached
     MaxChannelsReached,
 
-    /// Channel is blocked (from blocked peer)
+    /// Channel is blocked (duplicate response detected)
     ChannelBlocked,
 
     /// Signature verification failed
     SignatureVerificationFailed,
-
-    /// Response from a blocked peer
-    BlockedPeer,
 }
 
 
@@ -511,9 +508,6 @@ pub struct PeerElection {
     /// Track first-hop peers to prevent duplicate channels
     first_hop_peers: HashMap<PeerId, MessageTicket>,
 
-    /// Blocked peers (caught gaming or sending invalid responses)
-    blocked_peers: std::collections::HashSet<PeerId>,
-
     /// Configuration
     config: ElectionConfig,
 }
@@ -539,7 +533,6 @@ impl PeerElection {
             election_secret,
             channels: HashMap::new(),
             first_hop_peers: HashMap::new(),
-            blocked_peers: std::collections::HashSet::new(),
             config,
         }
     }
@@ -589,7 +582,6 @@ impl PeerElection {
     /// * `Ok(())` - Response verified and stored successfully
     /// * `Err(WrongToken)` - Answer is for a different token
     /// * `Err(UnknownTicket)` - Ticket not found in this election
-    /// * `Err(BlockedPeer)` - Response from a blocked peer
     /// * `Err(ChannelBlocked)` - Channel is blocked
     /// * `Err(DuplicateResponse)` - Channel already has response (now blocked)
     /// * `Err(SignatureVerificationFailed)` - Signature doesn't match expected values
@@ -603,11 +595,6 @@ impl PeerElection {
         // Check this election is for the correct token
         if answer.id != self.challenge_token {
             return Err(ElectionError::WrongToken);
-        }
-
-        // Check if this peer is blocked
-        if self.blocked_peers.contains(&responder_peer) {
-            return Err(ElectionError::BlockedPeer);
         }
 
         // Verify the signature BEFORE getting mutable access to channel
@@ -628,7 +615,6 @@ impl PeerElection {
         // Detect duplicate (anti-gaming mechanism)
         if channel.response.is_some() {
             channel.state = ChannelState::Blocked;
-            self.blocked_peers.insert(responder_peer);
             return Err(ElectionError::DuplicateResponse);
         }
 
@@ -696,7 +682,6 @@ impl PeerElection {
     /// * `Err(WrongToken)` - Referral is for a different token
     /// * `Err(UnknownTicket)` - Ticket not found
     /// * `Err(ChannelBlocked)` - Channel is blocked, ignoring referral
-    /// * `Err(BlockedPeer)` - Responder is a blocked peer
     pub fn handle_referral(
         &mut self,
         ticket: MessageTicket,
@@ -707,11 +692,6 @@ impl PeerElection {
         // Verify correct token for this election
         if token_challenge != self.challenge_token {
             return Err(ElectionError::WrongToken);
-        }
-
-        // Check if responder is blocked
-        if self.blocked_peers.contains(&responder_peer) {
-            return Err(ElectionError::BlockedPeer);
         }
 
         // Get channel and verify ticket matches
@@ -874,11 +854,6 @@ impl PeerElection {
     /// Get the number of channels (including pending and blocked)
     pub fn channel_count(&self) -> usize {
         self.channels.len()
-    }
-
-    /// Get the number of blocked peers
-    pub fn blocked_peer_count(&self) -> usize {
-        self.blocked_peers.len()
     }
 }
 
@@ -1754,20 +1729,8 @@ mod tests {
         assert!(result.is_err()); // Signature verification will fail
     }
 
-    #[test]
-    fn test_election_blocked_peer_rejected() {
-        let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
-        let ticket = election.create_channel(100).unwrap();
-
-        let answer = TokenMapping { id: 1000, block: 42 };
-        let sig = create_test_signature([(1, 10); SIGNATURE_CHUNKS]);
-
-        // Block the peer manually
-        election.blocked_peers.insert(101);
-
-        let result = election.handle_answer(ticket, &answer, &sig.signature, 101);
-        assert_eq!(result, Err(ElectionError::BlockedPeer));
-    }
+    // Removed test_election_blocked_peer_rejected - peer blocking no longer exists
+    // Only channels are blocked, not individual peers
 
     #[test]
     fn test_election_wrong_token_rejected() {
@@ -1825,13 +1788,9 @@ mod tests {
         assert_eq!(election.challenge_token(), challenge_token);
         assert_eq!(election.valid_response_count(), 0);
         assert_eq!(election.channel_count(), 0);
-        assert_eq!(election.blocked_peer_count(), 0);
         assert!(election.can_create_channel());
 
         election.create_channel(100).unwrap();
         assert_eq!(election.channel_count(), 1);
-
-        election.blocked_peers.insert(777);
-        assert_eq!(election.blocked_peer_count(), 1);
     }
 }

@@ -290,19 +290,34 @@ ticket = Blake3(challenge_token || first_hop_peer || election_secret)
 
 ---
 
-### 5. Blocked Peer Tracking (NEW - Reputation Defense)
+### 5. Channel Blocking Only (CRITICAL - No Individual Peer Tracking)
 
-**Attack**: Malicious peer attempts multiple gaming strategies or sends invalid responses.
+**IMPORTANT SECURITY DECISION**: We do NOT track blocked peers individually.
 
-**Defense**:
-- Election maintains a set of blocked peers
-- Peers are blocked when:
-  - They send duplicate responses (gaming attempt detected)
-  - They send responses with invalid signatures
-  - Any response from blocked peer is rejected
-- Blocks are per-election (isolated)
+**Why Individual Peer Blocking Is Dangerous**:
 
-**Result**: ✅ Once caught gaming, attacker is excluded from that election. Combined with continuous re-election in `ec_peers`, bad actors get systematically excluded over time.
+Evil nodes can weaponize it to exclude honest nodes:
+```
+Attack Scenario:
+  1. Evil node E receives Query from challenger
+  2. E sends Answer back (first response - accepted ✓)
+  3. E forwards Query to honest nodes H1, H2, H3
+  4. When H1, H2, H3 respond → they're "duplicates"
+  5. OLD BAD DESIGN: H1, H2, H3 would be blocked
+  6. Result: Evil node excludes honest nodes!
+```
+
+**Correct Defense - Channel Blocking Only**:
+- When duplicate response detected:
+  - Channel state → Blocked
+  - ALL responses on that channel ignored (first AND subsequent)
+  - NO individual peer tracking
+- This prevents weaponization:
+  - Evil node's response is also on the blocked channel
+  - Cannot selectively keep its response while blocking others
+  - Simpler = fewer attack vectors
+
+**Result**: ✅ Anti-gaming protection without weaponizable peer exclusion
 
 ---
 
@@ -422,7 +437,7 @@ The network may be genuinely partitioned or have fundamental disagreement. User 
 | Security Property | V1.0 (Old) | V2.0 (Current) | Change |
 |-------------------|------------|----------------|--------|
 | **Signature Verification** | ❌ Not implemented | ✅ **Full verification** | ✅ **MAJOR IMPROVEMENT** |
-| **Blocked Peer Tracking** | ❌ No tracking | ✅ **Per-election blocks** | ✅ **IMPROVEMENT** |
+| **Channel Blocking Only** | ❌ No blocking | ✅ **Channel-level only** | ✅ **CRITICAL FIX** |
 | **Secret Isolation** | ⚠️ Global secret | ✅ **Per-election random** | ✅ **IMPROVEMENT** |
 | **Duplicate Detection** | ✅ Present | ✅ Present | ➡️ Same |
 | **Consensus Threshold** | ✅ 8/10 mappings | ✅ 8/10 mappings | ➡️ Same |
@@ -438,10 +453,11 @@ The network may be genuinely partitioned or have fundamental disagreement. User 
    - V2.0: Verifies 10-bit chunks from Blake3 hash
    - Impact: Prevents fake state, guessing attacks, lazy peers
 
-2. **Blocked Peer Tracking**: Systematically excludes bad actors
-   - V1.0: No memory of bad behavior
-   - V2.0: Tracks and rejects gaming attempts
-   - Impact: Attackers can't retry within election
+2. **Channel Blocking Only** (Critical Security Fix): Prevents weaponization
+   - V1.0: No blocking mechanism
+   - V2.0: Blocks channels on duplicate, NOT individual peers
+   - Impact: Evil nodes cannot exclude honest nodes by forwarding queries
+   - **Why Not Peer Blocking**: Attackers could weaponize it to exclude honest nodes
 
 3. **Secret Isolation**: Compromising one election doesn't affect others
    - V1.0: Single global secret
@@ -546,17 +562,27 @@ Layer 4: This Election System
 - Continuous re-election tests consistency over time
 - Colluders must maintain expensive real infrastructure
 
-#### Attack 3: Route Manipulation
+#### Attack 3: Route Manipulation / Query Forwarding
 
-**Setup**: Attacker controls first-hop peer, forks challenge to multiple colluding responders.
+**Setup**: Attacker controls first-hop peer, forks challenge to multiple nodes (honest or colluding).
+
+**Attack Strategy**:
+```
+Attacker E receives Query
+  1. E responds first (gets accepted)
+  2. E forwards Query to nodes H1, H2, H3
+  3. Goal: Get H1, H2, H3 blocked or use their responses
+```
 
 **V2.0 Defense**:
 - Each channel accepts exactly ONE response
-- Second response immediately blocks channel AND all peers involved
-- All responders in blocked channel are disqualified
-- Blocked peers tracked and rejected for rest of election
+- Second response immediately blocks the CHANNEL (not individual peers!)
+- ALL responses on blocked channel are disqualified (including E's first response)
+- **Critical**: We do NOT track blocked peers individually
+  - Prevents weaponization: E cannot selectively exclude honest nodes
+  - E's response is also on the blocked channel, gets disqualified too
 
-**Result**: ✅ Attack detected and neutralized immediately + attackers excluded
+**Result**: ✅ Attack detected, entire channel disqualified (attacker and victims both excluded, maintaining fairness)
 
 #### Attack 4: Ticket Replay
 
@@ -849,7 +875,6 @@ match election.check_for_winner() {
 // Query state
 election.valid_response_count();
 election.can_create_channel();
-election.blocked_peer_count();
 ```
 
 ### Type Compatibility: u64 → 256-bit
@@ -1050,7 +1075,7 @@ The peer election system (V2.0) provides a **robust, secure, and practical** mec
 
 ✅ **Enhanced Security**:
 - **Signature verification** (NEW): Cryptographically proves responders have correct state
-- **Blocked peer tracking** (NEW): Systematically excludes bad actors
+- **Channel blocking only** (CRITICAL FIX): Prevents weaponization - only channels blocked, not peers
 - **Per-election secrets** (NEW): Isolation and forward secrecy
 - Multi-layered defense: POW + tickets + duplicates + consensus + signatures
 
