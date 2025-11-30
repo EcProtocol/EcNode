@@ -73,24 +73,21 @@ pub trait TokenStorageBackend {
 
 /// Proof-of-storage signature generator
 ///
-/// This struct wraps a TokenStorageBackend and provides signature generation
-/// functionality. It contains no storage itself - all data is in the backend.
-///
-/// # Type Parameter
-/// - `B`: Any type implementing `TokenStorageBackend`
+/// This struct provides signature generation functionality for proof-of-storage.
+/// It does not own storage - storage is passed as a parameter to methods.
 ///
 /// # Example
 /// ```rust
 /// let storage = MemTokens::new();
-/// let proof_system = ProofOfStorage::new(storage);
+/// let proof_system = ProofOfStorage::new();
 ///
 /// // Generate signature for a token
-/// if let Some(sig) = proof_system.generate_signature(&token, &peer) {
+/// if let Some(sig) = proof_system.generate_signature(&storage, &token, &peer) {
 ///     // Use signature...
 /// }
 /// ```
-pub struct ProofOfStorage<B: TokenStorageBackend> {
-    backend: B,
+pub struct ProofOfStorage {
+    // Zero-sized type - all methods take storage as parameter
 }
 
 /// Result of consensus cluster analysis
@@ -929,20 +926,10 @@ impl PeerElection {
     }
 }
 
-impl<B: TokenStorageBackend> ProofOfStorage<B> {
-    /// Create a new proof-of-storage system with the given backend
-    pub fn new(backend: B) -> Self {
-        Self { backend }
-    }
-
-    /// Get a reference to the underlying storage backend
-    pub fn backend(&self) -> &B {
-        &self.backend
-    }
-
-    /// Get a mutable reference to the underlying storage backend
-    pub fn backend_mut(&mut self) -> &mut B {
-        &mut self.backend
+impl ProofOfStorage {
+    /// Create a new proof-of-storage system (zero-sized type)
+    pub fn new() -> Self {
+        Self {}
     }
 
     /// Extract the last N bits from a token for signature matching
@@ -1004,6 +991,7 @@ impl<B: TokenStorageBackend> ProofOfStorage<B> {
     /// Returns tokens matching the signature criteria along with search statistics.
     pub fn search_by_signature(
         &self,
+        backend: &dyn TokenStorageBackend,
         lookup_token: &TokenId,
         signature_chunks: &[u16; SIGNATURE_CHUNKS],
     ) -> SignatureSearchResult {
@@ -1012,7 +1000,7 @@ impl<B: TokenStorageBackend> ProofOfStorage<B> {
         let mut chunk_idx = 0;
 
         // Search above (forward) for first 5 chunks
-        let mut after_iter = self.backend.range_after(lookup_token);
+        let mut after_iter = backend.range_after(lookup_token);
         while chunk_idx < 5 {
             if let Some((token, _)) = after_iter.next() {
                 steps += 1;
@@ -1027,7 +1015,7 @@ impl<B: TokenStorageBackend> ProofOfStorage<B> {
         }
 
         // Search below (backward) for last 5 chunks
-        let mut before_iter = self.backend.range_before(lookup_token);
+        let mut before_iter = backend.range_before(lookup_token);
         while chunk_idx < SIGNATURE_CHUNKS {
             if let Some((token, _)) = before_iter.next() {
                 steps += 1;
@@ -1232,17 +1220,18 @@ impl<B: TokenStorageBackend> ProofOfStorage<B> {
     /// ```
     pub fn generate_signature(
         &self,
+        backend: &dyn TokenStorageBackend,
         token: &TokenId,
         peer: &PeerId,
     ) -> Option<TokenSignature> {
         // Get the block mapping for this token
-        let block_time = self.backend.lookup(token)?;
+        let block_time = backend.lookup(token)?;
 
         // Generate signature from token, block, and peer
         let signature_chunks = Self::signature_for(token, &block_time.block, peer);
 
         // Perform signature-based search
-        let search_result = self.search_by_signature(token, &signature_chunks);
+        let search_result = self.search_by_signature(backend, token, &signature_chunks);
 
         // Only return a signature if we found all 10 tokens
         if search_result.complete {
@@ -1253,7 +1242,7 @@ impl<B: TokenStorageBackend> ProofOfStorage<B> {
             }; TOKENS_SIGNATURE_SIZE];
 
             for (i, &token_id) in search_result.tokens.iter().enumerate() {
-                if let Some(block_time) = self.backend.lookup(&token_id) {
+                if let Some(block_time) = backend.lookup(&token_id) {
                     signature[i] = TokenMapping {
                         id: token_id,
                         block: block_time.block,
@@ -1358,28 +1347,31 @@ mod tests {
         let mut backend = TestBackend::new();
         backend.set(&100, &1, 10);
 
-        let proof = ProofOfStorage::new(backend);
+        let proof = ProofOfStorage::new();
 
-        assert_eq!(proof.backend().len(), 1);
-        assert!(proof.backend().lookup(&100).is_some());
+        assert_eq!(backend.len(), 1);
+        assert!(backend.lookup(&100).is_some());
+
+        // Verify proof system can work with the backend
+        let _ = proof.generate_signature(&backend, &100, &42);
     }
 
     #[test]
     fn test_signature_generation_nonexistent_token() {
         let backend = TestBackend::new();
-        let proof = ProofOfStorage::new(backend);
+        let proof = ProofOfStorage::new();
 
-        let result = proof.generate_signature(&12345, &99999);
+        let result = proof.generate_signature(&backend, &12345, &99999);
         assert!(result.is_none(), "Should return None for nonexistent token");
     }
 
     #[test]
     fn test_signature_search_empty_storage() {
         let backend = TestBackend::new();
-        let proof = ProofOfStorage::new(backend);
+        let proof = ProofOfStorage::new();
 
         let signature = [0u16; SIGNATURE_CHUNKS];
-        let result = proof.search_by_signature(&1000, &signature);
+        let result = proof.search_by_signature(&backend, &1000, &signature);
 
         assert_eq!(result.tokens.len(), 0);
         assert!(!result.complete);
@@ -1433,7 +1425,7 @@ mod tests {
             ],
         };
 
-        let count = ProofOfStorage::<TestBackend>::count_common_mappings(&sig1, &sig2);
+        let count = ProofOfStorage::count_common_mappings(&sig1, &sig2);
         assert_eq!(count, 3, "Should find 3 common mappings");
     }
 
@@ -1470,7 +1462,7 @@ mod tests {
             },
         ];
 
-        let cluster = ProofOfStorage::<TestBackend>::find_consensus_cluster(&signatures, 10);
+        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 10);
 
         assert!(cluster.is_some());
         let cluster = cluster.unwrap();
@@ -1526,7 +1518,7 @@ mod tests {
         ];
 
         // With threshold of 8, only sig1 and sig2 should form a cluster
-        let cluster = ProofOfStorage::<TestBackend>::find_consensus_cluster(&signatures, 8);
+        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 8);
 
         assert!(cluster.is_some());
         let cluster = cluster.unwrap();
@@ -1594,7 +1586,7 @@ mod tests {
         ];
 
         // With threshold of 8, should find the larger group (Group B with 3 members)
-        let cluster = ProofOfStorage::<TestBackend>::find_consensus_cluster(&signatures, 8);
+        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 8);
 
         assert!(cluster.is_some());
         let cluster = cluster.unwrap();
@@ -1650,7 +1642,7 @@ mod tests {
         ];
 
         // With very high threshold, no cluster should be found
-        let cluster = ProofOfStorage::<TestBackend>::find_consensus_cluster(&signatures, 9);
+        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 9);
 
         // Should find nothing above threshold 9 (they only agree on 2/10)
         assert!(cluster.is_none() || cluster.unwrap().members.len() == 1);
@@ -1659,7 +1651,7 @@ mod tests {
     #[test]
     fn test_consensus_cluster_empty_input() {
         let signatures: Vec<TokenSignature> = vec![];
-        let cluster = ProofOfStorage::<TestBackend>::find_consensus_cluster(&signatures, 5);
+        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 5);
         assert!(cluster.is_none());
     }
 
@@ -1672,7 +1664,7 @@ mod tests {
             signature: [TokenMapping { id: 1, block: 1 }; SIGNATURE_CHUNKS],
         }];
 
-        let cluster = ProofOfStorage::<TestBackend>::find_consensus_cluster(&signatures, 5);
+        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 5);
         assert!(cluster.is_some());
         let cluster = cluster.unwrap();
         assert_eq!(cluster.members.len(), 1);

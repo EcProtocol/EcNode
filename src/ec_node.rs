@@ -9,11 +9,13 @@ use crate::ec_interface::{
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
 use crate::ec_peers::EcPeers;
+use crate::ec_proof_of_storage::TokenStorageBackend;
 
 use crate::ec_mempool::MessageRequest;
 
-pub struct EcNode<B: BatchedBackend + EcTokens + EcBlocks + 'static> {
+pub struct EcNode<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> {
     backend: Rc<RefCell<B>>,
+    token_storage: T,
     peers: EcPeers,
     mem_pool: EcMemPool,
     peer_id: PeerId,
@@ -23,10 +25,10 @@ pub struct EcNode<B: BatchedBackend + EcTokens + EcBlocks + 'static> {
     event_sink: Box<dyn EventSink>,
 }
 
-impl<B: BatchedBackend + EcTokens + EcBlocks + 'static> EcNode<B> {
+impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> EcNode<B, T> {
     /// Create a new node with default NoOpSink (zero overhead)
-    pub fn new(backend: Rc<RefCell<B>>, id: PeerId, time: EcTime) -> Self {
-        Self::new_with_sink(backend, id, time, Box::new(NoOpSink))
+    pub fn new(backend: Rc<RefCell<B>>, id: PeerId, time: EcTime, token_storage: T) -> Self {
+        Self::new_with_sink(backend, id, time, token_storage, Box::new(NoOpSink))
     }
 
     /// Create a new node with a custom event sink for debugging/analysis
@@ -34,11 +36,13 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static> EcNode<B> {
         backend: Rc<RefCell<B>>,
         id: PeerId,
         time: EcTime,
+        token_storage: T,
         event_sink: Box<dyn EventSink>,
     ) -> Self {
         Self {
             mem_pool: EcMemPool::new(),
             backend,
+            token_storage,
             peers: EcPeers::new(id),
             peer_id: id,
             time,
@@ -374,7 +378,8 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static> EcNode<B> {
                 if msg.ticket == self.block_req_ticket ^ token
                     || msg.ticket == self.parent_block_req_ticket ^ token
                 {
-                    self.peers.handle_referral(msg.sender, *high, *low);
+                    let _actions = self.peers.handle_referral(msg.ticket, *token, [*high, *low], msg.sender);
+                    // TODO: Process actions (send Query messages)
                 }
             }
         }

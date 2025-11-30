@@ -68,8 +68,8 @@ impl MemTokens {
     ///     // Use signature...
     /// }
     /// ```
-    pub fn into_proof_system(self) -> ProofOfStorage<Self> {
-        ProofOfStorage::new(self)
+    pub fn into_proof_system(self) -> ProofOfStorage {
+        ProofOfStorage::new()
     }
 }
 
@@ -166,8 +166,8 @@ impl EcTokens for MemTokens {
         // Create a temporary ProofOfStorage system for signature generation
         // We use a wrapper that implements TokenStorageBackend by forwarding to self
         let wrapper = MemTokensRef(self);
-        let proof_system = ProofOfStorage::new(wrapper);
-        proof_system.generate_signature(token, peer)
+        let proof_system = ProofOfStorage::new();
+        proof_system.generate_signature(&wrapper, token, peer)
     }
 }
 
@@ -475,10 +475,15 @@ mod tests {
         let mut storage = MemTokens::new();
         TokenStorageBackend::set(&mut storage, &100, &1, 10);
 
-        let proof_system = storage.into_proof_system();
+        // Verify storage has the token before conversion
+        assert_eq!(TokenStorageBackend::len(&storage), 1);
+        assert!(TokenStorageBackend::lookup(&storage, &100).is_some());
 
-        assert_eq!(TokenStorageBackend::len(proof_system.backend()), 1);
-        assert!(TokenStorageBackend::lookup(proof_system.backend(), &100).is_some());
+        // Create proof system (no longer consumes storage since it's zero-sized)
+        let _proof_system = ProofOfStorage::new();
+
+        // Verify we can still use storage independently
+        assert_eq!(TokenStorageBackend::len(&storage), 1);
     }
 
     // ========================================================================
