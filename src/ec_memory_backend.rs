@@ -358,6 +358,33 @@ impl EcTokens for MemoryBackend {
     }
 }
 
+// Implement TokenStorageBackend for MemoryBackend (delegates to tokens field)
+impl TokenStorageBackend for MemoryBackend {
+    fn lookup(&self, token: &TokenId) -> Option<BlockTime> {
+        TokenStorageBackend::lookup(&self.tokens, token)
+    }
+
+    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+        TokenStorageBackend::set(&mut self.tokens, token, block, time)
+    }
+
+    fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
+        TokenStorageBackend::range_after(&self.tokens, start)
+    }
+
+    fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
+        TokenStorageBackend::range_before(&self.tokens, end)
+    }
+
+    fn len(&self) -> usize {
+        TokenStorageBackend::len(&self.tokens)
+    }
+
+    fn is_empty(&self) -> bool {
+        TokenStorageBackend::is_empty(&self.tokens)
+    }
+}
+
 // Implement EcBlocks for MemoryBackend (delegates to blocks field)
 impl EcBlocks for MemoryBackend {
     fn lookup(&self, block: &BlockId) -> Option<Block> {

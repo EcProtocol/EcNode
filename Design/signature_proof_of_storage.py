@@ -48,7 +48,7 @@ def run_signature_proof_test():
     print("Signature-Based Proof of Storage Analysis")
     print("=" * 50)
     
-    generate = 10_000_000
+    generate = 1_000_000
     # Generate random 256-bit tokens
     print(f"Generating {generate} random 256-bit tokens...")
     tokens = [generate_256_bit_token() for _ in range(generate)]
@@ -59,7 +59,7 @@ def run_signature_proof_test():
     print(f"Signature chunks (10 bits each): {signature_chunks}")
     
     # Test parameters
-    densities = [0.99, 0.95, 0.90, 0.80, 0.50, 0.40]
+    densities = [0.99, 0.95, 0.90, 0.80, 0.70, 0.60]
     num_scenarios = 100
 
     # Generate random lookup token

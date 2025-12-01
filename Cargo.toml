@@ -9,6 +9,31 @@ path = "src/lib.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Examples are in the simulator/ directory
+[[example]]
+name = "basic_simulation"
+path = "simulator/basic_simulation.rs"
+
+[[example]]
+name = "peer_lifecycle_sim"
+path = "simulator/peer_lifecycle_sim.rs"
+
+[[example]]
+name = "csv_export_test"
+path = "simulator/csv_export_test.rs"
+
+[[example]]
+name = "event_analysis"
+path = "simulator/event_analysis.rs"
+
+[[example]]
+name = "event_logging_test"
+path = "simulator/event_logging_test.rs"
+
+[[example]]
+name = "fixed_seed_test"
+path = "simulator/fixed_seed_test.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"

@@ -10,8 +10,8 @@
 use log::info;
 use simple_logger::SimpleLogger;
 
-mod simulator;
-use simulator::{SimConfig, SimRunner};
+mod consensus;
+use consensus::{SimConfig, SimRunner};
 
 fn main() {
     SimpleLogger::new().init().unwrap();

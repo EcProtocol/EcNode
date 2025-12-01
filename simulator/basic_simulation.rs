@@ -5,8 +5,8 @@
 use log::info;
 use simple_logger::SimpleLogger;
 
-mod simulator;
-use simulator::{
+mod consensus;
+use consensus::{
     NetworkConfig, SimConfig, SimRunner, TopologyConfig, TopologyMode, TransactionConfig,
 };
 
