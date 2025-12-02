@@ -286,15 +286,15 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                     _ => {} // discard - do nothing
                 }
             }
-            Message::Query {
-                token,
+            Message::QueryBlock {
+                block_id,
                 target,
                 ticket,
             } => {
                 let respond_to = if *target == 0 { msg.sender } else { *target };
 
                 let backend = self.backend.borrow();
-                if let Some(me) = self.mem_pool.query(token, &*backend).map(|block| MessageEnvelope {
+                if let Some(me) = self.mem_pool.query(block_id, &*backend).map(|block| MessageEnvelope {
                     sender: self.peer_id,
                     receiver: respond_to,
                     ticket: *ticket,
@@ -305,7 +305,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                     responses.push(me)
                 } else if let None = self.peers.trusted_peer(&msg.sender) {
                     // this is not a trusted peer
-                    let peers = self.peers.peers_for(token, self.time);
+                    let peers = self.peers.peers_for(block_id, self.time);
 
                     responses.push(MessageEnvelope {
                         sender: self.peer_id,
@@ -313,22 +313,22 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         ticket: *ticket,
                         time: self.time,
                         message: Message::Referral {
-                            token: *token,
+                            token: *block_id,
                             high: peers[1],
                             low: peers[0],
                         },
                     });
-                } else if (token ^ self.time) & 0x3 == 0 {
+                } else if (block_id ^ self.time) & 0x3 == 0 {
                     // forwarding for trusted peers
-                    let peer_id = self.peers.peer_for(token, self.time);
+                    let peer_id = self.peers.peer_for(block_id, self.time);
 
                     responses.push(MessageEnvelope {
                         sender: self.peer_id,
                         receiver: peer_id,
                         ticket: 0,
                         time: self.time,
-                        message: Message::Query {
-                            token: *token,
+                        message: Message::QueryBlock {
+                            block_id: *block_id,
                             target: respond_to,
                             ticket: *ticket,
                         },
@@ -338,11 +338,50 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         self.time,
                         self.peer_id,
                         Event::BlockNotFound {
-                            block_id: *token,
+                            block_id: *block_id,
                             peer: self.peer_id,
                             from_peer: respond_to,
                         },
                     );
+                }
+            }
+            Message::QueryToken {
+                token_id,
+                target,
+                ticket,
+            } => {
+                let respond_to = if *target == 0 { msg.sender } else { *target };
+
+                // Forward to EcPeers for token lookup
+                if let Some(action) = self.peers.handle_query(&self.token_storage, *token_id, *ticket, msg.sender) {
+                    // Convert PeerAction to MessageEnvelope
+                    match action {
+                        crate::ec_peers::PeerAction::SendAnswer { receiver, answer, signature, ticket } => {
+                            responses.push(MessageEnvelope {
+                                sender: self.peer_id,
+                                receiver,
+                                ticket,
+                                time: self.time,
+                                message: Message::Answer { answer, signature },
+                            });
+                        }
+                        crate::ec_peers::PeerAction::SendReferral { receiver, token, ticket, suggested_peers } => {
+                            responses.push(MessageEnvelope {
+                                sender: self.peer_id,
+                                receiver,
+                                ticket,
+                                time: self.time,
+                                message: Message::Referral {
+                                    token,
+                                    high: suggested_peers[1],
+                                    low: suggested_peers[0],
+                                },
+                            });
+                        }
+                        _ => {
+                            // Ignore other action types (SendQuery, SendInvitation)
+                        }
+                    }
                 }
             }
             Message::Answer { answer, signature } => {
@@ -410,8 +449,8 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
             receiver: *receiver,
             ticket: 0,
             time: self.time,
-            message: Message::Query {
-                token: *block,
+            message: Message::QueryBlock {
+                block_id: *block,
                 target: 0,
                 ticket: ticket ^ block, // TODO calc ticket with SHA
             },

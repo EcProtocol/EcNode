@@ -278,7 +278,8 @@ impl SimRunner {
         for m in &self.messages {
             if let Some(node) = self.nodes.get_mut(&m.receiver) {
                 match m.message {
-                    Message::Query { .. } => self.message_counters.0 += 1,
+                    Message::QueryBlock { .. } => self.message_counters.0 += 1,
+                    Message::QueryToken { .. } => self.message_counters.0 += 1,
                     Message::Vote { .. } => self.message_counters.1 += 1,
                     Message::Block { .. } => self.message_counters.2 += 1,
                     Message::Answer { .. } => self.message_counters.3 += 1,

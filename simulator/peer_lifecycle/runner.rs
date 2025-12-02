@@ -58,7 +58,7 @@ struct MessageEnvelope {
 /// Simplified message types for simulation
 #[derive(Clone, Debug)]
 enum SimMessage {
-    Query {
+    QueryToken {
         token: TokenId,
         ticket: MessageTicket,
     },
@@ -279,7 +279,7 @@ impl PeerLifecycleRunner {
         }
 
         match envelope.message {
-            SimMessage::Query { token, ticket } => {
+            SimMessage::QueryToken { token, ticket } => {
                 // Use EcPeers.handle_query to generate response
                 if let Some(peer) = self.peers.get(&envelope.to) {
                     let action = peer.peer_manager.handle_query(&peer.token_storage, token, ticket, envelope.from);
@@ -336,7 +336,7 @@ impl PeerLifecycleRunner {
                     for action in actions {
                         match action {
                             PeerAction::SendQuery { receiver, token, ticket } => {
-                                self.send_message(peer_id, receiver, SimMessage::Query { token, ticket });
+                                self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
                             }
                             PeerAction::SendAnswer { .. } |
                             PeerAction::SendReferral { .. } |
@@ -353,7 +353,7 @@ impl PeerLifecycleRunner {
     /// Send a message
     fn send_message(&mut self, from: PeerId, to: PeerId, message: SimMessage) {
         match &message {
-            SimMessage::Query { .. } => self.total_messages.queries += 1,
+            SimMessage::QueryToken { .. } => self.total_messages.queries += 1,
             SimMessage::Answer { .. } => self.total_messages.answers += 1,
             SimMessage::Referral { .. } => self.total_messages.referrals += 1,
         }
@@ -391,7 +391,7 @@ impl PeerLifecycleRunner {
                                     token = target_peer;
                                 }
                             }
-                            self.send_message(peer_id, receiver, SimMessage::Query { token, ticket });
+                            self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
                         }
                         PeerAction::SendAnswer { receiver, answer, signature, ticket } => {
                             self.send_message(peer_id, receiver, SimMessage::Answer {

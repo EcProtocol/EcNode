@@ -63,9 +63,14 @@ pub enum Message {
         vote: u8,
         reply: bool,
     },
-    Query {
-        token: TokenId,
+    QueryBlock {
+        block_id: BlockId,
         target: PeerId, // who wants the result? 0 => me (in network case this allow NAT discovery of peer address)
+        ticket: MessageTicket,
+    },
+    QueryToken {
+        token_id: TokenId,
+        target: PeerId, // who wants the result? 0 => me
         ticket: MessageTicket,
     },
     Answer {
