@@ -1131,8 +1131,8 @@ The gift card example (Section 17.6) illustrates the issuer-redemption pattern w
 
 A name service maps human-readable identifiers to network addresses. In EC:
 - Token t = H("example.com")
-- Token data (off-chain): IP address, port, metadata
-- Owner updates pointer as infrastructure changes
+- Bundle with t2: IP address, port, SALT
+- Owner bundles with replacement for t2 as infrastructure changes
 
 This follows the gift card pattern (token = ownership, document = semantics) but with long-lived tokens and updates-in-place rather than splits. No coordination between registrars required — just agreement on the namespace root.
 
@@ -1140,7 +1140,7 @@ This follows the gift card pattern (token = ownership, document = semantics) but
 
 Social identity where the user controls portability:
 - Token t = H("@alice")  
-- Owner points to current provider, CDN, or content
+- Owner points to current provider, CDN, or content, or IP/PORT as above.
 - Switching platforms = updating the pointer, not migrating data
 
 Applications verify identity by checking token ownership. The user's key can sign content directly, providing cryptographic proof of authorship without platform intermediation.
