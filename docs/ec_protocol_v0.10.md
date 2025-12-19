@@ -26,7 +26,7 @@ Nodes receive queries of the form:
 
     q = H(token)
 
-where H is a cryptographic hash (SHA-256 unless otherwise specified). A node can respond to a query only if it knows the corresponding token preimage and associated block.
+where H is the protocol hash function (Blake3, see Appendix A). A node can respond to a query only if it knows the corresponding token preimage and associated block.
 
 Queries are indistinguishable with respect to their origin (user-driven vs. protocol-driven). Election-related queries form a strict minority of total queries.
 
@@ -939,6 +939,22 @@ Applications should choose confirmation levels appropriate to their risk toleran
 | **Time-stable** | Consistent state observed over interval | ~minutes | High-value transactions |
 | **Issuer-confirmed** | Issuer explicitly acknowledges | varies | Redemption, settlement |
 
+**User-side verification:**
+
+Users (or their applications) can verify state using the same election mechanism as nodes. A user queries multiple nodes via randomized channels and clusters responses by overlap, exactly as described in Section 9. The user can tune:
+- Number of channels (more channels → higher confidence)
+- Required cluster size (larger cluster → stronger majority evidence)
+- Overlap threshold (stricter matching → tighter alignment requirement)
+
+This provides tunable confidence in the current state reading.
+
+**Handling conflicting views:**
+
+If the election produces ambiguous results:
+- *Slow settlement:* Extend the election with more channels; if a clear majority emerges, the state is settling normally
+- *Weak majority:* Assess cluster sizes; a dominant cluster with small minority indicates likely convergence
+- *Split-brain:* Two or more comparably-sized clusters indicate genuine partition or active conflict; application should wait or escalate
+
 The appropriate level depends on:
 - Transaction value
 - Trust in counterparty
@@ -1009,25 +1025,38 @@ This example illustrates how EC's design philosophy enables applications impossi
 **Scenario:** A mall consortium wants to offer gift cards accepted at any member shop, without shared infrastructure.
 
 **Issuance:**
-1. Mall authority creates document: `{issuer: "MallAuth", value: 100, sig: ...}`
-2. Customer computes t₀ = SHA(document)
+1. Mall authority creates root document: `{issuer: "MallAuth", value: 100, sig: ...}`
+2. Customer computes t₀ = SHA(root_document)
 3. Customer registers t₀ in EC with their public key
 
 **Spending ($10 at Shop A):**
-1. Customer creates two child documents:
-   - doc₁: `{parent: t₀, value: 10, salt: SALT₁}`
-   - doc₂: `{parent: t₀, value: 90, salt: SALT₂}`
-2. Customer submits atomic EC transaction:
+1. Customer generates a random SALT for this split
+2. Customer creates two child documents (each contains root + split history):
+   - doc₁: `{root: ..., splits: [{value: 10, salt: SALT}]}`
+   - doc₂: `{root: ..., splits: [{value: 90, salt: SALT}]}`
+3. Customer computes token IDs:
+   - t₁ = SHA(t₀ || 10 || SALT)
+   - t₂ = SHA(t₀ || 90 || SALT)
+4. Customer submits atomic EC transaction:
    - Destroy t₀
-   - Create t₁ = SHA(doc₁), owner = Shop A's public key
-   - Create t₂ = SHA(doc₂), owner = customer
-3. Customer presents doc₁ and document chain to Shop A
+   - Create t₁, owner = Shop A's public key
+   - Create t₂, owner = customer
+5. Customer presents doc₁ to Shop A
+
+**Key insight:** Using the same SALT for both children, the validator can reconstruct the sibling token ID without seeing the sibling document. Given doc₁ showing value=10, SALT, and parent value=100:
+- Compute t₁ = SHA(t₀ || 10 || SALT) ✓ (matches presented token)
+- Compute t₂ = SHA(t₀ || 90 || SALT) (sibling must exist)
+- Verify t₀ was destroyed in the same transaction that created t₁ and t₂
+
+No need to see doc₂ or know who holds t₂.
 
 **Shop verification (stateless):**
-1. Verify document chain back to issuer signature
-2. Verify t₁ exists in EC, owned by shop's key
-3. Submit EC transaction: destroy t₁
-4. Provide goods
+1. Verify root document signature (issuer authenticity)
+2. Replay split chain: recompute each token ID from parent + value + SALT
+3. Verify final token t₁ exists in EC, owned by shop's key
+4. Verify all ancestor tokens are destroyed
+5. Submit EC transaction: destroy t₁
+6. Provide goods
 
 **Second redemption attempt fails:**
 1. Customer presents same t₁ to Shop B
@@ -1041,7 +1070,7 @@ This example illustrates how EC's design philosophy enables applications impossi
 | No shared database | EC is the only shared state |
 | No shop-side state | Destroy on redeem; EC tracks used/unused |
 | Multi-shop acceptance | Shared issuer key, independent verification |
-| Privacy | SALT prevents cross-branch visibility |
+| Self-certifying chain | Same SALT enables sibling verification |
 | No breach risk | No database of balances to steal |
 | Atomic splitting | 6-entry transaction ensures conservation |
 | Offline documents | Customer holds value proofs; EC holds ownership |
@@ -1131,19 +1160,65 @@ The gift card example (Section 17.6) illustrates the issuer-redemption pattern w
 
 A name service maps human-readable identifiers to network addresses. In EC:
 - Token t = H("example.com")
-- Bundle with t2: IP address, port, SALT
-- Owner bundles with replacement for t2 as infrastructure changes
+- Token content: IPv4/6 address + port + SALT fits in 32 bytes (token size)
+- No off-chain document needed — endpoint data is in the transaction itself
 
-This follows the gift card pattern (token = ownership, document = semantics) but with long-lived tokens and updates-in-place rather than splits. No coordination between registrars required — just agreement on the namespace root.
+Resolution: Query EC for H("example.com"), read endpoint from transaction content. Owner updates by submitting new transaction with updated endpoint.
+
+This follows a simpler pattern than gift cards: no document chain, just direct token → endpoint mapping.
 
 **Decentralized Identity**
 
 Social identity where the user controls portability:
 - Token t = H("@alice")  
-- Owner points to current provider, CDN, or content, or IP/PORT as above.
+- Token content: CDN pointer, content hash, or public key
 - Switching platforms = updating the pointer, not migrating data
 
 Applications verify identity by checking token ownership. The user's key can sign content directly, providing cryptographic proof of authorship without platform intermediation.
+
+**PKI Equivalence**
+
+Naming and identity together provide a decentralized Public Key Infrastructure:
+- Name → public key binding via token ownership
+- Resolution: query H("example.com") → retrieve owner's public key
+- No certificate authority required; the token *is* the certificate
+
+Trust establishment via co-signing:
+- Transaction entries can require multiple signatures
+- A name registration co-signed by multiple known entities establishes trust
+- Example: `H("example.com")` owned by key K, transaction co-signed by K and well-known auditor keys
+- Verifiers check co-signatures to assess trustworthiness
+
+This enables flexible trust models — from self-sovereign (single key, no co-signers) to highly audited (multiple institutional co-signers) — without protocol changes.
+
+**Mitigating Neighborhood Capture for Static Tokens**
+
+Unlike gift cards (which scatter via splits), naming and identity tokens are static and long-lived, making them potential targets for neighborhood capture attacks.
+
+Mitigation via redundant tokens:
+- Instead of single token H("example.com"), register multiple:
+  - t₀ = H("0/example.com")
+  - t₁ = H("1/example.com")
+  - ...
+  - tₖ = H("k/example.com")
+
+These land in k+1 different, uncorrelated neighborhoods. An attacker must capture multiple neighborhoods simultaneously. Readers verify that all tokens are controlled by the same key — any inconsistency indicates attack or misconfiguration.
+
+The security level scales with k. For high-value names, k = 10 provides meaningful protection; for most names, k = 2-3 suffices.
+
+**Resolution Proxies**
+
+For naming and identity, resolution speed matters. Organizations may operate proxy services:
+- Offer HTTPS endpoint (easier than direct EC queries for some clients)
+- Cache hot tokens with recent election evidence
+- Serve cached responses with proof of freshness
+
+Token popularity likely follows a power-law distribution. Proxy caching strategy:
+- On cache miss: stall client, fetch from EC, probabilistically cache
+- On cache hit: serve with election evidence
+- On expiry: probabilistically refresh (hot tokens refresh often, cold tokens evict)
+
+Popular tokens naturally accumulate more refresh opportunities; cold tokens are evicted. This provides efficient resolution while preserving decentralization — any proxy can be verified against EC directly.
 
 **Voting and Verifiable Elections**
 
@@ -1199,13 +1274,15 @@ This model trades strong finality for resilience, openness, and continuous opera
 
 ## Appendix A: Hash Function Usage
 
-For clarity, this document uses the following hash functions:
+The protocol standardizes on Blake3 for all internal hashing due to its speed and security properties:
 
 | Notation | Function | Output | Usage |
 |----------|----------|--------|-------|
-| H(·) | SHA-256 | 256 bits | Token addressing, block hashes, general-purpose |
+| H(·) | Blake3 | 256 bits | Token addressing, block hashes, pkHash, general-purpose |
 | Blake3₁₀₀(·) | Blake3 truncated | 100 bits | PoAS challenge construction |
-| Argon2(·) | Argon2id | 256 bits | PoW address derivation |
+| Argon2(·) | Argon2id | 256 bits | PoW address derivation (memory-hard) |
+
+**Note on token creation:** Users may derive token identifiers using any hash function of their choice (SHA-256, Blake3, application-specific schemes). The protocol treats tokens as opaque 256-bit identifiers. The H(·) notation above refers only to protocol-internal operations such as computing token addresses for routing.
 
 All comparisons of hash outputs are lexicographic over the byte representation.
 
@@ -1236,6 +1313,8 @@ All comparisons of hash outputs are lexicographic over the byte representation.
 | Draft 0.6 | — | Added Appendix D (Formal Analysis) with proofs for vote threshold, capture cost, and PoAS alignment |
 | Draft 0.7 | — | Added Sections 17.6-17.7: Stateless Gift Cards application example and Token Scattering security analysis |
 | Draft 0.8 | — | Added Section 17.9 (Further Applications: naming, identity, voting) |
+| Draft 0.9 | — | Clarified user-side elections in 17.3; fixed SALT mechanism in 17.6 (same SALT enables sibling verification); updated 17.9 with inline endpoint data for DNS, redundant tokens for static token security, and resolution proxy pattern |
+| Draft 0.10 | — | Standardized all protocol hashing on Blake3 (Appendix A); added PKI equivalence note with co-signing for trust establishment (Section 17.9) |
 
 ---
 
