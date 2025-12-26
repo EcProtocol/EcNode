@@ -48,7 +48,7 @@ def run_signature_proof_test():
     print("Signature-Based Proof of Storage Analysis")
     print("=" * 50)
     
-    generate = 1_000_000
+    generate = 1_00_000
     # Generate random 256-bit tokens
     print(f"Generating {generate} random 256-bit tokens...")
     tokens = [generate_256_bit_token() for _ in range(generate)]
@@ -66,6 +66,9 @@ def run_signature_proof_test():
     lookup_token = generate_256_bit_token()
 
     token_frequency_all = {}
+    tokens = sorted(tokens)
+
+    perfect_set, steps = find_tokens_by_signature(tokens, lookup_token, signature_chunks) 
 
     print(f"\nRunning {num_scenarios} test scenarios...")
     
@@ -75,6 +78,7 @@ def run_signature_proof_test():
         token_frequency = {}
         width_dist = []
         steps_dist = []
+        matching_dist = {}
         for _ in range(num_scenarios):
             # Sample tokens at current density
             sample_size = int(len(tokens) * density)
@@ -89,13 +93,24 @@ def run_signature_proof_test():
             # steps
             steps_dist.append(steps)
 
+            matching = 0
             # track frequency across extracts
-            for t in extracted_tokens:
+            for (i, t) in enumerate(extracted_tokens):
                 f = token_frequency.get(t, 0)
                 token_frequency[t] = f + 1
 
                 f = token_frequency_all.get(t, 0)
                 token_frequency_all[t] = f + 1
+
+                if t == perfect_set[i]:
+                    matching += 1
+
+            m = matching_dist.get(matching, 0)
+            matching_dist[matching] = m + 1
+
+        matching_sorted = sorted(matching_dist.items(), key=lambda x: x[0], reverse=True)
+        matching_filtered = [(k, v) for k, v in matching_sorted if k >= 6]
+        print(f"  match: {matching_filtered}")
 
         top_freq = sorted(token_frequency.values(), reverse=True)
         print(f"  freq: {top_freq[0:10]}")

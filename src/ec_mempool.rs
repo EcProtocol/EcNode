@@ -20,18 +20,18 @@ pub enum BlockState {
 }
 
 pub enum MessageRequest {
-    VOTE(BlockId, TokenId, u8, bool),
-    PARENT(BlockId, BlockId),
-    PARENTCOMMIT(BlockId),
+    Vote(BlockId, TokenId, u8, bool),
+    Parent(BlockId, BlockId),
+    MissingParent(BlockId),
 }
 
 impl MessageRequest {
-    pub fn sort_key(&self) -> (TokenId, bool) {
+    pub fn sort_key(&self) -> (TokenId, bool, BlockId) {
         match self {
             // group equal token_id and get possitive votes first
-            MessageRequest::VOTE(_, token_id, _, possitive) => (*token_id, *possitive),
-            MessageRequest::PARENT(_, parent_id) => (*parent_id, false),
-            MessageRequest::PARENTCOMMIT(block_id) => (*block_id, false),
+            MessageRequest::Vote(block_id, token_id, _, possitive) => (*token_id, *possitive, *block_id),
+            MessageRequest::Parent(_, parent_id) => (*parent_id, false, 0),
+            MessageRequest::MissingParent(block_id) => (*block_id, false, 0),
         }
     }
 }
@@ -80,6 +80,7 @@ impl PoolBlockState {
                     v.time = time;
                 }
             })
+            // TODO DOS protection? If all known peers vote for a block?
             .or_insert_with(|| PoolVote { time, vote });
 
         // did we change anything ? then it might be time to check the votes again
@@ -212,7 +213,7 @@ impl EcMemPool {
                         // Request parent to build our history / detect reorg
                         can_commit = false;
 
-                        messages.push(MessageRequest::PARENTCOMMIT(last_mapping));
+                        messages.push(MessageRequest::MissingParent(last_mapping));
 
                         event_sink.log(
                             time,
@@ -250,15 +251,12 @@ impl EcMemPool {
             .or_else(|| blocks.exists(block).then_some(BlockState::Commit))
     }
 
+    // TODO "equal share" - make sure some peer does not fill up the pool. Also - limit on pool-size needed?
     pub(crate) fn vote(&mut self, block: &BlockId, vote: u8, msg_sender: &PeerId, time: EcTime) {
-        // TODO allow override if already voted
-        // DOS protect - do not allow unbounded votes
-        if self.pool.len() < 100 {
-            self.pool
-                .entry(*block)
-                .or_insert_with(|| PoolBlockState::new(time))
-                .vote(msg_sender, vote, time);
-        }
+        self.pool
+            .entry(*block)
+            .or_insert_with(|| PoolBlockState::new(time))
+            .vote(msg_sender, vote, time);
     }
 
     pub(crate) fn query(&self, block: &BlockId, blocks: &dyn EcBlocks) -> Option<Block> {
@@ -418,12 +416,12 @@ impl EcMemPool {
             for i in 0..block.used as usize {
                 if (block_state.validate & 1 << i) != 0 {
                     // Fetch parent for signature validation
-                    messages.push(MessageRequest::PARENT(block_id, block.parts[i].last));
+                    messages.push(MessageRequest::Parent(block_id, block.parts[i].last));
                 }
 
                 if (block_state.remaining & 1 << i) != 0 {
                     // Request vote using pre-calculated vote_mask
-                    messages.push(MessageRequest::VOTE(
+                    messages.push(MessageRequest::Vote(
                         block_id,
                         block.parts[i].token,
                         evaluation.vote_mask,
@@ -434,7 +432,7 @@ impl EcMemPool {
 
             // Vote witness
             if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
-                messages.push(MessageRequest::VOTE(
+                messages.push(MessageRequest::Vote(
                     block_id,
                     block_id,
                     evaluation.vote_mask,
@@ -511,10 +509,6 @@ mod tests {
 
         let blocks = Rc::new(RefCell::new(MockEcBlocks {
             blocks: HashMap::new(),
-        }));
-
-        let tokens = Rc::new(RefCell::new(MockEcTokens {
-            tokens: HashMap::new(),
         }));
 
         let mut mem_pool = EcMemPool::new();

@@ -286,15 +286,16 @@ impl PeerLifecycleRunner {
 
                     if let Some(action) = action {
                         let sender_id = envelope.to;
+                        let receiver = envelope.from;
                         match action {
-                            PeerAction::SendAnswer { receiver, answer, signature, ticket } => {
+                            PeerAction::SendAnswer { answer, signature, ticket } => {
                                 self.send_message(sender_id, receiver, SimMessage::Answer {
                                     answer,
                                     signature,
                                     ticket,
                                 });
                             }
-                            PeerAction::SendReferral { receiver, token, ticket, suggested_peers } => {
+                            PeerAction::SendReferral { token, ticket, suggested_peers } => {
                                 self.send_message(sender_id, receiver, SimMessage::Referral {
                                     token,
                                     ticket,
@@ -379,50 +380,13 @@ impl PeerLifecycleRunner {
                 for action in actions {
                     match action {
                         PeerAction::SendQuery { receiver, mut token, ticket } => {
-                            // For discovery: if token is random and not a known peer ID,
-                            // replace it with an actual peer ID from the network
-                            // This simulates learning about peer IDs through referrals/gossip
-                            if !peer_ids.contains(&token) && self.rng.gen_bool(0.8) {
-                                // 80% of the time, replace with an actual peer ID
-                                if let Some(&target_peer) = peer_ids.iter()
-                                    .filter(|&&id| id != peer_id)
-                                    .nth(self.rng.gen_range(0..peer_ids.len().saturating_sub(1)))
-                                {
-                                    token = target_peer;
-                                }
-                            }
                             self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
                         }
-                        PeerAction::SendAnswer { receiver, answer, signature, ticket } => {
-                            self.send_message(peer_id, receiver, SimMessage::Answer {
-                                answer,
-                                signature,
-                                ticket,
-                            });
-                        }
-                        PeerAction::SendReferral { receiver, token, ticket, suggested_peers } => {
-                            self.send_message(peer_id, receiver, SimMessage::Referral {
-                                token,
-                                ticket,
-                                suggested_peers,
-                            });
-                        }
                         PeerAction::SendInvitation { receiver, answer, signature } => {
-                            // Handle invitation: promote both sender and receiver to Connected
-                            // This simulates a simplified mutual invitation exchange
-
-                            // Promote receiver to Connected (they received our invitation)
-                            if let Some(receiver_peer) = self.peers.get_mut(&receiver) {
-                                receiver_peer.peer_manager.promote_to_connected(peer_id, current_time);
-                            }
-
-                            // Promote sender to Connected (assuming receiver sends reciprocal invitation)
-                            if let Some(sender_peer) = self.peers.get_mut(&peer_id) {
-                                sender_peer.peer_manager.promote_to_connected(receiver, current_time);
-                            }
-
-                            // Track invitation messages
-                            self.total_messages.answers += 1; // Count as Answer-type message
+                            self.send_message(peer_id, receiver, SimMessage::Answer { answer, signature, ticket: 0 });
+                        }
+                        _ => {
+                            panic!("Unexpected Action returned from tick")
                         }
                     }
                 }

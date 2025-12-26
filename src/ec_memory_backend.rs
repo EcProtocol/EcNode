@@ -34,12 +34,17 @@ use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
 ///
 /// # Example
 /// ```rust
-/// let mut storage = MemTokens::new();
-/// storage.set(&token_id, &block_id, time);
+/// use ec_rust::ec_memory_backend::MemTokens;
+/// use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 ///
-/// if let Some(block_time) = storage.lookup(&token_id) {
-///     println!("Token {} maps to block {}", token_id, block_time.block);
-/// }
+/// let mut storage = MemTokens::new();
+/// let token_id = 123u64;
+/// let block_id = 456u64;
+/// let time = 789u64;
+/// TokenStorageBackend::set(&mut storage, &token_id, &block_id, time);
+///
+/// // Verify the token was stored
+/// assert!(TokenStorageBackend::lookup(&storage, &token_id).is_some());
 /// ```
 pub struct MemTokens {
     tokens: BTreeMap<TokenId, BlockTime>,
@@ -60,13 +65,13 @@ impl MemTokens {
     ///
     /// # Example
     /// ```rust
-    /// let mut storage = MemTokens::new();
-    /// // ... populate storage ...
+    /// use ec_rust::ec_memory_backend::MemTokens;
+    /// use ec_rust::ec_proof_of_storage::ProofOfStorage;
+    ///
+    /// let storage = MemTokens::new();
     ///
     /// let proof_system = storage.into_proof_system();
-    /// if let Some(sig) = proof_system.generate_signature(&token, &peer) {
-    ///     // Use signature...
-    /// }
+    /// // Can now use proof_system for generating signatures
     /// ```
     pub fn into_proof_system(self) -> ProofOfStorage {
         ProofOfStorage::new()
@@ -188,9 +193,20 @@ impl EcTokens for MemTokens {
 ///
 /// # Example
 /// ```rust
+/// use ec_rust::ec_memory_backend::MemBlocks;
+/// use ec_rust::ec_interface::{Block, EcBlocks, TokenBlock};
+///
 /// let mut storage = MemBlocks::new();
+/// let block = Block {
+///     id: 123,
+///     time: 1000,
+///     used: 2,
+///     parts: [TokenBlock::default(); 6],
+///     signatures: [None; 6],
+/// };
 /// storage.save(&block);
 ///
+/// let block_id = 123u64;
 /// if storage.exists(&block_id) {
 ///     let retrieved = storage.lookup(&block_id).unwrap();
 ///     println!("Block {} has {} tokens", retrieved.id, retrieved.used);
@@ -240,13 +256,27 @@ impl EcBlocks for MemBlocks {
 ///
 /// # Example
 /// ```rust
+/// use ec_rust::ec_memory_backend::MemoryBackend;
+/// use ec_rust::ec_interface::{Block, EcBlocks, TokenBlock};
+/// use ec_rust::ec_proof_of_storage::TokenStorageBackend;
+///
 /// let mut backend = MemoryBackend::new();
 ///
 /// // Access tokens
+/// let token_id = 123u64;
+/// let block_id = 456u64;
+/// let time = 789u64;
 /// let tokens = backend.tokens_mut();
-/// tokens.set(&token_id, &block_id, time);
+/// TokenStorageBackend::set(tokens, &token_id, &block_id, time);
 ///
 /// // Access blocks
+/// let block = Block {
+///     id: block_id,
+///     time,
+///     used: 1,
+///     parts: [TokenBlock::default(); 6],
+///     signatures: [None; 6],
+/// };
 /// let blocks = backend.blocks_mut();
 /// blocks.save(&block);
 /// ```

@@ -184,14 +184,30 @@ pub trait EcBlocks {
 ///
 /// # Example
 /// ```rust
+/// use ec_rust::ec_memory_backend::MemoryBackend;
+/// use ec_rust::ec_interface::{Block, BatchedBackend, TokenBlock};
+///
+/// let mut backend = MemoryBackend::new();
 /// let mut batch = backend.begin_batch();
+///
+/// let block = Block {
+///     id: 123,
+///     time: 1000,
+///     used: 1,
+///     parts: [TokenBlock::default(); 6],
+///     signatures: [None; 6],
+/// };
+/// let token_id = 456u64;
+/// let block_id = 123u64;
+/// let time = 1000u64;
 ///
 /// // Mempool adds blocks and tokens during tick
 /// batch.save_block(&block);
 /// batch.update_token(&token_id, &block_id, time);
 ///
 /// // End of tick: commit everything atomically
-/// batch.commit()?;
+/// batch.commit().unwrap();
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub trait StorageBatch {
     /// Save a block to the batch

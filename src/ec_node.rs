@@ -1,14 +1,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hashbrown::HashSet;
-
 use crate::ec_interface::{
     BatchedBackend, Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, Message,
     MessageEnvelope, MessageTicket, NoOpSink, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
-use crate::ec_peers::EcPeers;
+use crate::ec_peers::{EcPeers, PeerAction};
 use crate::ec_proof_of_storage::TokenStorageBackend;
 
 use crate::ec_mempool::MessageRequest;
@@ -74,16 +72,16 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
 
     /**
      * TODO
-     * Here we need to see all at least vote-for tokens - such that conflicts can be detected. 
-     * In case of competing updates to a token we must BLOCK each valid transactionn competing - and start sending such negative votes.
-     * 
+     * Here we need to see all at least vote-for tokens - such that conflicts can be detected.
+     * In case of competing (possitive) updates to a token we vote for "higest" block_id.
+     *
      * TODO
      * We should test collecting multi-messages. Such that votes to the same node gets send together.
-        // TODO pack messages in Message2 style
-        // - idea: the oldest transaction (longest in mempool) "sucks" all overlapping into message - sync. on roll.
-        // (when commited or timeout - this schedule of a neighborhood is then "freed" of the next oldest etc)
-        // TODO could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
-     * 
+    // TODO pack messages in Message2 style
+    // - idea: the oldest transaction (longest in mempool) "sucks" all overlapping into message - sync. on roll.
+    // (when commited or timeout - this schedule of a neighborhood is then "freed" of the next oldest etc)
+    // TODO could e.g make sure vote msg. for all trxs go to same peers - such that all detect the conflict
+     *
      * We should also investigate if (like in earlier prototypes) we can reduce the votes by only sending to trusted nodes that hasn't responded yet.
      */
     pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
@@ -108,6 +106,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
 
             let mut all_messages = reorg_messages;
 
+            // TODO must move after check for "conflict detection" - Rule: Never commit a block, if a "higher-named" conflict exists
             // Phase 2: Process committable blocks (mutable borrow + batch)
             let commit_messages = {
                 let mut backend_ref = self.backend.borrow_mut();
@@ -138,39 +137,14 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
 
         messages.sort_unstable_by_key(MessageRequest::sort_key);
 
-        // loop through and find any conflicting votes (true, true) - and block them.
-        let mut token = 0;
-        let mut blocked = HashSet::new();
-        for request in &messages {
-            if let MessageRequest::VOTE(block_id, token_id, _, true) = request {
-                if token == *token_id {
-                    // TODO mark as blocked
-
-                    blocked.insert(block_id);
-                    self.event_sink.log(
-                        self.time,
-                        self.peer_id,
-                        Event::BlockStateChange {
-                            block_id: *block_id,
-                            from_state: "pending",
-                            to_state: "blocked",
-                        },
-                    );
-                }
-                token = *token_id
-            }
-        }
-
         // TODO check - and also applied to parent - oldest ref first
+        let mut token: u64 = 0;
         for request in &messages {
             match request {
-                MessageRequest::VOTE(block_id, token_id, vote, _) => {
-                    // blocked then all negative
-                    let vote = if blocked.contains(&block_id) {
-                        0
-                    } else {
-                        *vote
-                    };
+                MessageRequest::Vote(block_id, token_id, vote, _) => {
+                    // block from second vote
+                    let vote = if token == *token_id { 0 } else { *vote };
+                    token = *token_id;
 
                     for peer_id in self.peers.peers_for(&token_id, self.time) {
                         responses.push(MessageEnvelope {
@@ -186,7 +160,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         })
                     }
                 }
-                MessageRequest::PARENT(block_id, parent_id) => {
+                MessageRequest::Parent(block_id, parent_id) => {
                     // TODO a work around. Should be handled in mem_pool
                     let backend = self.backend.borrow();
                     if let Some(parent) = self.mem_pool.query(&parent_id, &*backend) {
@@ -197,7 +171,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         responses.push(self.request_block(&peer_id, &block_id, 0))
                     }
                 }
-                MessageRequest::PARENTCOMMIT(block_id) => {
+                MessageRequest::MissingParent(block_id) => {
                     let peer_id = self.peers.peer_for(&block_id, self.time);
 
                     responses.push(self.request_block(
@@ -291,16 +265,20 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                 target,
                 ticket,
             } => {
-                let respond_to = if *target == 0 { msg.sender } else { *target };
+                let receiver = if *target == 0 { msg.sender } else { *target };
 
                 let backend = self.backend.borrow();
-                if let Some(me) = self.mem_pool.query(block_id, &*backend).map(|block| MessageEnvelope {
-                    sender: self.peer_id,
-                    receiver: respond_to,
-                    ticket: *ticket,
-                    time: self.time,
-                    message: Message::Block { block },
-                }) {
+                if let Some(me) =
+                    self.mem_pool
+                        .query(block_id, &*backend)
+                        .map(|block| MessageEnvelope {
+                            sender: self.peer_id,
+                            receiver,
+                            ticket: *ticket,
+                            time: self.time,
+                            message: Message::Block { block },
+                        })
+                {
                     // this node has this block
                     responses.push(me)
                 } else if let None = self.peers.trusted_peer(&msg.sender) {
@@ -329,7 +307,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         time: self.time,
                         message: Message::QueryBlock {
                             block_id: *block_id,
-                            target: respond_to,
+                            target: receiver,
                             ticket: *ticket,
                         },
                     });
@@ -340,7 +318,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         Event::BlockNotFound {
                             block_id: *block_id,
                             peer: self.peer_id,
-                            from_peer: respond_to,
+                            from_peer: receiver,
                         },
                     );
                 }
@@ -350,13 +328,20 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                 target,
                 ticket,
             } => {
-                let respond_to = if *target == 0 { msg.sender } else { *target };
+                let receiver = if *target == 0 { msg.sender } else { *target };
 
                 // Forward to EcPeers for token lookup
-                if let Some(action) = self.peers.handle_query(&self.token_storage, *token_id, *ticket, msg.sender) {
+                if let Some(action) =
+                    self.peers
+                        .handle_query(&self.token_storage, *token_id, *ticket, msg.sender)
+                {
                     // Convert PeerAction to MessageEnvelope
                     match action {
-                        crate::ec_peers::PeerAction::SendAnswer { receiver, answer, signature, ticket } => {
+                        PeerAction::SendAnswer {
+                            answer,
+                            signature,
+                            ticket,
+                        } => {
                             responses.push(MessageEnvelope {
                                 sender: self.peer_id,
                                 receiver,
@@ -365,7 +350,11 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                                 message: Message::Answer { answer, signature },
                             });
                         }
-                        crate::ec_peers::PeerAction::SendReferral { receiver, token, ticket, suggested_peers } => {
+                        PeerAction::SendReferral {
+                            token,
+                            ticket,
+                            suggested_peers,
+                        } => {
                             responses.push(MessageEnvelope {
                                 sender: self.peer_id,
                                 receiver,
@@ -378,8 +367,26 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                                 },
                             });
                         }
-                        _ => {
-                            // Ignore other action types (SendQuery, SendInvitation)
+                        PeerAction::SendQuery {
+                            receiver,
+                            token,
+                            ticket,
+                        } => {
+                            // Forward
+                            responses.push(MessageEnvelope {
+                                sender: self.peer_id,
+                                receiver,
+                                ticket,
+                                time: self.time,
+                                message: Message::QueryToken {
+                                    token_id: token,
+                                    target: 0,
+                                    ticket,
+                                },
+                            });
+                        }
+                        PeerAction::SendInvitation { .. } => {
+                            // Ignore SendInvitation (not relevant here)
                         }
                     }
                 }
@@ -393,10 +400,9 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                 if msg.ticket == self.block_req_ticket ^ block.id
                     || msg.ticket == self.parent_block_req_ticket ^ block.id
                 {
-                    // TODO DOS-protection
-
                     if self.mem_pool.block(block, self.time) {
-                        let _is_reorg = msg.ticket == self.parent_block_req_ticket ^ block.id;
+                        // TODO DOS-protection: Balance creations of entries from peers/clients
+                 
                         self.event_sink.log(
                             self.time,
                             self.peer_id,
@@ -417,8 +423,23 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                 if msg.ticket == self.block_req_ticket ^ token
                     || msg.ticket == self.parent_block_req_ticket ^ token
                 {
-                    let _actions = self.peers.handle_referral(msg.ticket, *token, [*high, *low], msg.sender);
-                    // TODO: Process actions (send Query messages)
+                    // TODO psudo random - inject common random
+                    let receiver = if (msg.ticket ^ msg.time) & 1 == 0 {low} else {high};
+
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: *receiver,
+                        ticket: 0,
+                        time: self.time,
+                        message: Message::QueryBlock {
+                            block_id: *token,
+                            target: 0,
+                            ticket: msg.ticket,
+                        },
+                    });
+                } else if let Some(peer_action) = self.peers
+                            .handle_referral(msg.ticket, *token, [*high, *low], msg.sender) {
+                    
                 }
             }
         }

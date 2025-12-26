@@ -20,17 +20,17 @@
 //! 4. Call `node.tick()` and `node.handle_message()` as messages arrive
 //!
 //! ```no_run
-//! use ec_rust::{EcNode, ec_memory_backend::{MemBlocks, MemTokens}};
+//! use ec_rust::{EcNode, ec_memory_backend::MemoryBackend};
 //! use std::rc::Rc;
 //! use std::cell::RefCell;
 //!
-//! // Create storage backends
-//! let tokens = Rc::new(RefCell::new(MemTokens::new()));
-//! let blocks = Rc::new(RefCell::new(MemBlocks::new()));
+//! // Create storage backend
+//! let backend = Rc::new(RefCell::new(MemoryBackend::new()));
+//! let token_storage = MemoryBackend::new();
 //!
 //! // Create a consensus node
 //! let peer_id = 12345u64;
-//! let mut node = EcNode::new(tokens, blocks, peer_id, 0);
+//! let mut node = EcNode::new(backend, peer_id, 0, token_storage);
 //!
 //! // In your network event loop:
 //! // - Call node.tick(&mut outgoing_messages) periodically
@@ -67,6 +67,3 @@ pub use ec_node::EcNode;
 pub use ec_proof_of_storage::{
     ring_distance, ConsensusCluster, ElectionConfig, ElectionError, PeerElection, WinnerResult,
 };
-
-// Internal utilities (used by ec_peers.rs and ec_node.rs, not exposed to external clients)
-pub(crate) use ec_proof_of_storage::ChannelState;

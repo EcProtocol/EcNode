@@ -78,8 +78,13 @@ pub trait TokenStorageBackend {
 ///
 /// # Example
 /// ```rust
+/// use ec_rust::ec_memory_backend::MemTokens;
+/// use ec_rust::ec_proof_of_storage::ProofOfStorage;
+///
 /// let storage = MemTokens::new();
 /// let proof_system = ProofOfStorage::new();
+/// let token = 123u64;
+/// let peer = 456u64;
 ///
 /// // Generate signature for a token
 /// if let Some(sig) = proof_system.generate_signature(&storage, &token, &peer) {
@@ -468,6 +473,9 @@ pub enum ElectionError {
 
     /// All suggested peers from referral are already participating
     NoViableSuggestions,
+
+    /// Trying to setup a channel for self
+    SelfReference,
 }
 
 
@@ -554,7 +562,13 @@ impl PeerElection {
     /// * `Err(MaxChannelsReached)` - Cannot create more channels
     /// * `Err(ChannelAlreadyExists)` - Channel for this first-hop peer already exists
     /// * `Err(PeerAlreadyParticipating)` - Peer has already responded via another channel
+    /// * `Err(SelfReference)` - can not setup a channel for self
     pub fn create_channel(&mut self, first_hop: PeerId) -> Result<MessageTicket, ElectionError> {
+        // do not a allow a channel to self
+        if self.my_peer_id == first_hop {
+            return Err(ElectionError::SelfReference);
+        }
+
         if self.channels.len() >= self.config.max_channels {
             return Err(ElectionError::MaxChannelsReached);
         }
@@ -1080,7 +1094,12 @@ impl ProofOfStorage {
     ///
     /// # Example
     /// ```rust
-    /// let signatures = vec![sig1, sig2, sig3, sig4];
+    /// use ec_rust::ec_proof_of_storage::ProofOfStorage;
+    /// use ec_rust::ec_interface::TokenSignature;
+    ///
+    /// // Create some example signatures (in practice, these would come from peers)
+    /// let signatures: Vec<TokenSignature> = vec![];
+    ///
     /// // Find cluster where all pairs agree on at least 7/10 mappings
     /// if let Some(cluster) = ProofOfStorage::find_consensus_cluster(&signatures, 7) {
     ///     println!("Found {} agreeing signatures", cluster.members.len());
@@ -1208,9 +1227,16 @@ impl ProofOfStorage {
     ///
     /// # Example
     /// ```rust
-    /// let proof_system = ProofOfStorage::new(storage);
+    /// use ec_rust::ec_memory_backend::MemTokens;
+    /// use ec_rust::ec_proof_of_storage::ProofOfStorage;
+    /// use ec_rust::ec_interface::Message;
     ///
-    /// if let Some(signature) = proof_system.generate_signature(&token, &peer) {
+    /// let storage = MemTokens::new();
+    /// let proof_system = ProofOfStorage::new();
+    /// let token = 123u64;
+    /// let peer = 456u64;
+    ///
+    /// if let Some(signature) = proof_system.generate_signature(&storage, &token, &peer) {
     ///     // Wrap in Message::Answer and send to peer
     ///     let msg = Message::Answer {
     ///         answer: signature.answer,

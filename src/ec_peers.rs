@@ -159,7 +159,6 @@ pub enum PeerAction {
 
     /// Send an Answer message with proof-of-storage signature
     SendAnswer {
-        receiver: PeerId,
         answer: TokenMapping,
         signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
         ticket: MessageTicket,
@@ -167,7 +166,6 @@ pub enum PeerAction {
 
     /// Send a Referral message with suggested peers
     SendReferral {
-        receiver: PeerId,
         token: TokenId,
         ticket: MessageTicket,
         suggested_peers: [PeerId; 2],
@@ -664,6 +662,11 @@ impl EcPeers {
         ticket: MessageTicket,
         peer_id: PeerId,
     ) {
+        // handle Invitation
+        if ticket == 0 {
+            // TODO handle Invitation here
+            
+        }
         // Sample tokens from Answer for future discovery
         // Answer contains: 1 answer token + 10 signature tokens = 11 valid tokens
         self.token_samples.sample_from_answer(answer, signature);
@@ -695,24 +698,17 @@ impl EcPeers {
         token: TokenId,
         suggested_peers: [PeerId; 2],
         sender: PeerId,
-    ) -> Vec<PeerAction> {
-        let mut actions = Vec::new();
-
-        // Sample peer IDs from Referral (peer IDs are valid tokens)
-        self.token_samples.add_token(suggested_peers[0]);
-        self.token_samples.add_token(suggested_peers[1]);
-        self.token_samples.add_token(sender);
-
+    ) -> Option<PeerAction> {
         // Find the ongoing election for this token
         if let Some(ongoing) = self.active_elections.get_mut(&token) {
             // Try to handle the referral
             match ongoing.election.handle_referral(ticket, token, suggested_peers, sender) {
                 Ok(next_peer) => {
                     // Election returned a suggested peer to try next
-                    // Skip if it's self
-                    if next_peer == self.peer_id {
-                        return actions;
-                    }
+
+                    // Sample peer IDs from Referral (peer IDs are valid tokens)
+                    self.token_samples.add_token(suggested_peers[0]);
+                    self.token_samples.add_token(suggested_peers[1]);
 
                     // Note: We DO allow querying non-Connected peers during discovery!
                     // The referral mechanism needs to work across the whole network,
@@ -721,7 +717,7 @@ impl EcPeers {
 
                     // Create a new channel to the suggested peer
                     if let Ok(new_ticket) = ongoing.election.create_channel(next_peer) {
-                        actions.push(PeerAction::SendQuery {
+                        return Some(PeerAction::SendQuery {
                             receiver: next_peer,
                             token,
                             ticket: new_ticket,
@@ -736,7 +732,7 @@ impl EcPeers {
         }
         // If no election found for this token, ignore the referral
 
-        actions
+        None
     }
 
     /// Handle a Query message - gateway to proof-of-storage system
@@ -766,7 +762,6 @@ impl EcPeers {
         if let Some(signature) = self.proof_system.generate_signature(token_storage, &token, &querier) {
             // We own the token - send Answer
             return Some(PeerAction::SendAnswer {
-                receiver: querier,
                 answer: signature.answer,
                 signature: signature.signature,
                 ticket,
@@ -778,7 +773,6 @@ impl EcPeers {
 
         if closest.len() >= 2 {
             Some(PeerAction::SendReferral {
-                receiver: querier,
                 token,
                 ticket,
                 suggested_peers: [closest[0], closest[1]],
@@ -1249,28 +1243,7 @@ impl EcPeers {
             return Vec::new();
         };
 
-        let mut skipped_self = 0;
-        let mut skipped_not_connected = 0;
-
         for first_hop in candidates.iter().take(count) {
-            // Skip self
-            if *first_hop == self.peer_id {
-                skipped_self += 1;
-                continue;
-            }
-
-            // Allow querying the target peer directly even if not Connected
-            // (for peer ID discovery), otherwise require Connected peers
-            let is_target_peer = *first_hop == challenge_token;
-            if !is_target_peer && !self.active.contains(first_hop) {
-                skipped_not_connected += 1;
-                continue;
-            }
-
-            if !ongoing.election.can_create_channel() {
-                break; // Hit max_channels limit
-            }
-
             // Create channel
             match ongoing.election.create_channel(*first_hop) {
                 Ok(ticket) => {
@@ -1554,12 +1527,12 @@ impl EcPeers {
     pub fn tick(&mut self, token_storage: &dyn TokenStorageBackend, time: EcTime) -> Vec<PeerAction> {
         let mut actions = Vec::new();
 
-        // Phase 2: Timeout detection
+        // Phase 1: Timeout detection
         self.detect_pending_timeouts(time);
         self.detect_connection_timeouts(time);
         self.cleanup_expired_elections(time);
 
-        // Phase 3: Process ongoing elections
+        // Phase 2: Process ongoing elections
         let election_actions = self.process_elections(token_storage, time);
         actions.extend(election_actions);
 
@@ -1571,7 +1544,7 @@ impl EcPeers {
         }
 
         // TODO Phase 4: Apply quality updates
-        // TODO Phase 4: Apply churn if epoch boundary
+        // TODO Phase 5: Apply churn if epoch boundary
 
         actions
     }
