@@ -178,9 +178,14 @@ impl PeerLifecycleRunner {
 
             // Store all tokens from the view
             let mut known_tokens = Vec::new();
+            let mut has_self_id = false;
             for (token_id, block_id) in token_view {
                 token_storage.set(&token_id, &block_id, 0); // time=0 for simplicity
                 known_tokens.push(token_id);
+
+                if token_id == peer_id {
+                    has_self_id = true;
+                }
             }
 
             // Create peer manager

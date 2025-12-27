@@ -48,9 +48,11 @@ impl GlobalTokenMapping {
     pub fn new(mut rng: StdRng, peer_ids: Vec<PeerId>, total_tokens: usize) -> Self {
         let mut mappings = HashMap::with_capacity(total_tokens + peer_ids.len());
 
-        // First: Add all peer IDs as tokens (block 0 = peer registration)
+        // First: Add all peer IDs as tokens with RANDOM block IDs
+        // (NOT block 0, because proof-of-storage needs real blocks with signature tokens)
         for &peer_id in &peer_ids {
-            mappings.insert(peer_id, 0);
+            let block: BlockId = rng.gen();
+            mappings.insert(peer_id, block);
         }
 
         // Second: Generate additional random token→block mappings
@@ -98,8 +100,16 @@ impl GlobalTokenMapping {
         let mut view = HashMap::new();
 
         // IMPORTANT: Add peer_id itself as token (for peer discovery)
-        // Every peer knows their own ID mapping
-        view.insert(peer_id, 0);  // Block 0 = registration
+        // Every peer knows their own ID mapping (with whatever block it maps to)
+        if let Some(&block) = self.mappings.get(&peer_id) {
+            view.insert(peer_id, block);
+        }
+
+        // DEBUG
+        let added_self = view.contains_key(&peer_id);
+        if cfg!(debug_assertions) && !added_self {
+            eprintln!("[TOKEN_DIST] WARNING: Failed to add peer's own ID {:016x}", peer_id);
+        }
 
         // Filter tokens within range and sample by coverage fraction
         for (&token, &block) in &self.mappings {
@@ -113,6 +123,12 @@ impl GlobalTokenMapping {
                     view.insert(token, block);
                 }
             }
+        }
+
+        // DEBUG: Check if peer's own ID is still there
+        if cfg!(debug_assertions) && !view.contains_key(&peer_id) {
+            eprintln!("[TOKEN_DIST] ERROR: Peer {:016x}'s own ID was removed from view! view.len()={}",
+                peer_id, view.len());
         }
 
         view

@@ -216,11 +216,6 @@ impl TokenSampleCollection {
     /// Add a token to the collection
     /// Returns true if token was added, false if already present or at capacity
     fn add_token(&mut self, token: TokenId) -> bool {
-        // If already present, nothing to do
-        if self.samples.contains(&token) {
-            return false;
-        }
-
         // If at capacity, don't add (eviction happens separately in tick)
         if self.samples.len() >= self.max_capacity {
             return false;
@@ -238,9 +233,6 @@ impl TokenSampleCollection {
         signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
         sender_peer_id: PeerId,
     ) {
-        // Add the answer token
-        self.add_token(answer.id);
-
         // Add sender's peer ID as a token
         self.add_token(sender_peer_id);
 
@@ -449,10 +441,6 @@ impl EcPeers {
             return self.handle_invitation(answer, signature, peer_id, time, token_storage);
         }
 
-        // Sample tokens from Answer for future discovery
-        // Answer contains: 1 answer token + 10 signature tokens + sender peer ID
-        self.token_samples.sample_from_answer(answer, signature, peer_id);
-
         // Route answer to the correct ongoing election
         let challenge_token = answer.id;
 
@@ -462,6 +450,9 @@ impl EcPeers {
                 Ok(()) => {
                     // Answer successfully recorded
                     // Winner will be detected in process_elections()
+                    // Sample tokens from Answer for future discovery
+                    // Answer contains: 1 answer token + 10 signature tokens + sender peer ID
+                    self.token_samples.sample_from_answer(answer, signature, peer_id);
                 }
                 Err(_e) => {
                     // Invalid signature or ticket, or channel already blocked
@@ -484,9 +475,6 @@ impl EcPeers {
         _token_storage: &dyn TokenStorageBackend,
     ) -> Vec<PeerAction> {
         use rand::Rng;
-
-        // Sample tokens from Invitation for future discovery
-        self.token_samples.sample_from_answer(answer, signature, sender_peer_id);
 
         // Calculate distance-based acceptance probability
         // Closer peers have higher probability of triggering a response
@@ -563,13 +551,11 @@ impl EcPeers {
         time: EcTime,
     ) -> Option<PeerAction> {
         // Find the ongoing election for this token
-        if let Some(ongoing) = self.active_elections.get_mut(&token) {
+        let action = if let Some(ongoing) = self.active_elections.get_mut(&token) {
             // Try to handle the referral
             match ongoing.election.handle_referral(ticket, token, suggested_peers, sender) {
                 Ok(next_peer) => {
                     // Election returned a suggested peer to try next
-
-                    // Sample peer IDs from Referral (peer IDs are valid tokens)
                     self.token_samples.sample_from_referral(&suggested_peers);
 
                     // Note: We DO allow querying non-Connected peers during discovery!
@@ -579,22 +565,32 @@ impl EcPeers {
 
                     // Create a new channel to the suggested peer
                     if let Ok(new_ticket) = ongoing.election.create_channel(next_peer, time) {
-                        return Some(PeerAction::SendQuery {
+                        Some(PeerAction::SendQuery {
                             receiver: next_peer,
                             token,
                             ticket: new_ticket,
-                        });
+                        })
+                    } else {
+                        None
                     }
                 }
                 Err(_) => {
                     // Referral failed (wrong token, unknown ticket, blocked channel, etc.)
-                    // Ignore
+                    None
                 }
             }
-        }
-        // If no election found for this token, ignore the referral
+        } else {
+            None
+        };
 
-        None
+        // Add suggested peers to Identified state (after releasing mutable borrow)
+        for &peer_id in &suggested_peers {
+            if peer_id != 0 {
+                self.add_identified_peer(peer_id, time);
+            }
+        }
+
+        action
     }
 
     /// Handle a Query message - gateway to proof-of-storage system
@@ -635,7 +631,6 @@ impl EcPeers {
 
         if closest.len() >= 2 {
             // TODO forward Query for Connected peers instead of Referral
-    
             Some(PeerAction::SendReferral {
                 token,
                 ticket,
@@ -1012,16 +1007,25 @@ impl EcPeers {
     }
 
     /// Trigger multiple elections per tick (new design)
-    /// Picks N tokens from collection and removes them
+    /// Picks N tokens from collection and removes them.
+    /// If collection is low, uses random tokens to bootstrap discovery.
     fn trigger_multiple_elections(
         &mut self,
         _token_storage: &dyn TokenStorageBackend,
         time: EcTime,
     ) -> Vec<PeerAction> {
+        use rand::Rng;
         let mut actions = Vec::new();
 
         // Pick N challenge tokens and remove them from collection
-        let challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick);
+        let mut challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick);
+
+        // If we don't have enough tokens, add random tokens to bootstrap discovery
+        // Random tokens won't exist, so we'll get Referrals that populate Identified
+        while challenge_tokens.len() < self.config.elections_per_tick {
+            let random_token: TokenId = rand::thread_rng().gen();
+            challenge_tokens.push(random_token);
+        }
 
         for challenge_token in challenge_tokens {
             // Start election (which spawns initial channels and returns Query actions)
@@ -1390,6 +1394,51 @@ impl EcPeers {
     // Main Tick Method (Phase 3)
     // ========================================================================
 
+    /// Send random Invitations to Identified peers
+    /// This converts Identified peers to Pending/Connected state
+    fn send_random_invitations(
+        &mut self,
+        token_storage: &dyn TokenStorageBackend,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
+        use rand::seq::SliceRandom;
+        let mut actions = Vec::new();
+
+        // Get list of Identified peers
+        let identified_peers: Vec<PeerId> = self.peers
+            .iter()
+            .filter(|(_, p)| p.state.is_identified())
+            .map(|(id, _)| *id)
+            .collect();
+
+        if identified_peers.is_empty() {
+            return actions;
+        }
+
+        // Send invitations to 1-3 random Identified peers per tick
+        let num_invitations = (identified_peers.len().min(3)).max(1);
+        let selected = identified_peers
+            .choose_multiple(&mut rand::thread_rng(), num_invitations)
+            .copied()
+            .collect::<Vec<_>>();
+
+        for peer_id in selected {
+            // Promote to Pending
+            if self.promote_to_pending(peer_id, self.peer_id, time) {
+                // Generate Invitation (Answer with our own ID as token)
+                if let Some(sig) = self.proof_system.generate_signature(token_storage, &self.peer_id, &peer_id) {
+                    actions.push(PeerAction::SendInvitation {
+                        receiver: peer_id,
+                        answer: sig.answer,
+                        signature: sig.signature,
+                    });
+                }
+            }
+        }
+
+        actions
+    }
+
     /// Main tick function - returns actions for EcNode to execute
     pub fn tick(&mut self, token_storage: &dyn TokenStorageBackend, time: EcTime) -> Vec<PeerAction> {
         let mut actions = Vec::new();
@@ -1411,7 +1460,11 @@ impl EcPeers {
         // Phase 5: Prune Connected peers by distance (distance-based probability)
         self.prune_connected_by_distance(time);
 
-        // Phase 6: Trigger new elections (pick and remove tokens)
+        // Phase 6: Send random Invitations to Identified peers
+        let invitation_actions = self.send_random_invitations(token_storage, time);
+        actions.extend(invitation_actions);
+
+        // Phase 7: Trigger new elections (pick and remove tokens, or use random tokens if low)
         let new_election_actions = self.trigger_multiple_elections(token_storage, time);
         actions.extend(new_election_actions);
 

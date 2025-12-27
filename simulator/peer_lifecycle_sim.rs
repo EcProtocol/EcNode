@@ -46,7 +46,7 @@ fn main() {
     // Token distribution with 90% coverage (high quality nodes)
     // neighbor_overlap controls view width - each peer overlaps with N neighbors
     config.token_distribution = TokenDistributionConfig {
-        total_tokens: 10_000,     // 10K tokens + peer IDs automatically injected
+        total_tokens: 100_000,    // 100K tokens + peer IDs automatically injected
         neighbor_overlap: 10,      // Overlap with 10 neighbors on each side (gives ~12 nearby)
         coverage_fraction: 0.9,    // Know 90% of nearby tokens (high quality)
     };
