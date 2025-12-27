@@ -30,12 +30,6 @@ pub struct PeerLifecycleRunner {
     // Metrics tracking
     metrics_history: Vec<RoundMetrics>,
     total_messages: MessageCounter,
-
-    // Election tracking
-    elections_started_total: usize,
-    elections_completed_total: usize,
-    elections_timeout_total: usize,
-    elections_splitbrain_total: usize,
 }
 
 /// A simulated peer
@@ -106,10 +100,6 @@ impl PeerLifecycleRunner {
             delayed_messages: VecDeque::new(),
             metrics_history: Vec::new(),
             total_messages: MessageCounter::default(),
-            elections_started_total: 0,
-            elections_completed_total: 0,
-            elections_timeout_total: 0,
-            elections_splitbrain_total: 0,
         }
     }
 
@@ -469,34 +459,53 @@ impl PeerLifecycleRunner {
             self.current_round as u64 * self.config.tick_duration_ms,
         );
 
-        // Collect peer state counts
-        let identified = 0;
-        let pending = 0;
-        let mut connected = 0;
+        // Collect peer state counts across all peers
+        let mut total_identified = 0;
+        let mut total_pending = 0;
+        let mut total_connected = 0;
         let mut active_count = 0;
         let mut connected_counts: Vec<usize> = Vec::new();
-        let mut _quality_scores: Vec<f64> = Vec::new();
+
+        // Aggregate election stats from all peers
+        let mut total_elections_started = 0;
+        let mut total_elections_completed = 0;
+        let mut total_elections_timeout = 0;
+        let mut total_elections_splitbrain = 0;
 
         for peer in self.peers.values() {
             if peer.active {
                 active_count += 1;
 
-                // Count states (simplified - we'd need to query peer_manager internal state)
+                // Collect peer state counts
+                let num_identified = peer.peer_manager.num_identified();
+                let num_pending = peer.peer_manager.num_pending();
                 let num_connected = peer.peer_manager.num_connected();
-                connected += num_connected;
+
+                total_identified += num_identified;
+                total_pending += num_pending;
+                total_connected += num_connected;
                 connected_counts.push(num_connected);
 
-                // TODO: Track identified/pending counts
-                // TODO: Track quality scores
+                // Collect election stats from this peer
+                let (started, completed, timeout, splitbrain) = peer.peer_manager.get_election_stats();
+                total_elections_started += started;
+                total_elections_completed += completed;
+                total_elections_timeout += timeout;
+                total_elections_splitbrain += splitbrain;
             }
         }
+
+        // Calculate averages
+        let avg_identified = if active_count > 0 { total_identified / active_count } else { 0 };
+        let avg_pending = if active_count > 0 { total_pending / active_count } else { 0 };
+        let avg_connected = if active_count > 0 { total_connected / active_count } else { 0 };
 
         metrics.peer_counts = PeerCounts {
             total_peers: self.peers.len(),
             active_peers: active_count,
-            identified,
-            pending,
-            connected: connected / active_count.max(1), // Average
+            identified: avg_identified,
+            pending: avg_pending,
+            connected: avg_connected,
         };
 
         // Network health
@@ -505,21 +514,30 @@ impl PeerLifecycleRunner {
             let max = *connected_counts.iter().max().unwrap_or(&0);
             let avg = connected_counts.iter().sum::<usize>() as f64 / connected_counts.len() as f64;
 
+            // Calculate standard deviation
+            let variance = connected_counts.iter()
+                .map(|&count| {
+                    let diff = count as f64 - avg;
+                    diff * diff
+                })
+                .sum::<f64>() / connected_counts.len() as f64;
+            let stddev = variance.sqrt();
+
             metrics.network_health = NetworkHealth {
                 min_connected_peers: min,
                 max_connected_peers: max,
                 avg_connected_peers: avg,
-                stddev_connected_peers: 0.0, // TODO: Calculate
+                stddev_connected_peers: stddev,
                 ring_coverage_percent: 0.0, // TODO: Calculate
                 partition_detected: false,
             };
         }
 
-        // Election stats
-        metrics.election_stats.total_elections_started = self.elections_started_total;
-        metrics.election_stats.total_elections_completed = self.elections_completed_total;
-        metrics.election_stats.total_elections_timed_out = self.elections_timeout_total;
-        metrics.election_stats.total_split_brain_detected = self.elections_splitbrain_total;
+        // Aggregate election stats from all peers
+        metrics.election_stats.total_elections_started = total_elections_started;
+        metrics.election_stats.total_elections_completed = total_elections_completed;
+        metrics.election_stats.total_elections_timed_out = total_elections_timeout;
+        metrics.election_stats.total_split_brain_detected = total_elections_splitbrain;
 
         self.metrics_history.push(metrics);
     }

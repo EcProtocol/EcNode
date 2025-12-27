@@ -333,6 +333,19 @@ pub struct EcPeers {
 
     /// Configuration
     config: PeerManagerConfig,
+
+    // ===== Election Statistics =====
+    /// Total elections started (lifetime counter)
+    elections_started_total: usize,
+
+    /// Total elections completed successfully (lifetime counter)
+    elections_completed_total: usize,
+
+    /// Total elections that timed out (lifetime counter)
+    elections_timeout_total: usize,
+
+    /// Total split-brain scenarios detected (lifetime counter)
+    elections_splitbrain_total: usize,
 }
 
 pub struct PeerRange {
@@ -1044,6 +1057,10 @@ impl EcPeers {
             proof_system,
             token_samples,
             config,
+            elections_started_total: 0,
+            elections_completed_total: 0,
+            elections_timeout_total: 0,
+            elections_splitbrain_total: 0,
         }
     }
 
@@ -1058,6 +1075,37 @@ impl EcPeers {
             .values()
             .filter(|p| p.state.is_connected())
             .count()
+    }
+
+    /// Get number of Identified peers
+    pub fn num_identified(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|p| p.state.is_identified())
+            .count()
+    }
+
+    /// Get number of Pending peers
+    pub fn num_pending(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|p| p.state.is_pending())
+            .count()
+    }
+
+    /// Get total number of active elections
+    pub fn num_active_elections(&self) -> usize {
+        self.active_elections.len()
+    }
+
+    /// Get election statistics
+    pub fn get_election_stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.elections_started_total,
+            self.elections_completed_total,
+            self.elections_timeout_total,
+            self.elections_splitbrain_total,
+        )
     }
 
     // ========================================================================
@@ -1081,6 +1129,9 @@ impl EcPeers {
         let ongoing = OngoingElection::new(election, time);
 
         self.active_elections.insert(challenge_token, ongoing);
+
+        // Increment election counter
+        self.elections_started_total += 1;
 
         // Spawn initial channels and return Query actions
         self.spawn_election_channels(challenge_token, time)
@@ -1120,6 +1171,9 @@ impl EcPeers {
         let ongoing = OngoingElection::new(election, time);
 
         self.active_elections.insert(challenge_token, ongoing);
+
+        // Increment election counter
+        self.elections_started_total += 1;
 
         // Update last_invitation_election_at for spam prevention
         if let Some(peer) = self.peers.get_mut(&responder_peer) {
@@ -1188,7 +1242,9 @@ impl EcPeers {
         let mut actions = Vec::new();
         let mut to_resolve: Vec<(TokenId, usize)> = Vec::new();
         let mut winners: Vec<(TokenId, PeerId)> = Vec::new();
-        let mut to_remove: Vec<TokenId> = Vec::new();
+        let mut to_remove_completed: Vec<TokenId> = Vec::new();
+        let mut to_remove_timeout: Vec<TokenId> = Vec::new();
+        let mut to_remove_splitbrain: Vec<TokenId> = Vec::new();
 
         // First pass: collect election results (only read, no mutable calls)
         let tokens: Vec<TokenId> = self.active_elections.keys().copied().collect();
@@ -1210,7 +1266,7 @@ impl EcPeers {
                 WinnerResult::Single { winner, .. } => {
                     // Success! Election complete - remove it after processing
                     winners.push((token, winner));
-                    to_remove.push(token);
+                    to_remove_completed.push(token);
                 }
 
                 WinnerResult::SplitBrain { .. } => {
@@ -1220,8 +1276,8 @@ impl EcPeers {
                         let needed = 2;
                         to_resolve.push((token, needed));
                     } else {
-                        // Give up - timeout and remove
-                        to_remove.push(token);
+                        // Give up - split-brain unresolved
+                        to_remove_splitbrain.push(token);
                     }
                 }
 
@@ -1229,7 +1285,7 @@ impl EcPeers {
                     // Not enough responses yet
                     if elapsed >= self.config.election_timeout {
                         // Timeout - remove election
-                        to_remove.push(token);
+                        to_remove_timeout.push(token);
                     }
                 }
             }
@@ -1247,9 +1303,22 @@ impl EcPeers {
             actions.extend(spawned);
         }
 
-        // Remove completed/timed-out elections (no caching)
-        for token in to_remove {
+        // Remove completed elections and update counter
+        for token in to_remove_completed {
             self.active_elections.remove(&token);
+            self.elections_completed_total += 1;
+        }
+
+        // Remove timed-out elections and update counter
+        for token in to_remove_timeout {
+            self.active_elections.remove(&token);
+            self.elections_timeout_total += 1;
+        }
+
+        // Remove split-brain elections and update counter
+        for token in to_remove_splitbrain {
+            self.active_elections.remove(&token);
+            self.elections_splitbrain_total += 1;
         }
 
         actions
