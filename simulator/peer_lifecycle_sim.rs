@@ -6,7 +6,7 @@ use peer_lifecycle::{
     PeerLifecycleConfig,
     PeerLifecycleRunner,
     InitialNetworkState,
-    TokenDistribution,
+    TokenDistributionConfig,
     TopologyMode,
 };
 
@@ -25,33 +25,30 @@ fn main() {
     // Customize for test
     config.rounds = 2000;
 
-    // Increase connection timeout to prevent premature timeouts during testing
-    // In real system, normal traffic would provide keepalives
-    config.peer_config.connection_timeout = 10000;
-
-    // Make elections more frequent to speed up ring building
-    config.peer_config.election_interval = 10; // Every 10 ticks instead of 60
-
-    // Give elections MUCH more time to accumulate Answers via Referral chains
-    config.peer_config.election_timeout = 100; // 100 ticks instead of 8
-    config.peer_config.min_collection_time = 10; // Wait 10 ticks before checking
-
-    // Increase pending timeout so discovered peers don't immediately timeout
-    // In production, we'd send Invitations, but for testing just give them time
-    config.peer_config.pending_timeout = 1000; // Long enough to see discovery working
+    // Adjust peer management parameters for testing
+    config.peer_config.connection_timeout = 10000; // Long timeout to prevent premature disconnects
+    config.peer_config.election_timeout = 100; // Give elections time to accumulate Answers via Referral chains
+    config.peer_config.min_collection_time = 10; // Wait 10 ticks before checking election completion
+    config.peer_config.pending_timeout = 1000; // Long timeout for discovered peers
+    config.peer_config.elections_per_tick = 3; // Trigger multiple elections per tick
+    // Network configuration matching Design/peer_lifecycle_simulator.md
+    // Test scenario: 30 connected peers, 90% token coverage, 20% peer knowledge
     config.initial_state = InitialNetworkState {
-        num_peers: 20,
-        // Start with a well-connected seed network (ring + some random connections)
-        // This simulates joining an existing network rather than cold start
-        initial_topology: TopologyMode::Ring { neighbors: 3 },
-        bootstrap_rounds: 20,
+        num_peers: 30, // Start with 30 connected peers
+        // LocalKnowledge: Peers know subset of neighbors, some are Connected
+        initial_topology: TopologyMode::LocalKnowledge {
+            peer_knowledge_fraction: 0.5, // Know 50% of nearby peers (Identified)
+            connected_fraction: 0.4,       // 40% of known peers start as Connected
+        },
+        bootstrap_rounds: 100,
     };
-    // Use Clustered distribution - tokens near peer ID for realistic DHT behavior
-    // Need enough tokens for proof-of-storage signatures (10 tokens with specific 10-bit patterns)
-    // With 1024 possible patterns, need ~10,000+ tokens for good coverage
-    config.token_distribution = TokenDistribution::Clustered {
-        tokens_per_peer: 10_000,
-        cluster_radius: 1_000_000, // Cluster within 1M of peer ID
+
+    // Token distribution with 90% coverage (high quality nodes)
+    // neighbor_overlap controls view width - each peer overlaps with N neighbors
+    config.token_distribution = TokenDistributionConfig {
+        total_tokens: 10_000,     // 10K tokens + peer IDs automatically injected
+        neighbor_overlap: 10,      // Overlap with 10 neighbors on each side (gives ~12 nearby)
+        coverage_fraction: 0.9,    // Know 90% of nearby tokens (high quality)
     };
     config.metrics.sample_interval = 10;
 

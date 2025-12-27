@@ -2,7 +2,7 @@
 
 use super::config::PeerLifecycleConfig;
 use super::stats::*;
-use super::token_dist::TokenDistributor;
+use super::token_dist::GlobalTokenMapping;
 use ec_rust::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_peers::{EcPeers, PeerAction};
@@ -43,7 +43,7 @@ struct SimPeer {
     peer_id: PeerId,
     peer_manager: EcPeers,
     token_storage: MemTokens,
-    owned_tokens: Vec<TokenId>,
+    known_tokens: Vec<TokenId>,  // Tokens in this peer's view
     active: bool,
 }
 
@@ -150,88 +150,137 @@ impl PeerLifecycleRunner {
             .map(|_| self.rng.gen())
             .collect();
 
-        // Distribute tokens
-        let mut distributor = TokenDistributor::new(StdRng::from_seed(self.rng.gen()));
-        let token_assignments = distributor.distribute(&peer_ids, &self.config.token_distribution);
+        // Create global token mapping with peer IDs injected as tokens
+        let mut global_mapping = GlobalTokenMapping::new(
+            StdRng::from_seed(self.rng.gen()),
+            peer_ids.clone(),
+            self.config.token_distribution.total_tokens,
+        );
 
-        // Create peers
+        // Calculate view_width from neighbor_overlap parameter
+        let view_width = GlobalTokenMapping::calculate_view_width(
+            num_peers,
+            self.config.token_distribution.neighbor_overlap,
+        );
+
+        // Create peers with views of the global mapping
         for peer_id in peer_ids {
-            let owned_tokens = token_assignments.get(&peer_id).cloned().unwrap_or_default();
+            // Get this peer's view of the global token mapping
+            let token_view = global_mapping.get_peer_view(
+                peer_id,
+                view_width,
+                self.config.token_distribution.coverage_fraction,
+            );
 
             // Create token storage backend (MemTokens)
             use ec_rust::ec_proof_of_storage::TokenStorageBackend;
             let mut token_storage = MemTokens::new();
 
-            // IMPORTANT: Register peer_id as a token for peer discovery
-            // This allows other peers to find this peer by querying for its peer_id
-            token_storage.set(&peer_id, &0, 0); // block=0, time=0 for registration
-
-            for (idx, token_id) in owned_tokens.iter().enumerate() {
-                // Create a simple mapping for simulation
-                let block_id = (idx + 1) as u64; // Offset by 1 since block 0 is registration
-                token_storage.set(token_id, &block_id, 0); // time=0 for simplicity
+            // Store all tokens from the view
+            let mut known_tokens = Vec::new();
+            for (token_id, block_id) in token_view {
+                token_storage.set(&token_id, &block_id, 0); // time=0 for simplicity
+                known_tokens.push(token_id);
             }
 
-            // Create peer manager (without token storage now)
+            // Create peer manager
             let peer_manager = EcPeers::with_config(peer_id, self.config.peer_config.clone());
 
             let peer = SimPeer {
                 peer_id,
                 peer_manager,
                 token_storage,
-                owned_tokens,
+                known_tokens,
                 active: true,
             };
 
             self.peers.insert(peer_id, peer);
         }
 
-        // Initialize topology (seed initial connections)
-        self.initialize_topology();
+        // Initialize topology (seed initial peer knowledge and connections)
+        self.initialize_topology(&global_mapping, view_width);
     }
 
-    /// Initialize peer topology
-    fn initialize_topology(&mut self) {
+    /// Initialize peer topology based on configuration
+    fn initialize_topology(&mut self, global_mapping: &GlobalTokenMapping, view_width: u64) {
         use super::config::TopologyMode;
+        use rand::seq::SliceRandom;
 
         let peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
 
         match &self.config.initial_state.initial_topology {
-            TopologyMode::FullyConnected => {
+            TopologyMode::FullyKnown { connected_fraction } => {
                 // Every peer knows every other peer
                 for (peer_id, peer) in &mut self.peers {
-                    for other_id in &peer_ids {
-                        if other_id != peer_id {
-                            peer.peer_manager.update_peer(other_id, 0);
+                    let mut known_peers: Vec<PeerId> = peer_ids.iter()
+                        .filter(|&&id| id != *peer_id)
+                        .copied()
+                        .collect();
+
+                    // Shuffle and select connected_fraction to make Connected
+                    known_peers.shuffle(&mut self.rng);
+                    let num_connected = (known_peers.len() as f64 * connected_fraction) as usize;
+
+                    for (idx, &other_id) in known_peers.iter().enumerate() {
+                        if idx < num_connected {
+                            // Add as seed peer (will be promoted to Connected)
+                            peer.peer_manager.add_seed_peer(other_id, 0);
+                        } else {
+                            // Add as Identified only
+                            peer.peer_manager.update_peer(&other_id, 0);
                         }
                     }
                 }
             }
 
-            TopologyMode::Random { connectivity } => {
-                // Random connections with specified connectivity
+            TopologyMode::LocalKnowledge { peer_knowledge_fraction, connected_fraction } => {
+                // Peers know subset of neighbors based on view_width
+                let mut total_known = 0;
+                let mut total_connected = 0;
+
                 for (peer_id, peer) in &mut self.peers {
-                    for other_id in &peer_ids {
-                        if other_id != peer_id && self.rng.gen_bool(*connectivity) {
-                            peer.peer_manager.update_peer(other_id, 0);
+                    // Get nearby peers within view_width
+                    let nearby_peers = global_mapping.get_nearby_peers(*peer_id, view_width);
+
+                    // Sample peer_knowledge_fraction of nearby peers
+                    let mut known_peers = nearby_peers;
+                    known_peers.shuffle(&mut self.rng);
+                    let num_known = (known_peers.len() as f64 * peer_knowledge_fraction) as usize;
+                    known_peers.truncate(num_known);
+
+                    // Of the known peers, make connected_fraction Connected
+                    let num_connected = (known_peers.len() as f64 * connected_fraction) as usize;
+
+                    total_known += known_peers.len();
+                    total_connected += num_connected;
+
+                    for (idx, &other_id) in known_peers.iter().enumerate() {
+                        if idx < num_connected {
+                            // Add as seed peer (will be promoted to Connected)
+                            peer.peer_manager.add_seed_peer(other_id, 0);
+                        } else {
+                            // Add as Identified only
+                            peer.peer_manager.update_peer(&other_id, 0);
                         }
                     }
                 }
             }
 
             TopologyMode::Ring { neighbors } => {
-                // Ring topology
-                let sorted_peers: Vec<_> = peer_ids.iter().copied().collect();
+                // Ring topology - all neighbors are Connected
+                let mut sorted_peers: Vec<_> = peer_ids.iter().copied().collect();
+                sorted_peers.sort(); // Sort by ID for consistent ring
+
                 for (i, peer_id) in sorted_peers.iter().enumerate() {
                     if let Some(peer) = self.peers.get_mut(peer_id) {
                         for offset in 1..=*neighbors {
                             // Forward neighbor
                             let forward_idx = (i + offset) % sorted_peers.len();
-                            peer.peer_manager.update_peer(&sorted_peers[forward_idx], 0);
+                            peer.peer_manager.add_seed_peer(sorted_peers[forward_idx], 0);
 
                             // Backward neighbor
                             let backward_idx = (i + sorted_peers.len() - offset) % sorted_peers.len();
-                            peer.peer_manager.update_peer(&sorted_peers[backward_idx], 0);
+                            peer.peer_manager.add_seed_peer(sorted_peers[backward_idx], 0);
                         }
                     }
                 }
@@ -313,11 +362,14 @@ impl PeerLifecycleRunner {
             SimMessage::Answer { answer, signature, ticket } => {
                 // Peer received answer - route to election
                 if let Some(peer) = self.peers.get_mut(&envelope.to) {
+                    let current_time = self.current_round as EcTime;
                     peer.peer_manager.handle_answer(
                         &answer,
                         &signature,
                         ticket,
                         envelope.from,
+                        current_time,
+                        &peer.token_storage,
                     );
                 }
             }
@@ -325,11 +377,13 @@ impl PeerLifecycleRunner {
             SimMessage::Referral { token, ticket, suggested_peers } => {
                 // Peer received referral - route to election and spawn new channels
                 if let Some(peer) = self.peers.get_mut(&envelope.to) {
+                    let current_time = self.current_round as EcTime;
                     let actions = peer.peer_manager.handle_referral(
                         ticket,
                         token,
                         suggested_peers,
                         envelope.from,
+                        current_time,
                     );
 
                     // Process the returned actions (send new Query messages)
@@ -379,7 +433,7 @@ impl PeerLifecycleRunner {
                 // Process actions
                 for action in actions {
                     match action {
-                        PeerAction::SendQuery { receiver, mut token, ticket } => {
+                        PeerAction::SendQuery { receiver, token, ticket } => {
                             self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
                         }
                         PeerAction::SendInvitation { receiver, answer, signature } => {
@@ -407,8 +461,8 @@ impl PeerLifecycleRunner {
         );
 
         // Collect peer state counts
-        let mut identified = 0;
-        let mut pending = 0;
+        let identified = 0;
+        let pending = 0;
         let mut connected = 0;
         let mut active_count = 0;
         let mut connected_counts: Vec<usize> = Vec::new();

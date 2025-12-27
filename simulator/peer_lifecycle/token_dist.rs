@@ -1,217 +1,154 @@
-// Token Distribution Strategies
+// Token Distribution for Peer Lifecycle Simulator
+//
+// Creates a global token mapping and provides views to individual peers.
+// Each peer gets a "view" based on their position on the ring and quality parameters.
 
-use super::config::{TokenDistribution, WeightDistribution};
-use ec_rust::ec_interface::{PeerId, TokenId};
+use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
 use rand::rngs::StdRng;
-use rand::{Rng, RngCore};
+use rand::Rng;
 use std::collections::HashMap;
 
-/// Distributor for assigning tokens to peers
-pub struct TokenDistributor {
+/// Configuration for token distribution
+#[derive(Debug, Clone)]
+pub struct TokenDistributionConfig {
+    /// Total number of tokens in the global mapping (excluding peer IDs)
+    pub total_tokens: usize,
+
+    /// How many neighbors on each side should peers overlap with (±neighbors)
+    /// This determines view_width to ensure sufficient overlap for elections
+    pub neighbor_overlap: usize,
+
+    /// Fraction of tokens within view_width that peer knows (0.0-1.0)
+    /// This is the "quality" parameter
+    pub coverage_fraction: f64,
+}
+
+impl Default for TokenDistributionConfig {
+    fn default() -> Self {
+        Self {
+            total_tokens: 10_000,
+            neighbor_overlap: 5,  // Overlap with 5 neighbors on each side
+            coverage_fraction: 0.8,  // Know 80% of nearby tokens
+        }
+    }
+}
+
+/// Global token mapping (the canonical truth)
+pub struct GlobalTokenMapping {
+    mappings: HashMap<TokenId, BlockId>,
+    peer_ids: Vec<PeerId>,
     rng: StdRng,
 }
 
-impl TokenDistributor {
-    pub fn new(rng: StdRng) -> Self {
-        Self { rng }
-    }
+impl GlobalTokenMapping {
+    /// Create a new global token mapping with peer IDs and random tokens
+    ///
+    /// Peer IDs are injected as tokens first (for peer discovery), then random
+    /// tokens are added to reach total_tokens count.
+    pub fn new(mut rng: StdRng, peer_ids: Vec<PeerId>, total_tokens: usize) -> Self {
+        let mut mappings = HashMap::with_capacity(total_tokens + peer_ids.len());
 
-    /// Distribute tokens to peers according to strategy
-    pub fn distribute(
-        &mut self,
-        peers: &[PeerId],
-        strategy: &TokenDistribution,
-    ) -> HashMap<PeerId, Vec<TokenId>> {
-        match strategy {
-            TokenDistribution::Uniform { tokens_per_peer } => {
-                self.distribute_uniform(peers, *tokens_per_peer)
-            }
-
-            TokenDistribution::Clustered {
-                tokens_per_peer,
-                cluster_radius,
-            } => self.distribute_clustered(peers, *tokens_per_peer, *cluster_radius),
-
-            TokenDistribution::Random {
-                total_tokens,
-                min_per_peer,
-                max_per_peer,
-            } => self.distribute_random(peers, *total_tokens, *min_per_peer, *max_per_peer),
-
-            TokenDistribution::Weighted {
-                total_tokens,
-                distribution,
-            } => self.distribute_weighted(peers, *total_tokens, distribution),
-
-            TokenDistribution::Custom(mapping) => mapping.clone(),
-        }
-    }
-
-    /// Uniform distribution: each peer gets N tokens uniformly on ring
-    fn distribute_uniform(
-        &mut self,
-        peers: &[PeerId],
-        tokens_per_peer: usize,
-    ) -> HashMap<PeerId, Vec<TokenId>> {
-        let mut result = HashMap::new();
-
-        for peer_id in peers {
-            let mut tokens = Vec::new();
-            for _ in 0..tokens_per_peer {
-                // Generate random token
-                tokens.push(self.rng.next_u64());
-            }
-            result.insert(*peer_id, tokens);
+        // First: Add all peer IDs as tokens (block 0 = peer registration)
+        for &peer_id in &peer_ids {
+            mappings.insert(peer_id, 0);
         }
 
-        result
-    }
-
-    /// Clustered distribution: tokens near peer ID on ring
-    fn distribute_clustered(
-        &mut self,
-        peers: &[PeerId],
-        tokens_per_peer: usize,
-        cluster_radius: u64,
-    ) -> HashMap<PeerId, Vec<TokenId>> {
-        let mut result = HashMap::new();
-
-        for peer_id in peers {
-            let mut tokens = Vec::new();
-            for _ in 0..tokens_per_peer {
-                // Generate token within cluster_radius of peer_id
-                let offset = self.rng.gen_range(0..cluster_radius);
-                let direction = if self.rng.gen_bool(0.5) { 1i64 } else { -1i64 };
-                let token = peer_id.wrapping_add((offset as i64 * direction) as u64);
-                tokens.push(token);
-            }
-            result.insert(*peer_id, tokens);
+        // Second: Generate additional random token→block mappings
+        for _ in 0..total_tokens {
+            let token: TokenId = rng.gen();
+            let block: BlockId = rng.gen();
+            mappings.insert(token, block);
         }
 
-        result
+        Self { mappings, peer_ids, rng }
     }
 
-    /// Random distribution: total_tokens distributed randomly
-    fn distribute_random(
-        &mut self,
-        peers: &[PeerId],
-        total_tokens: usize,
-        min_per_peer: usize,
-        max_per_peer: usize,
-    ) -> HashMap<PeerId, Vec<TokenId>> {
-        let mut result: HashMap<PeerId, Vec<TokenId>> = HashMap::new();
-
-        // Initialize with minimum tokens
-        for peer_id in peers {
-            let mut tokens = Vec::new();
-            for _ in 0..min_per_peer {
-                tokens.push(self.rng.next_u64());
-            }
-            result.insert(*peer_id, tokens);
+    /// Calculate view_width needed for neighbors to overlap
+    ///
+    /// Given N peers uniformly distributed on ring and desired overlap of K neighbors,
+    /// calculate the width that ensures each peer's view includes K neighbors on each side.
+    pub fn calculate_view_width(num_peers: usize, neighbor_overlap: usize) -> u64 {
+        if num_peers <= 1 {
+            return u64::MAX / 2; // Single peer sees everything
         }
 
-        // Distribute remaining tokens
-        let assigned = peers.len() * min_per_peer;
-        let remaining = total_tokens.saturating_sub(assigned);
+        // Average distance between peers on ring
+        let ring_size = u64::MAX;
+        let avg_peer_distance = ring_size / num_peers as u64;
 
-        for _ in 0..remaining {
-            // Pick random peer that hasn't hit max
-            let available_peers: Vec<_> = peers
-                .iter()
-                .filter(|p| result.get(p).map_or(0, |v| v.len()) < max_per_peer)
-                .collect();
+        // Width should cover neighbor_overlap peers on each side
+        // Add 20% margin to ensure coverage despite uniform distribution variance
+        // Use saturating_mul to prevent overflow
+        let base_width = avg_peer_distance.saturating_mul(neighbor_overlap as u64);
+        let width = base_width.saturating_mul(12) / 10;
 
-            if available_peers.is_empty() {
-                break; // All peers at max
-            }
-
-            let peer_id = *available_peers[self.rng.gen_range(0..available_peers.len())];
-            result
-                .entry(peer_id)
-                .or_insert_with(Vec::new)
-                .push(self.rng.next_u64());
-        }
-
-        result
+        width.min(u64::MAX / 2) // Cap at half the ring
     }
 
-    /// Weighted distribution: use distribution function
-    fn distribute_weighted(
+    /// Get a view of tokens for a specific peer as a HashMap
+    ///
+    /// Returns tokens within ±view_width of peer_id, with coverage_fraction sampling.
+    /// The peer's own ID is always included (for discovery).
+    pub fn get_peer_view(
         &mut self,
-        peers: &[PeerId],
-        total_tokens: usize,
-        distribution: &WeightDistribution,
-    ) -> HashMap<PeerId, Vec<TokenId>> {
-        // Calculate weights for each peer
-        let weights = self.calculate_weights(peers.len(), distribution);
+        peer_id: PeerId,
+        view_width: u64,
+        coverage_fraction: f64,
+    ) -> HashMap<TokenId, BlockId> {
+        let mut view = HashMap::new();
 
-        // Normalize weights to sum to total_tokens
-        let sum: f64 = weights.iter().sum();
-        let mut token_counts: Vec<usize> = weights
-            .iter()
-            .map(|&w| ((w / sum) * total_tokens as f64).round() as usize)
-            .collect();
+        // IMPORTANT: Add peer_id itself as token (for peer discovery)
+        // Every peer knows their own ID mapping
+        view.insert(peer_id, 0);  // Block 0 = registration
 
-        // Adjust for rounding errors
-        let assigned: usize = token_counts.iter().sum();
-        if assigned < total_tokens {
-            // Add remaining to random peers
-            for _ in 0..(total_tokens - assigned) {
-                let idx = self.rng.gen_range(0..token_counts.len());
-                token_counts[idx] += 1;
+        // Filter tokens within range and sample by coverage fraction
+        for (&token, &block) in &self.mappings {
+            if token == peer_id {
+                continue; // Already added above
             }
-        } else if assigned > total_tokens {
-            // Remove excess from random peers
-            for _ in 0..(assigned - total_tokens) {
-                let idx = self.rng.gen_range(0..token_counts.len());
-                if token_counts[idx] > 0 {
-                    token_counts[idx] -= 1;
+
+            if self.is_in_range(peer_id, token, view_width) {
+                // Probabilistically include based on coverage fraction
+                if self.rng.gen_bool(coverage_fraction) {
+                    view.insert(token, block);
                 }
             }
         }
 
-        // Assign tokens
-        let mut result = HashMap::new();
-        for (i, peer_id) in peers.iter().enumerate() {
-            let mut tokens = Vec::new();
-            for _ in 0..token_counts[i] {
-                tokens.push(self.rng.next_u64());
-            }
-            result.insert(*peer_id, tokens);
-        }
-
-        result
+        view
     }
 
-    /// Calculate weights based on distribution function
-    fn calculate_weights(&mut self, count: usize, distribution: &WeightDistribution) -> Vec<f64> {
-        match distribution {
-            WeightDistribution::PowerLaw { alpha } => {
-                // Power law: weight[i] = i^(-alpha)
-                (1..=count)
-                    .map(|i| (i as f64).powf(-alpha))
-                    .collect()
-            }
-
-            WeightDistribution::Exponential { lambda } => {
-                // Exponential: weight[i] = exp(-lambda * i)
-                (0..count)
-                    .map(|i| (-lambda * i as f64).exp())
-                    .collect()
-            }
-
-            WeightDistribution::Normal { mean, stddev } => {
-                // Normal distribution
-                (0..count)
-                    .map(|i| {
-                        let x = i as f64;
-                        let exponent = -((x - mean).powi(2)) / (2.0 * stddev.powi(2));
-                        exponent.exp()
-                    })
-                    .collect()
-            }
-        }
+    /// Get list of peer IDs that should be known by this peer
+    ///
+    /// Returns peer IDs within ±view_width, useful for initializing topology.
+    /// Separate from token view to allow different knowledge vs connectivity parameters.
+    pub fn get_nearby_peers(&self, peer_id: PeerId, view_width: u64) -> Vec<PeerId> {
+        self.peer_ids
+            .iter()
+            .filter(|&&other_id| {
+                other_id != peer_id && self.is_in_range(peer_id, other_id, view_width)
+            })
+            .copied()
+            .collect()
     }
+
+    /// Check if token is within ±view_width of peer_id on the ring
+    fn is_in_range(&self, peer_id: PeerId, token: TokenId, view_width: u64) -> bool {
+        let distance = ring_distance(peer_id, token);
+        distance <= view_width
+    }
+
+    /// Get total number of tokens
+    pub fn total_tokens(&self) -> usize {
+        self.mappings.len()
+    }
+}
+
+/// Calculate ring distance (shortest path on circular ID space)
+fn ring_distance(a: u64, b: u64) -> u64 {
+    let forward = b.wrapping_sub(a);
+    let backward = a.wrapping_sub(b);
+    forward.min(backward)
 }
 
 #[cfg(test)]
@@ -220,60 +157,91 @@ mod tests {
     use rand::SeedableRng;
 
     #[test]
-    fn test_uniform_distribution() {
-        let rng = StdRng::from_seed([0u8; 32]);
-        let mut distributor = TokenDistributor::new(rng);
+    fn test_ring_distance() {
+        assert_eq!(ring_distance(0, 100), 100);
+        assert_eq!(ring_distance(100, 0), 100);
+        assert_eq!(ring_distance(0, 0), 0);
 
-        let peers = vec![1000, 2000, 3000];
-        let result = distributor.distribute_uniform(&peers, 5);
-
-        assert_eq!(result.len(), 3);
-        for peer in &peers {
-            assert_eq!(result.get(peer).unwrap().len(), 5);
-        }
+        // Wrapping
+        let near_max = u64::MAX - 100;
+        assert_eq!(ring_distance(0, near_max), 101);
     }
 
     #[test]
-    fn test_random_distribution() {
-        let rng = StdRng::from_seed([0u8; 32]);
-        let mut distributor = TokenDistributor::new(rng);
-
-        let peers = vec![1000, 2000, 3000];
-        let result = distributor.distribute_random(&peers, 20, 2, 10);
-
-        // Each peer should have at least min_per_peer
-        for peer in &peers {
-            let count = result.get(peer).unwrap().len();
-            assert!(count >= 2);
-            assert!(count <= 10);
-        }
-
-        // Total should be close to total_tokens
-        let total: usize = result.values().map(|v| v.len()).sum();
-        assert_eq!(total, 20);
+    fn test_global_mapping_creation() {
+        let rng = StdRng::seed_from_u64(42);
+        let peer_ids = vec![100, 200, 300];
+        let mapping = GlobalTokenMapping::new(rng, peer_ids.clone(), 1000);
+        // Should have 1000 random tokens + 3 peer IDs
+        assert_eq!(mapping.total_tokens(), 1003);
     }
 
     #[test]
-    fn test_clustered_distribution() {
-        let rng = StdRng::from_seed([0u8; 32]);
-        let mut distributor = TokenDistributor::new(rng);
+    fn test_peer_view_includes_peer_id() {
+        let rng = StdRng::seed_from_u64(42);
+        let peer_id = 12345;
+        let peer_ids = vec![peer_id, 50000, 100000];
+        let mut mapping = GlobalTokenMapping::new(rng, peer_ids, 100);
 
-        let peers = vec![1000];
-        let result = distributor.distribute_clustered(&peers, 10, 100);
+        let view = mapping.get_peer_view(peer_id, 10000, 1.0);
 
-        let tokens = result.get(&1000).unwrap();
-        assert_eq!(tokens.len(), 10);
-
-        // Tokens should be within 100 of peer_id (allowing wraparound)
-        for token in tokens {
-            let dist = ring_distance(1000, *token);
-            assert!(dist <= 100, "Token {} too far from peer 1000 (dist: {})", token, dist);
-        }
+        // Peer should always know their own ID
+        assert!(view.contains_key(&peer_id));
+        assert_eq!(view[&peer_id], 0);
     }
 
-    fn ring_distance(a: u64, b: u64) -> u64 {
-        let forward = b.wrapping_sub(a);
-        let backward = a.wrapping_sub(b);
-        forward.min(backward)
+    #[test]
+    fn test_coverage_fraction() {
+        let rng = StdRng::seed_from_u64(42);
+        let peer_id = 0;
+        let peer_ids = vec![peer_id];
+        let mut mapping = GlobalTokenMapping::new(rng, peer_ids, 10000);
+
+        // Full coverage
+        let full_view = mapping.get_peer_view(peer_id, u64::MAX / 2, 1.0);
+        let full_count = full_view.len();
+
+        // Half coverage (probabilistic, so approximate)
+        let half_view = mapping.get_peer_view(peer_id, u64::MAX / 2, 0.5);
+        let half_count = half_view.len();
+
+        // Half coverage should have roughly half the tokens (with some variance)
+        assert!(half_count < full_count);
+        let half_f64 = half_count as f64;
+        let full_f64 = full_count as f64;
+        assert!(half_f64 > full_f64 * 0.3); // At least 30%
+        assert!(half_f64 < full_f64 * 0.7); // At most 70%
+    }
+
+    #[test]
+    fn test_view_width_calculation() {
+        // With 10 peers and 2 neighbor overlap, should cover ~20% of ring on each side
+        let width = GlobalTokenMapping::calculate_view_width(10, 2);
+        let expected = (u64::MAX / 10) * 2 * 12 / 10; // avg_distance * overlap * 1.2
+        assert_eq!(width, expected);
+
+        // With 100 peers and 5 neighbor overlap
+        let width = GlobalTokenMapping::calculate_view_width(100, 5);
+        let expected = (u64::MAX / 100) * 5 * 12 / 10;
+        assert_eq!(width, expected);
+    }
+
+    #[test]
+    fn test_nearby_peers() {
+        let rng = StdRng::seed_from_u64(42);
+        let peer_ids: Vec<PeerId> = vec![100, 500, 1000, 5000, 10000];
+        let mapping = GlobalTokenMapping::new(rng, peer_ids.clone(), 100);
+
+        // Get peers near 1000
+        let width = 2000; // Should include 100, 500, and exclude far ones
+        let nearby = mapping.get_nearby_peers(1000, width);
+
+        // Should include self's neighbors but not self
+        assert!(!nearby.contains(&1000)); // Not self
+        assert!(nearby.contains(&100));   // Close enough
+        assert!(nearby.contains(&500));   // Close enough
+        // 5000 and 10000 should be excluded (too far)
+        assert!(!nearby.contains(&5000));
+        assert!(!nearby.contains(&10000));
     }
 }

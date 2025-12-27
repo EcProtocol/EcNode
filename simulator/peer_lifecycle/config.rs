@@ -1,8 +1,7 @@
 // Peer Lifecycle Simulator Configuration
 
 use ec_rust::ec_peers::PeerManagerConfig;
-use ec_rust::ec_interface::{PeerId, TokenId};
-use std::collections::HashMap;
+use ec_rust::ec_interface::PeerId;
 
 // ============================================================================
 // Main Configuration
@@ -23,8 +22,8 @@ pub struct PeerLifecycleConfig {
     /// Initial network state
     pub initial_state: InitialNetworkState,
 
-    /// Token distribution strategy
-    pub token_distribution: TokenDistribution,
+    /// Token distribution configuration
+    pub token_distribution: TokenDistributionConfig,
 
     /// Scheduled network events
     pub events: EventSchedule,
@@ -59,16 +58,22 @@ pub struct InitialNetworkState {
     pub bootstrap_rounds: usize,
 }
 
-/// Topology modes for initial peer discovery
+/// Topology modes for initial peer discovery and knowledge
 #[derive(Debug, Clone)]
 pub enum TopologyMode {
-    /// All peers know all other peers
-    FullyConnected,
+    /// All peers know all other peers (100% knowledge)
+    /// connected_fraction controls how many become Connected vs just Identified
+    FullyKnown { connected_fraction: f64 },
 
-    /// Random connections with specified connectivity (0.0 to 1.0)
-    Random { connectivity: f64 },
+    /// Peers know neighbors within view_width based on neighbor_overlap
+    /// peer_knowledge_fraction controls what % of nearby peers they know (0.0-1.0)
+    /// connected_fraction of known peers start as Connected
+    LocalKnowledge {
+        peer_knowledge_fraction: f64,  // What % of nearby peers are known
+        connected_fraction: f64,       // What % of known peers are Connected
+    },
 
-    /// Ring topology with N neighbors on each side
+    /// Ring topology with N neighbors on each side, all Connected
     Ring { neighbors: usize },
 
     /// No initial connections (peers must discover via elections)
@@ -79,48 +84,23 @@ pub enum TopologyMode {
 // Token Distribution
 // ============================================================================
 
-/// Token distribution strategies
+/// Configuration for token distribution
+///
+/// Uses a global token mapping with per-peer views based on:
+/// - neighbor_overlap: How many neighbors on each side should overlap (determines view_width)
+/// - coverage_fraction: Quality parameter - fraction of tokens within range that peer knows (0.0-1.0)
 #[derive(Debug, Clone)]
-pub enum TokenDistribution {
-    /// Each peer owns N tokens uniformly distributed on ring
-    Uniform {
-        tokens_per_peer: usize,
-    },
+pub struct TokenDistributionConfig {
+    /// Total number of tokens in the global mapping (excluding peer IDs)
+    pub total_tokens: usize,
 
-    /// Tokens clustered by ring proximity to peer IDs
-    Clustered {
-        tokens_per_peer: usize,
-        cluster_radius: u64,
-    },
+    /// How many neighbors on each side should peers overlap with (±neighbors)
+    /// This determines view_width to ensure sufficient overlap for elections
+    pub neighbor_overlap: usize,
 
-    /// Completely random distribution
-    Random {
-        total_tokens: usize,
-        min_per_peer: usize,
-        max_per_peer: usize,
-    },
-
-    /// Weighted distribution (some peers have more tokens)
-    Weighted {
-        total_tokens: usize,
-        distribution: WeightDistribution,
-    },
-
-    /// Custom: exact token assignments
-    Custom(HashMap<PeerId, Vec<TokenId>>),
-}
-
-/// Weight distribution functions
-#[derive(Debug, Clone)]
-pub enum WeightDistribution {
-    /// Power law distribution (scale-free network)
-    PowerLaw { alpha: f64 },
-
-    /// Exponential distribution
-    Exponential { lambda: f64 },
-
-    /// Normal (Gaussian) distribution
-    Normal { mean: f64, stddev: f64 },
+    /// Fraction of tokens within view_width that peer knows (0.0-1.0)
+    /// This is the "quality" parameter
+    pub coverage_fraction: f64,
 }
 
 // ============================================================================
@@ -149,7 +129,7 @@ pub enum NetworkEvent {
     /// Add new peers to the network
     PeerJoin {
         count: usize,
-        tokens: TokenDistribution,
+        coverage_fraction: f64, // Quality of new peers (0.0-1.0)
         initial_knowledge: Vec<PeerId>, // Bootstrap peers they know
     },
 
@@ -262,7 +242,7 @@ impl Default for PeerLifecycleConfig {
             tick_duration_ms: 100,
             seed: None,
             initial_state: InitialNetworkState::default(),
-            token_distribution: TokenDistribution::default(),
+            token_distribution: TokenDistributionConfig::default(),
             events: EventSchedule::default(),
             peer_config: PeerManagerConfig::default(),
             network: NetworkConfig::default(),
@@ -276,15 +256,22 @@ impl Default for InitialNetworkState {
     fn default() -> Self {
         Self {
             num_peers: 50,
-            initial_topology: TopologyMode::Random { connectivity: 0.3 },
+            initial_topology: TopologyMode::LocalKnowledge {
+                peer_knowledge_fraction: 0.2,  // Know 20% of nearby peers
+                connected_fraction: 0.3,        // 30% of known peers are Connected
+            },
             bootstrap_rounds: 50,
         }
     }
 }
 
-impl Default for TokenDistribution {
+impl Default for TokenDistributionConfig {
     fn default() -> Self {
-        Self::Uniform { tokens_per_peer: 10 }
+        Self {
+            total_tokens: 10_000,
+            neighbor_overlap: 5,  // Overlap with 5 neighbors on each side
+            coverage_fraction: 0.8,  // Know 80% of nearby tokens
+        }
     }
 }
 

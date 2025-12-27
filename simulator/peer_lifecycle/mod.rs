@@ -9,7 +9,7 @@ pub mod runner;
 pub use config::{
     PeerLifecycleConfig,
     InitialNetworkState,
-    TokenDistribution,
+    TokenDistributionConfig,
     EventSchedule,
     NetworkEvent,
     PeerSelection,
@@ -23,5 +23,5 @@ pub use stats::{
     NetworkHealth,
 };
 
-pub use token_dist::TokenDistributor;
+pub use token_dist::GlobalTokenMapping;
 pub use runner::PeerLifecycleRunner;
