@@ -1,9 +1,11 @@
 # Peer Election via Proof-of-Storage: Design Document
 
 **Status**: Implementation Complete
-**Version**: 2.0
-**Last Updated**: 2025-01-11
-**Major Changes**: Simplified API, added signature verification, user-controlled timing
+**Version**: 3.0 (Simplified Integration)
+**Last Updated**: 2025-01-27
+**Major Changes from V2.0**: Removed election caching, added per-peer invitation cooldown, distance-based peer management, continuous elections
+
+**Previous Major Changes (V2.0)**: Simplified API, added signature verification, user-controlled timing
 
 ---
 
@@ -41,6 +43,20 @@ The peer election system enables nodes in the ecRust distributed network to disc
 3. **Attack Resistance**: Resist Sybil attacks, collusion, and gaming attempts
 4. **Network Health Visibility**: Detect and report split-brain scenarios
 5. **Practical Performance**: Complete elections in ~5 seconds with good success rate
+
+### V3.0 Integration Improvements
+
+**Core election protocol unchanged** - All security properties from V2.0 maintained.
+
+**Integration simplifications** (in ec_peers peer management):
+- ✅ **No election caching** - Elections deleted immediately when complete/timeout
+- ✅ **Per-peer invitation rate limiting** - Uses timestamp in peer state instead of cache
+- ✅ **Continuous elections** - Multiple per tick instead of interval-based
+- ✅ **Distance-based acceptance** - Probabilistic invitation handling based on ring distance
+- ✅ **Token removal on selection** - Natural rate limiting, fresher sample collection
+- ✅ **Statistical self-organization** - Gaussian peer distribution emerges naturally
+
+**Result**: Simpler, more elegant peer management while maintaining all election security properties.
 
 ---
 
@@ -915,65 +931,149 @@ fn agreeing_signatures(n: usize, common_count: usize) -> Vec<TokenSignature> {
 }
 ```
 
-### Integration with ec_peers
+### Integration with ec_peers (V3.0 - Simplified)
 
 **ec_peers Responsibilities** (User-controlled):
-- Maintain active elections: `HashMap<TokenId, PeerElection>`
-- Spawn initial channels (e.g., 3 channels)
+- Maintain active elections: `HashMap<TokenId, OngoingElection>` where `OngoingElection = { election: PeerElection, started_at: EcTime }`
+- **No election caching** - elections removed immediately when complete/timeout
+- Spawn initial channels (typically 3-4 per election)
 - Route incoming Answer/Referral messages to correct election
-- Implement timeout logic
-- Decide when to check for winner
-- Handle split-brain (spawn more or accept)
-- Maintain connections to elected winners
-- Continuous re-election for peer quality
+- **Continuous elections** - trigger multiple elections per tick (default: 3)
+- Handle split-brain (spawn more channels)
+- Maintain peer lifecycle (Identified → Pending → Connected)
+- **Per-peer invitation cooldown** - prevent invitation spam using timestamp in peer state
+
+**Key Simplifications** (vs older designs):
+- ✅ **No election result caching** - removed ElectionState enum, elections deleted immediately
+- ✅ **Per-peer invitation rate limiting** - uses `last_invitation_election_at` in Identified state
+- ✅ **Continuous elections** - no `election_interval`, runs multiple per tick
+- ✅ **Distance-based peer management** - acceptance and pruning based on ring distance
+- ✅ **Token removal on selection** - natural rate limiting, tokens removed when picked for elections
 
 **Clean Interface**:
 ```rust
-// Start election
-let election = PeerElection::new(token, self.my_peer_id, config);
-self.active_elections.insert(token, election);
+// TICK: Trigger multiple elections continuously
+fn tick(&mut self, time: EcTime) -> Vec<PeerAction> {
+    // ... timeout detection, election processing ...
 
-// Spawn channels
-for peer in random_peers(3) {
-    let ticket = election.create_channel(peer)?;
-    self.send_query(token, ticket, peer);
+    // Pick N challenge tokens and REMOVE them from collection
+    let tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick);
+
+    for token in tokens {
+        // Start election (no caching)
+        let election = PeerElection::new(token, self.peer_id, config);
+        self.active_elections.insert(token, OngoingElection {
+            election,
+            started_at: time,
+        });
+
+        // Spawn 3-4 channels (mix of closest Identified + random Connected)
+        for peer in select_channel_peers(token) {
+            let ticket = election.create_channel(peer)?;
+            actions.push(PeerAction::SendQuery { receiver: peer, token, ticket });
+        }
+    }
+
+    actions
 }
 
-// On Answer received
-match election.handle_answer(ticket, answer, sig, responder) {
+// On Answer received (regular response)
+match election.handle_answer(ticket, answer, sig, responder, time) {
     Ok(()) => { /* response stored */ }
-    Err(ElectionError::DuplicateResponse) => { /* peer caught gaming */ }
+    Err(ElectionError::DuplicateResponse) => { /* channel blocked */ }
+    Err(ElectionError::SignatureVerificationFailed) => { /* peer blocked */ }
     Err(e) => { /* log error */ }
+}
+
+// On Answer received (Invitation with ticket=0)
+fn handle_invitation(&mut self, answer, sig, sender, time) -> Vec<PeerAction> {
+    // 1. Sample tokens from Invitation
+    self.token_samples.sample_from_answer(answer, sig, sender);
+
+    // 2. Calculate distance-based acceptance probability
+    let accept_prob = 1.0 - (distance / ring_size);  // close = high, far = low
+    if !random() < accept_prob {
+        self.add_identified_peer(sender, time);  // Declined
+        return Vec::new();
+    }
+
+    // 3. Check per-peer invitation cooldown (60 ticks minimum)
+    if sender recently sent invitation {
+        return Vec::new();  // Too soon
+    }
+
+    // 4. Start election on sender's PeerId
+    let election = PeerElection::new(sender, self.peer_id, config);
+    self.active_elections.insert(sender, ...);
+    election.handle_answer(0, answer, sig, sender, time)?;  // Invitation as first Answer
+
+    // 5. Spawn channels to verify sender
+    spawn_election_channels(sender, time)
 }
 
 // On Referral received
 match election.handle_referral(ticket, token, suggested, responder) {
     Ok(new_peer) => {
+        // Sample peer IDs from Referral
+        self.token_samples.sample_from_referral(&suggested);
+
+        // Create new channel
         let new_ticket = election.create_channel(new_peer)?;
-        self.send_query(token, new_ticket, new_peer);
+        actions.push(PeerAction::SendQuery { receiver: new_peer, token, ticket: new_ticket });
     }
     Err(e) => { /* log error */ }
 }
 
-// Check for winner (periodically or on timeout)
-match election.check_for_winner() {
-    WinnerResult::Single { winner, .. } => {
-        self.connect_to_peer(winner);
-        self.active_elections.remove(&token);
-    }
-    WinnerResult::SplitBrain { .. } => {
-        // Spawn 2-3 more channels
-        self.spawn_more_channels(&mut election, 3);
-    }
-    WinnerResult::NoConsensus => {
-        if elapsed > TIMEOUT {
-            self.active_elections.remove(&token); // Give up
+// Process elections (every tick)
+fn process_elections(&mut self, time: EcTime) -> Vec<PeerAction> {
+    let mut to_remove = Vec::new();
+
+    for (token, ongoing) in &self.active_elections {
+        let elapsed = time - ongoing.started_at;
+
+        // Wait for minimum collection time
+        if elapsed < self.config.min_collection_time { continue; }
+
+        match ongoing.election.check_for_winner() {
+            WinnerResult::Single { winner, .. } => {
+                // Success! Promote winner, send Invitation, remove election
+                self.handle_election_success(winner, time);
+                to_remove.push(token);
+            }
+            WinnerResult::SplitBrain { .. } if elapsed < timeout => {
+                // Spawn more channels to resolve
+                actions.extend(spawn_more_channels(token, 2));
+            }
+            WinnerResult::SplitBrain { .. } | WinnerResult::NoConsensus if elapsed >= timeout => {
+                // Timeout - remove election (no caching)
+                to_remove.push(token);
+            }
+            _ => { /* keep waiting */ }
         }
     }
+
+    // Remove completed/timed-out elections immediately
+    for token in to_remove {
+        self.active_elections.remove(&token);
+    }
+
+    actions
 }
 ```
 
-**See**: [docs/TODO_election_integration.md](./TODO_election_integration.md) for detailed integration guide.
+**Anti-Spam Mechanisms**:
+1. **Token removal on selection** - Same token won't be re-elected until added via new Answer/Referral
+2. **Per-peer invitation cooldown** - 60 tick minimum between invitations from same peer (stored in peer state)
+3. **Distance-based acceptance** - Far peers have low probability of triggering election (~0.0), close peers high (~1.0)
+4. **Active election check** - Can't start duplicate election for same token
+
+**No Election Caching**:
+- Elections removed immediately when complete/timeout
+- Natural rate limiting via token removal and per-peer cooldown
+- Simpler: no ElectionState enum, no cache TTL, no cleanup phase
+- More direct: successful elections promote peer, failed elections just disappear
+
+**See**: [Design/peer_management_system.md](../Design/peer_management_system.md) for full peer lifecycle design.
 
 ---
 

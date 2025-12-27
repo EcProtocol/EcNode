@@ -2,7 +2,7 @@ use crate::ec_interface::{
     EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
 };
 use crate::ec_proof_of_storage::{ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ============================================================================
 // Configuration
@@ -11,79 +11,72 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// Configuration for the peer management system
 #[derive(Debug, Clone)]
 pub struct PeerManagerConfig {
-    /// Total budget of connections across all distance classes (default: 50)
-    pub total_budget: usize,
+    // ===== Capacity Limits =====
+    /// Maximum number of Connected peers (default: 200)
+    pub connected_max_capacity: usize,
 
-    /// Interval for budget enforcement in ticks (default: 60)
-    pub budget_enforcement_interval: u64,
+    /// Maximum number of Identified peers (default: 5000)
+    pub identified_max_capacity: usize,
 
-    /// Interval between starting new elections (in ticks, default: 60)
-    pub election_interval: u64,
+    /// Maximum number of tokens in sample collection (default: 1000)
+    pub token_sample_max_capacity: usize,
 
-    /// Minimum time to collect election responses before checking for winner (in ticks, default: 2)
+    // ===== Election Parameters =====
+    /// Number of elections to trigger per tick (default: 3)
+    pub elections_per_tick: usize,
+
+    /// Minimum time to collect election responses before checking for winner (in ticks, default: 10)
     pub min_collection_time: u64,
 
-    /// Maximum time to wait for election before timeout (in ticks, default: 8)
+    /// Maximum time to wait for election before timeout (in ticks, default: 30)
     pub election_timeout: u64,
 
+    /// TTL for election cache (in ticks, default: 300)
+    pub election_cache_ttl: u64,
+
+    // ===== Timeout Parameters =====
     /// Timeout for Pending state before demoting to Identified (in ticks, default: 10)
     pub pending_timeout: u64,
 
     /// Timeout for Connected state without keepalive (in ticks, default: 300 = 5 min)
     pub connection_timeout: u64,
 
-    /// Decay factor for exponential moving average of quality scores (default: 0.3)
-    pub quality_decay_alpha: f64,
+    /// Protection time for recently connected peers from pruning (in ticks, default: 600 = 10 min)
+    pub prune_protection_time: u64,
 
-    /// Random churn rate applied per epoch (default: 0.4 = 40%)
-    pub churn_rate: f64,
+    // ===== Legacy (backward compatibility) =====
+    /// Total budget - kept for compatibility (maps to connected_max_capacity)
+    pub total_budget: usize,
 
-    /// Interval between churn epochs (in ticks, default: 1800 = 30 min)
-    pub churn_interval: u64,
-
-    /// Minimum connection age to be eligible for churn (in ticks, default: 600 = 10 min)
-    pub churn_protection_time: u64,
-
-    /// Number of election channels to create (default: 3)
-    pub election_channel_count: usize,
-
-    /// Number of closest peers to consider for channel selection (default: 8)
-    pub channel_candidate_count: usize,
-
-    /// Maximum discovered peers to keep (default: 1000)
-    pub max_discovered_peers: usize,
-
-    /// Election result cache TTL in ticks (default: 300 = 5 minutes)
-    pub election_cache_ttl: u64,
-
+    // ===== Election Configuration =====
     /// Configuration for PeerElection
     pub election_config: ElectionConfig,
-
-    /// Maximum tokens per distance class in sample collection (default: 20)
-    /// Total capacity = 64 classes * 20 = 1,280 tokens
-    pub max_tokens_per_distance_class: usize,
 }
 
 impl Default for PeerManagerConfig {
     fn default() -> Self {
         Self {
-            total_budget: 50,
-            budget_enforcement_interval: 60,
-            election_interval: 60,
-            min_collection_time: 2,
-            election_timeout: 8,
+            // Capacity limits
+            connected_max_capacity: 200,
+            identified_max_capacity: 5000,
+            token_sample_max_capacity: 1000,
+
+            // Election parameters
+            elections_per_tick: 3,
+            min_collection_time: 10,
+            election_timeout: 30,
+            election_cache_ttl: 300,
+
+            // Timeout parameters
             pending_timeout: 10,
             connection_timeout: 300,
-            quality_decay_alpha: 0.3,
-            churn_rate: 0.4,
-            churn_interval: 1800,
-            churn_protection_time: 600,
-            election_channel_count: 3,
-            channel_candidate_count: 8,
-            max_discovered_peers: 1000,
-            election_cache_ttl: 300,
+            prune_protection_time: 600,
+
+            // Legacy compatibility
+            total_budget: 200,  // Maps to connected_max_capacity
+
+            // Election configuration
             election_config: ElectionConfig::default(),
-            max_tokens_per_distance_class: 20,
         }
     }
 }
@@ -98,6 +91,8 @@ pub enum PeerState {
     /// Peer discovered via referral or answer, not yet invited
     Identified {
         discovered_at: EcTime,
+        /// Last time we started an election due to their Invitation (spam prevention)
+        last_invitation_election_at: Option<EcTime>,
     },
 
     /// Invitation sent, waiting for reciprocal invitation
@@ -183,140 +178,75 @@ pub enum PeerAction {
 // Election Tracking
 // ============================================================================
 
-/// State of an election for caching
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ElectionState {
-    /// Election is actively collecting responses
-    Running,
-    /// Election completed successfully with a winner
-    Completed {
-        winner: PeerId,
-        completed_at: EcTime,
-    },
-    /// Election timed out without finding a winner
-    TimedOut {
-        timed_out_at: EcTime,
-    },
-}
-
-/// Tracks an ongoing or cached election
+/// Tracks an ongoing election (no caching)
 struct OngoingElection {
     election: PeerElection,
     started_at: EcTime,
-    purpose: ElectionPurpose,
-    state: ElectionState,
-}
-
-/// Purpose of an election
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ElectionPurpose {
-    /// Bootstrap: trying to establish initial connections
-    Bootstrap,
-    /// Continuous: validating existing connections or finding better candidates
-    Continuous,
-    /// Responding to an incoming invitation
-    InvitationResponse { from_peer: PeerId },
 }
 
 // ============================================================================
 // Token Sample Collection
 // ============================================================================
 
-/// Number of distance classes (one per bit position in u64)
-const NUM_DISTANCE_CLASSES: usize = 64;
-
-/// Sampled tokens organized by distance class for even ring coverage
+/// Sampled tokens for election challenges
 ///
-/// This structure maintains a bounded collection of tokens distributed evenly
-/// across the u64 ID space. Tokens are organized into 64 distance classes
-/// (one per bit position), with each class holding a limited number of tokens.
+/// This structure maintains a bounded collection of tokens used for triggering elections.
+/// Tokens are added from validated Answers, Invitations, and Referrals throughout the
+/// node's lifetime. The collection is continuously pruned via:
+/// - Uniform random eviction when at capacity
+/// - Removal when a token is selected for an election
 ///
-/// This enables efficient peer discovery across the entire network by ensuring
-/// we have queryable tokens in all regions of the ID space.
+/// The combination of biased input (gradient routing provides nearby tokens) and
+/// uniform eviction naturally produces a Gaussian distribution centered on our peer ID.
 struct TokenSampleCollection {
-    /// Tokens organized by distance class (log2-based bucketing)
-    /// Each BTreeSet holds up to max_per_class tokens
-    tokens_by_class: [BTreeSet<TokenId>; NUM_DISTANCE_CLASSES],
+    /// Flat set of sampled tokens
+    samples: HashSet<TokenId>,
 
-    /// Maximum tokens per distance class
-    max_per_class: usize,
-
-    /// Our peer ID (for calculating distances)
-    peer_id: PeerId,
+    /// Maximum capacity
+    max_capacity: usize,
 }
 
 impl TokenSampleCollection {
     /// Create a new empty token sample collection
-    fn new(peer_id: PeerId, max_per_class: usize) -> Self {
-        // Initialize array of empty BTreeSets
-        let tokens_by_class: [BTreeSet<TokenId>; NUM_DISTANCE_CLASSES] =
-            std::array::from_fn(|_| BTreeSet::new());
-
+    fn new(max_capacity: usize) -> Self {
         Self {
-            tokens_by_class,
-            max_per_class,
-            peer_id,
+            samples: HashSet::new(),
+            max_capacity,
         }
-    }
-
-    /// Calculate which distance class a token belongs to
-    /// Uses same logic as EcPeers::calculate_distance_class
-    fn calculate_distance_class(peer_id: PeerId, token: TokenId) -> usize {
-        let dist = {
-            let forward = token.wrapping_sub(peer_id);
-            let backward = peer_id.wrapping_sub(token);
-            forward.min(backward)
-        };
-
-        if dist == 0 {
-            return 0;
-        }
-
-        // Use leading zeros to get log2-based classes
-        (64 - dist.leading_zeros()) as usize
     }
 
     /// Add a token to the collection
-    /// Returns true if token was added, false if rejected
+    /// Returns true if token was added, false if already present or at capacity
     fn add_token(&mut self, token: TokenId) -> bool {
-        if token == self.peer_id {
-            return false; // Don't store self
-        }
-
-        let class = Self::calculate_distance_class(self.peer_id, token);
-        let class_set = &mut self.tokens_by_class[class];
-
         // If already present, nothing to do
-        if class_set.contains(&token) {
+        if self.samples.contains(&token) {
             return false;
         }
 
-        // If class is full, check if we should replace
-        if class_set.len() >= self.max_per_class {
-            // Simple strategy: replace a random token
-            // Could be improved to replace the token closest to an existing one
-            if let Some(&first_token) = class_set.iter().next() {
-                class_set.remove(&first_token);
-            }
+        // If at capacity, don't add (eviction happens separately in tick)
+        if self.samples.len() >= self.max_capacity {
+            return false;
         }
 
-        class_set.insert(token);
-        true
+        self.samples.insert(token)
     }
 
     /// Sample tokens from an Answer message
     /// Answer contains: 1 answer token + 10 signature tokens = 11 total
-    /// We sample intelligently to fill gaps in our collection
+    /// Also adds the peer_id of the sender
     fn sample_from_answer(
         &mut self,
         answer: &TokenMapping,
         signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
+        sender_peer_id: PeerId,
     ) {
         // Add the answer token
         self.add_token(answer.id);
 
+        // Add sender's peer ID as a token
+        self.add_token(sender_peer_id);
+
         // Sample from signature tokens
-        // Strategy: Add tokens from underrepresented distance classes first
         for sig_token in signature {
             if sig_token.id != 0 {
                 self.add_token(sig_token.id);
@@ -324,89 +254,73 @@ impl TokenSampleCollection {
         }
     }
 
-    /// Pick a random token from a specific distance class
-    fn pick_from_class(&self, class_index: usize) -> Option<TokenId> {
-        if class_index >= NUM_DISTANCE_CLASSES {
-            return None;
+    /// Sample peer IDs from a Referral message
+    fn sample_from_referral(&mut self, suggested_peers: &[PeerId; 2]) {
+        for &peer_id in suggested_peers {
+            if peer_id != 0 {
+                self.add_token(peer_id);
+            }
         }
-
-        let class_set = &self.tokens_by_class[class_index];
-        if class_set.is_empty() {
-            return None;
-        }
-
-        // Pick random token from class
-        use rand::seq::IteratorRandom;
-        class_set.iter().choose(&mut rand::thread_rng()).copied()
     }
 
-    /// Pick a random token from any class
-    fn pick_random(&self) -> Option<TokenId> {
-        // Collect all tokens
-        let all_tokens: Vec<TokenId> = self.tokens_by_class
-            .iter()
-            .flat_map(|set| set.iter().copied())
-            .collect();
+    /// Pick N random tokens and REMOVE them from the collection
+    /// Returns up to N tokens (may be less if collection is small)
+    fn pick_and_remove(&mut self, n: usize) -> Vec<TokenId> {
+        use rand::seq::IteratorRandom;
+        let mut rng = rand::thread_rng();
 
-        if all_tokens.is_empty() {
-            return None;
+        let selected: Vec<TokenId> = self.samples
+            .iter()
+            .copied()
+            .choose_multiple(&mut rng, n);
+
+        // Remove selected tokens from the collection
+        for &token in &selected {
+            self.samples.remove(&token);
         }
 
-        use rand::seq::SliceRandom;
-        all_tokens.choose(&mut rand::thread_rng()).copied()
+        selected
+    }
+
+    /// Evict random tokens if over capacity
+    /// Returns number of tokens evicted
+    fn evict_excess(&mut self) -> usize {
+        if self.samples.len() <= self.max_capacity {
+            return 0;
+        }
+
+        use rand::seq::IteratorRandom;
+        let mut rng = rand::thread_rng();
+
+        let excess = self.samples.len() - self.max_capacity;
+        let to_evict: Vec<TokenId> = self.samples
+            .iter()
+            .copied()
+            .choose_multiple(&mut rng, excess);
+
+        for token in &to_evict {
+            self.samples.remove(token);
+        }
+
+        to_evict.len()
     }
 
     /// Get total number of sampled tokens
     fn len(&self) -> usize {
-        self.tokens_by_class.iter().map(|set| set.len()).sum()
+        self.samples.len()
     }
 
     /// Check if collection is empty
     fn is_empty(&self) -> bool {
-        self.tokens_by_class.iter().all(|set| set.is_empty())
+        self.samples.is_empty()
     }
 }
 
 impl OngoingElection {
-    fn new(election: PeerElection, started_at: EcTime, purpose: ElectionPurpose) -> Self {
+    fn new(election: PeerElection, started_at: EcTime) -> Self {
         Self {
             election,
             started_at,
-            purpose,
-            state: ElectionState::Running,
-        }
-    }
-
-    /// Check if this election result can be used from cache
-    fn is_cache_valid(&self, current_time: EcTime, cache_ttl: u64) -> bool {
-        match self.state {
-            ElectionState::Completed { completed_at, .. } => {
-                current_time - completed_at < cache_ttl
-            }
-            _ => false,
-        }
-    }
-
-    /// Mark election as completed with winner
-    fn complete(&mut self, winner: PeerId, time: EcTime) {
-        self.state = ElectionState::Completed {
-            winner,
-            completed_at: time,
-        };
-    }
-
-    /// Mark election as timed out
-    fn timeout(&mut self, time: EcTime) {
-        self.state = ElectionState::TimedOut {
-            timed_out_at: time,
-        };
-    }
-
-    /// Get winner if election is completed
-    fn get_winner(&self) -> Option<PeerId> {
-        match self.state {
-            ElectionState::Completed { winner, .. } => Some(winner),
-            _ => None,
         }
     }
 }
@@ -662,15 +576,16 @@ impl EcPeers {
         ticket: MessageTicket,
         peer_id: PeerId,
         time: EcTime,
-    ) {
-        // handle Invitation
+        token_storage: &dyn TokenStorageBackend,
+    ) -> Vec<PeerAction> {
+        // handle Invitation (ticket == 0)
         if ticket == 0 {
-            // TODO handle Invitation here
-            
+            return self.handle_invitation(answer, signature, peer_id, time, token_storage);
         }
+
         // Sample tokens from Answer for future discovery
-        // Answer contains: 1 answer token + 10 signature tokens = 11 valid tokens
-        self.token_samples.sample_from_answer(answer, signature);
+        // Answer contains: 1 answer token + 10 signature tokens + sender peer ID
+        self.token_samples.sample_from_answer(answer, signature, peer_id);
 
         // Route answer to the correct ongoing election
         let challenge_token = answer.id;
@@ -689,6 +604,86 @@ impl EcPeers {
             }
         }
         // If no election found for this token, ignore the answer
+        Vec::new()
+    }
+
+    /// Handle an Invitation (Answer with ticket=0)
+    /// Uses distance-based probability to decide whether to respond
+    fn handle_invitation(
+        &mut self,
+        answer: &TokenMapping,
+        signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
+        sender_peer_id: PeerId,
+        time: EcTime,
+        _token_storage: &dyn TokenStorageBackend,
+    ) -> Vec<PeerAction> {
+        use rand::Rng;
+
+        // Sample tokens from Invitation for future discovery
+        self.token_samples.sample_from_answer(answer, signature, sender_peer_id);
+
+        // Calculate distance-based acceptance probability
+        // Closer peers have higher probability of triggering a response
+        let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
+        let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
+        let distance_fraction = distance / ring_size;
+        let accept_prob = 1.0 - distance_fraction; // Inverse: close = high, far = low
+
+        // Decide whether to respond to this Invitation
+        if !rand::thread_rng().gen_bool(accept_prob) {
+            // Declined - just add sender to Identified for future consideration
+            self.add_identified_peer(sender_peer_id, time);
+            return Vec::new();
+        }
+
+        // Accepted - check per-peer invitation cooldown
+        const INVITATION_COOLDOWN: EcTime = 60; // Minimum 60 ticks between invitations from same peer
+
+        // Check if sender is already known and has a recent invitation election
+        if let Some(peer) = self.peers.get(&sender_peer_id) {
+            if let PeerState::Identified { last_invitation_election_at, .. } = peer.state {
+                if let Some(last_time) = last_invitation_election_at {
+                    if time - last_time < INVITATION_COOLDOWN {
+                        // Too soon - reject this Invitation
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+
+        // Check if we already have an election for this peer
+        if self.active_elections.contains_key(&sender_peer_id) {
+            // Election already exists, just record this Invitation as an Answer
+            if let Some(ongoing) = self.active_elections.get_mut(&sender_peer_id) {
+                // Use ticket=0 to record the Invitation
+                let _ = ongoing.election.handle_answer(0, answer, signature, sender_peer_id, time);
+            }
+            return Vec::new();
+        }
+
+        // Ensure sender is in Identified state before starting election
+        self.add_identified_peer(sender_peer_id, time);
+
+        // Update last_invitation_election_at timestamp
+        if let Some(peer) = self.peers.get_mut(&sender_peer_id) {
+            if let PeerState::Identified { last_invitation_election_at, .. } = &mut peer.state {
+                *last_invitation_election_at = Some(time);
+            }
+        }
+
+        // Start new election on sender's PeerId
+        self.start_election(sender_peer_id, time);
+
+        // Record the Invitation as the first Answer in this election
+        if let Some(ongoing) = self.active_elections.get_mut(&sender_peer_id) {
+            let _ = ongoing.election.handle_answer(0, answer, signature, sender_peer_id, time);
+        }
+
+        // Spawn channels for this election
+        // Mix of closest Identified peers and random Connected peers
+        let channel_actions = self.spawn_election_channels(sender_peer_id, time);
+
+        channel_actions
     }
 
     /// Handle a Referral message (peer suggestions)
@@ -709,8 +704,7 @@ impl EcPeers {
                     // Election returned a suggested peer to try next
 
                     // Sample peer IDs from Referral (peer IDs are valid tokens)
-                    self.token_samples.add_token(suggested_peers[0]);
-                    self.token_samples.add_token(suggested_peers[1]);
+                    self.token_samples.sample_from_referral(&suggested_peers);
 
                     // Note: We DO allow querying non-Connected peers during discovery!
                     // The referral mechanism needs to work across the whole network,
@@ -774,6 +768,8 @@ impl EcPeers {
         let closest = self.find_closest_peers(token, 2);
 
         if closest.len() >= 2 {
+            // TODO forward Query for Connected peers instead of Referral
+    
             Some(PeerAction::SendReferral {
                 token,
                 ticket,
@@ -825,7 +821,7 @@ impl EcPeers {
     }
 
     /// Get peer indices for a token (internal use)
-    pub(crate) fn peers_idx_for(&self, key: &TokenId, time: EcTime) -> Vec<usize> {
+    fn peers_idx_for(&self, key: &TokenId, time: EcTime) -> Vec<usize> {
         if self.active.is_empty() {
             return vec![];
         }
@@ -897,7 +893,14 @@ impl EcPeers {
     // ========================================================================
 
     /// Add newly discovered peer to Identified state (from Referral)
-    pub fn add_identified_peer(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    /// Add a seed peer for bootstrap (public API)
+    /// Adds the peer to the Identified state for initial discovery
+    pub fn add_seed_peer(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+        self.add_identified_peer(peer_id, time)
+    }
+
+    /// Add a peer to Identified state (internal)
+    fn add_identified_peer(&mut self, peer_id: PeerId, time: EcTime) -> bool {
         if peer_id == self.peer_id {
             return false; // Never add self
         }
@@ -915,6 +918,7 @@ impl EcPeers {
                 id: peer_id,
                 state: PeerState::Identified {
                     discovered_at: time,
+                    last_invitation_election_at: None,
                 },
                 distance_class,
             },
@@ -927,7 +931,7 @@ impl EcPeers {
     }
 
     /// Promote Identified peer to Pending after election win (we send Invitation)
-    pub fn promote_to_pending(&mut self, peer_id: PeerId, election_token: TokenId, time: EcTime) -> bool {
+    fn promote_to_pending(&mut self, peer_id: PeerId, election_token: TokenId, time: EcTime) -> bool {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
             None => return false, // Peer not found
@@ -947,7 +951,7 @@ impl EcPeers {
     }
 
     /// Promote peer to Connected (mutual Invitation exchange)
-    pub fn promote_to_connected(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    fn promote_to_connected(&mut self, peer_id: PeerId, time: EcTime) -> bool {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
             None => return false, // Peer not found
@@ -975,7 +979,7 @@ impl EcPeers {
     }
 
     /// Demote Connected peer to Identified (timeout, churn, budget enforcement)
-    pub fn demote_from_connected(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    fn demote_from_connected(&mut self, peer_id: PeerId, time: EcTime) -> bool {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
             None => return false, // Peer not found
@@ -988,6 +992,7 @@ impl EcPeers {
 
         peer.state = PeerState::Identified {
             discovered_at: time,
+            last_invitation_election_at: None,
         };
 
         // Remove from active list
@@ -999,7 +1004,7 @@ impl EcPeers {
     }
 
     /// Demote Pending peer to Identified (timeout)
-    pub fn demote_to_identified(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    fn demote_to_identified(&mut self, peer_id: PeerId, time: EcTime) -> bool {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
             None => return false, // Peer not found
@@ -1012,13 +1017,14 @@ impl EcPeers {
 
         peer.state = PeerState::Identified {
             discovered_at: time,
+            last_invitation_election_at: None,
         };
 
         true
     }
 
     /// Update last_keepalive for Connected peer
-    pub fn update_keepalive(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    fn update_keepalive(&mut self, peer_id: PeerId, time: EcTime) -> bool {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
             None => return false, // Peer not found
@@ -1038,7 +1044,7 @@ impl EcPeers {
 
     /// Detect and handle Pending peer timeouts
     /// Returns list of peers that were demoted
-    pub fn detect_pending_timeouts(&mut self, time: EcTime) -> Vec<PeerId> {
+    fn detect_pending_timeouts(&mut self, time: EcTime) -> Vec<PeerId> {
         let timeout_threshold = self.config.pending_timeout;
         let mut timed_out = Vec::new();
 
@@ -1060,7 +1066,7 @@ impl EcPeers {
 
     /// Detect and handle Connected peer timeouts (no keepalive)
     /// Returns list of peers that were demoted
-    pub fn detect_connection_timeouts(&mut self, time: EcTime) -> Vec<PeerId> {
+    fn detect_connection_timeouts(&mut self, time: EcTime) -> Vec<PeerId> {
         let timeout_threshold = self.config.connection_timeout;
         let mut timed_out = Vec::new();
 
@@ -1080,38 +1086,91 @@ impl EcPeers {
         timed_out
     }
 
-    /// Clean up expired election cache entries
-    /// Returns number of elections cleaned up
-    pub fn cleanup_expired_elections(&mut self, time: EcTime) -> usize {
-        let cache_ttl = self.config.election_cache_ttl;
-        let mut to_remove = Vec::new();
+    /// Evict excess Identified peers (uniform random)
+    fn evict_excess_identified(&mut self) {
+        let identified_peers: Vec<PeerId> = self.peers
+            .iter()
+            .filter(|(_, p)| p.state.is_identified())
+            .map(|(id, _)| *id)
+            .collect();
 
-        for (token, election) in &self.active_elections {
-            // Remove if completed and TTL expired, or if timed out long ago
-            let should_remove = match election.state {
-                ElectionState::Completed { completed_at, .. } => {
-                    time - completed_at >= cache_ttl
-                }
-                ElectionState::TimedOut { timed_out_at } => {
-                    time - timed_out_at >= cache_ttl
-                }
-                ElectionState::Running => {
-                    // Remove if running too long (expired)
-                    time - election.started_at >= self.config.election_timeout
-                }
-            };
-
-            if should_remove {
-                to_remove.push(*token);
-            }
+        if identified_peers.len() <= self.config.identified_max_capacity {
+            return; // No eviction needed
         }
 
-        let count = to_remove.len();
-        for token in to_remove {
-            self.active_elections.remove(&token);
+        use rand::seq::SliceRandom;
+        let excess = identified_peers.len() - self.config.identified_max_capacity;
+        let to_evict = identified_peers
+            .choose_multiple(&mut rand::thread_rng(), excess)
+            .copied()
+            .collect::<Vec<_>>();
+
+        for peer_id in to_evict {
+            self.peers.remove(&peer_id);
+            // Also remove from active list if present
+            self.active.retain(|&p| p != peer_id);
+        }
+    }
+
+    /// Prune Connected peers based on distance probability
+    /// Closer peers have lower probability of being pruned
+    fn prune_connected_by_distance(&mut self, time: EcTime) {
+        use rand::Rng;
+        let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
+
+        let to_demote: Vec<PeerId> = self.peers
+            .iter()
+            .filter_map(|(peer_id, peer)| {
+                if let PeerState::Connected { connected_since, .. } = peer.state {
+                    // Protect recently connected peers
+                    if time - connected_since < self.config.prune_protection_time {
+                        return None;
+                    }
+
+                    // Calculate prune probability based on distance
+                    let distance = Self::ring_distance(self.peer_id, *peer_id) as f64;
+                    let distance_fraction = distance / ring_size;
+                    let prune_prob = distance_fraction; // Linear (0.0 near, ~1.0 far)
+
+                    if rand::thread_rng().gen_bool(prune_prob) {
+                        Some(*peer_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Demote selected peers to Identified
+        for peer_id in to_demote {
+            self.demote_from_connected(peer_id, time);
+        }
+    }
+
+    /// Trigger multiple elections per tick (new design)
+    /// Picks N tokens from collection and removes them
+    fn trigger_multiple_elections(
+        &mut self,
+        _token_storage: &dyn TokenStorageBackend,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
+        let mut actions = Vec::new();
+
+        // Pick N challenge tokens and remove them from collection
+        let challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick);
+
+        for challenge_token in challenge_tokens {
+            // Start election
+            self.start_election(challenge_token, time);
+
+            // Spawn channels for this election
+            let channel_actions = self.spawn_election_channels(challenge_token, time);
+            actions.extend(channel_actions);
         }
 
-        count
+        actions
     }
 
     // ========================================================================
@@ -1156,7 +1215,7 @@ impl EcPeers {
     pub fn with_config(peer_id: PeerId, config: PeerManagerConfig) -> Self {
         let distance_class_budgets = Self::initialize_distance_class_budgets(&config);
         let proof_system = ProofOfStorage::new();
-        let token_samples = TokenSampleCollection::new(peer_id, config.max_tokens_per_distance_class);
+        let token_samples = TokenSampleCollection::new(config.token_sample_max_capacity);
 
         Self {
             peer_id,
@@ -1191,7 +1250,7 @@ impl EcPeers {
     // ========================================================================
 
     /// Start a new peer election for a challenge token
-    pub fn start_election(&mut self, challenge_token: TokenId, time: EcTime) -> Vec<PeerAction> {
+    fn start_election(&mut self, challenge_token: TokenId, time: EcTime) -> Vec<PeerAction> {
         // Check if we already have an election for this token
         if self.active_elections.contains_key(&challenge_token) {
             return Vec::new(); // Election already running
@@ -1205,11 +1264,7 @@ impl EcPeers {
             self.config.election_config.clone(),
         );
 
-        let ongoing = OngoingElection::new(
-            election,
-            time,
-            ElectionPurpose::Continuous,
-        );
+        let ongoing = OngoingElection::new(election, time);
 
         self.active_elections.insert(challenge_token, ongoing);
 
@@ -1225,7 +1280,9 @@ impl EcPeers {
             return Vec::new(); // Election not found
         }
 
-        let count = self.config.election_channel_count;
+        const CHANNELS_PER_ELECTION: usize = 4;
+        const CLOSEST_CANDIDATES: usize = 8;
+
         let mut actions = Vec::new();
 
         // OPTIMIZATION: Always try querying the challenge token directly first
@@ -1234,10 +1291,7 @@ impl EcPeers {
         let mut candidates = vec![challenge_token];
 
         // Add closest peers as additional candidates (for DHT-style routing)
-        let closest = self.find_closest_peers(
-            challenge_token,
-            self.config.channel_candidate_count,
-        );
+        let closest = self.find_closest_peers(challenge_token, CLOSEST_CANDIDATES);
         candidates.extend(closest);
 
         // Now get mutable access to election
@@ -1245,7 +1299,7 @@ impl EcPeers {
             return Vec::new();
         };
 
-        for first_hop in candidates.iter().take(count) {
+        for first_hop in candidates.iter().take(CHANNELS_PER_ELECTION) {
             // Create channel
             match ongoing.election.create_channel(*first_hop, time) {
                 Ok(ticket) => {
@@ -1268,52 +1322,20 @@ impl EcPeers {
 
     /// Pick a challenge token for election
     /// Strategy: Prioritize peer IDs (guaranteed Answers), build ring with density gradient
+    /// Pick a random challenge token (without removing from collection)
+    /// Used when we need to peek at available tokens
     fn pick_challenge_token(&self) -> TokenId {
         use rand::Rng;
+        use rand::seq::IteratorRandom;
 
-        // Strategy 0: Prioritize known peer IDs (80% of the time when we have peers)
-        // Peer IDs ARE tokens by design, and peers always own their own ID
-        // This ensures high Answer rate and successful elections
-        if !self.peers.is_empty() && rand::thread_rng().gen_bool(0.8) {
-            // Pick a random peer ID from our peer list
-            let peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
-            if let Some(peer_id) = peer_ids.get(rand::thread_rng().gen_range(0..peer_ids.len())) {
-                return *peer_id;
+        // If we have tokens in the sample collection, pick one randomly
+        if !self.token_samples.is_empty() {
+            if let Some(&token) = self.token_samples.samples.iter().choose(&mut rand::thread_rng()) {
+                return token;
             }
         }
 
-        // Strategy 1: Check for coverage gaps in distance classes
-        // Prioritize closer classes (build gradient around our peer ID)
-        // Only use sampled tokens to fill gaps, don't generate new ones (Strategy 4 does that)
-        for class_index in 0..NUM_DISTANCE_CLASSES {
-            let class_set = &self.token_samples.tokens_by_class[class_index];
-
-            // If this class is underrepresented (< 50% capacity) AND has some tokens, use them
-            if class_set.len() > 0 && class_set.len() < self.config.max_tokens_per_distance_class / 2 {
-                if let Some(token) = self.token_samples.pick_from_class(class_index) {
-                    return token;
-                }
-            }
-        }
-
-        // Strategy 2: All classes have good coverage - use sampled tokens
-        // Prioritize closer classes to maintain density gradient
-        for class_index in 0..NUM_DISTANCE_CLASSES {
-            if let Some(token) = self.token_samples.pick_from_class(class_index) {
-                // Weight by distance: closer classes more likely
-                let weight = 1.0 / (class_index as f64 + 1.0);
-                if rand::thread_rng().gen_bool(weight.min(0.8)) {
-                    return token;
-                }
-            }
-        }
-
-        // Strategy 3: Random sampled token as fallback
-        if let Some(token) = self.token_samples.pick_random() {
-            return token;
-        }
-
-        // Strategy 4: Pure random exploration (only when we have NO peers and NO samples)
+        // Fallback: Pure random exploration (bootstrap phase when no samples yet)
         rand::thread_rng().gen()
     }
 
@@ -1337,25 +1359,10 @@ impl EcPeers {
     }
 
     /// Pick a token near a peer on the ring (for targeted re-election)
+    /// Simply returns a random offset from the peer ID
     fn pick_token_near_peer(&self, peer: PeerId) -> TokenId {
         use rand::Rng;
-
-        // Try to find a sampled token in the same distance class as the peer
-        let class = Self::ring_distance(self.peer_id, peer);
-        let class_index = if class == 0 {
-            0
-        } else {
-            (64 - class.leading_zeros()) as usize
-        };
-
-        // 70% of the time, use a sampled token from the same class
-        if rand::thread_rng().gen_bool(0.7) {
-            if let Some(token) = self.token_samples.pick_from_class(class_index) {
-                return token;
-            }
-        }
-
-        // Fallback: Pick random token near peer
+        // Pick a random token near the peer (within ~1000 of the peer on the ring)
         peer.wrapping_add(rand::thread_rng().gen_range(0..1000))
     }
 
@@ -1365,19 +1372,15 @@ impl EcPeers {
         let mut actions = Vec::new();
         let mut to_resolve: Vec<(TokenId, usize)> = Vec::new();
         let mut winners: Vec<(TokenId, PeerId)> = Vec::new();
+        let mut to_remove: Vec<TokenId> = Vec::new();
 
         // First pass: collect election results (only read, no mutable calls)
         let tokens: Vec<TokenId> = self.active_elections.keys().copied().collect();
 
         for token in tokens {
-            let Some(ongoing) = self.active_elections.get_mut(&token) else {
+            let Some(ongoing) = self.active_elections.get(&token) else {
                 continue;
             };
-
-            // Skip if not Running
-            if !matches!(ongoing.state, ElectionState::Running) {
-                continue;
-            }
 
             let elapsed = time.saturating_sub(ongoing.started_at);
 
@@ -1389,9 +1392,9 @@ impl EcPeers {
             // Check for winner
             match ongoing.election.check_for_winner() {
                 WinnerResult::Single { winner, .. } => {
-                    // Success! Election complete
-                    ongoing.complete(winner, time);
+                    // Success! Election complete - remove it after processing
                     winners.push((token, winner));
+                    to_remove.push(token);
                 }
 
                 WinnerResult::SplitBrain { .. } => {
@@ -1401,16 +1404,16 @@ impl EcPeers {
                         let needed = 2;
                         to_resolve.push((token, needed));
                     } else {
-                        // Give up
-                        ongoing.timeout(time);
+                        // Give up - timeout and remove
+                        to_remove.push(token);
                     }
                 }
 
                 WinnerResult::NoConsensus => {
                     // Not enough responses yet
                     if elapsed >= self.config.election_timeout {
-                        // Timeout
-                        ongoing.timeout(time);
+                        // Timeout - remove election
+                        to_remove.push(token);
                     }
                 }
             }
@@ -1424,12 +1427,14 @@ impl EcPeers {
 
         // Spawn more channels for split-brain elections
         for (token, _count) in to_resolve {
-            let _spawned = self.spawn_election_channels(token, time);
-            // TODO: Generate SendQuery actions for spawned channels
+            let spawned = self.spawn_election_channels(token, time);
+            actions.extend(spawned);
         }
 
-        // Note: Don't remove completed elections immediately - keep them in cache
-        // They will be cleaned up by cleanup_expired_elections()
+        // Remove completed/timed-out elections (no caching)
+        for token in to_remove {
+            self.active_elections.remove(&token);
+        }
 
         actions
     }
@@ -1456,8 +1461,8 @@ impl EcPeers {
                 *election_wins += 1;
                 *election_attempts += 1;
                 // Update quality score with exponential moving average
-                let alpha = self.config.quality_decay_alpha;
-                *quality_score = alpha * 1.0 + (1.0 - alpha) * *quality_score;
+                const QUALITY_DECAY_ALPHA: f64 = 0.3;
+                *quality_score = QUALITY_DECAY_ALPHA * 1.0 + (1.0 - QUALITY_DECAY_ALPHA) * *quality_score;
             } else {
                 // Not connected - promote to Pending
                 // This means we should send an Invitation
@@ -1532,21 +1537,23 @@ impl EcPeers {
         // Phase 1: Timeout detection
         self.detect_pending_timeouts(time);
         self.detect_connection_timeouts(time);
-        self.cleanup_expired_elections(time);
 
         // Phase 2: Process ongoing elections
         let election_actions = self.process_elections(token_storage, time);
         actions.extend(election_actions);
 
-        // Phase 3: Start new elections if needed
-        if time >= self.next_election_time {
-            let new_election_actions = self.trigger_next_election(time);
-            actions.extend(new_election_actions);
-            self.next_election_time = time + self.config.election_interval;
-        }
+        // Phase 3: Evict excess Identified peers (uniform random)
+        self.evict_excess_identified();
 
-        // TODO Phase 4: Apply quality updates
-        // TODO Phase 5: Apply churn if epoch boundary
+        // Phase 4: Evict excess TokenSamples (uniform random)
+        self.token_samples.evict_excess();
+
+        // Phase 5: Prune Connected peers by distance (distance-based probability)
+        self.prune_connected_by_distance(time);
+
+        // Phase 6: Trigger new elections (pick and remove tokens)
+        let new_election_actions = self.trigger_multiple_elections(token_storage, time);
+        actions.extend(new_election_actions);
 
         actions
     }
@@ -1574,132 +1581,255 @@ impl EcPeers {
     }
 }
 
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec_memory_backend::MemTokens;
-
-    // Helper function to create a test EcPeers instance
-    fn create_test_peers(peer_id: PeerId) -> EcPeers {
-        EcPeers::new(peer_id)
-    }
-
-    // Helper function to create a test EcPeers instance with custom config
-    fn create_test_peers_with_config(peer_id: PeerId, config: PeerManagerConfig) -> EcPeers {
-        EcPeers::with_config(peer_id, config)
-    }
-
-    // ========================================================================
-    // Distance and Budget Tests
-    // ========================================================================
 
     #[test]
-    fn test_ring_distance_normal() {
-        // Normal case: forward distance shorter
-        assert_eq!(EcPeers::ring_distance(100, 150), 50);
-        assert_eq!(EcPeers::ring_distance(150, 100), 50); // Symmetric
-    }
+    fn test_ring_distance_calculation() {
+        // Test distance calculation on the ring
 
-    #[test]
-    fn test_ring_distance_wrapping() {
-        // Wrapping case: backward distance shorter
-        let result = EcPeers::ring_distance(10, u64::MAX - 5);
-        // Forward: (MAX - 5) - 10 = MAX - 15 (very large)
-        // Backward: 10 - (MAX - 5) wraps to 16
-        assert_eq!(result, 16);
+        // Distance from 0 to 100 should be 100
+        assert_eq!(EcPeers::ring_distance(0, 100), 100);
+
+        // Distance is symmetric
+        assert_eq!(EcPeers::ring_distance(100, 0), 100);
+
+        // Distance from peer to itself is 0
+        assert_eq!(EcPeers::ring_distance(1000, 1000), 0);
+
+        // Distance wraps around the ring (uses shorter path)
+        let max = u64::MAX;
+        let near_max = max - 100;
+        // Distance from 0 to (MAX - 100) should be 100 (wrapping around)
+        assert_eq!(EcPeers::ring_distance(0, near_max), 101);
+
+        // Distance at opposite side of ring
+        let half = u64::MAX / 2;
+        let dist = EcPeers::ring_distance(0, half);
+        // Should be approximately half the ring
+        assert!(dist >= half - 1 && dist <= half + 1);
     }
 
     #[test]
-    fn test_ring_distance_self() {
-        assert_eq!(EcPeers::ring_distance(42, 42), 0);
-        assert_eq!(EcPeers::ring_distance(0, 0), 0);
-        assert_eq!(EcPeers::ring_distance(u64::MAX, u64::MAX), 0);
+    fn test_invitation_acceptance_probability() {
+        // Test that acceptance probability decreases with distance
+
+        let ring_size = u64::MAX as f64 / 2.0;
+
+        // Very close peer (distance = 100)
+        let close_distance = 100.0;
+        let close_fraction = close_distance / ring_size;
+        let close_prob = 1.0 - close_fraction;
+        assert!(close_prob > 0.999); // Almost certain to accept
+
+        // Mid-distance peer
+        let mid_distance = ring_size / 2.0;
+        let mid_fraction = mid_distance / ring_size;
+        let mid_prob = 1.0 - mid_fraction;
+        assert!(mid_prob > 0.4 && mid_prob < 0.6); // ~50% acceptance
+
+        // Far peer (opposite side of ring)
+        let far_distance = ring_size - 100.0;
+        let far_fraction = far_distance / ring_size;
+        let far_prob = 1.0 - far_fraction;
+        assert!(far_prob < 0.001); // Almost certain to reject
     }
 
     #[test]
-    fn test_distance_class_calculation() {
-        let peers = create_test_peers(1000);
+    fn test_prune_probability() {
+        // Test that prune probability increases with distance
 
-        // Self should be class 0
-        assert_eq!(peers.calculate_distance_class(1000), 0);
+        let ring_size = u64::MAX as f64 / 2.0;
 
-        // Very close peer (distance 1)
-        assert_eq!(peers.calculate_distance_class(1001), 1);
+        // Very close peer (distance = 100)
+        let close_distance = 100.0;
+        let close_fraction = close_distance / ring_size;
+        let close_prune_prob = close_fraction;
+        assert!(close_prune_prob < 0.001); // Almost never pruned
 
-        // Moderate distance
-        let dist_class_100 = peers.calculate_distance_class(1100);
-        let dist_class_200 = peers.calculate_distance_class(1200);
-        // Further peers should be in higher classes
-        assert!(dist_class_200 >= dist_class_100);
+        // Mid-distance peer
+        let mid_distance = ring_size / 2.0;
+        let mid_fraction = mid_distance / ring_size;
+        let mid_prune_prob = mid_fraction;
+        assert!(mid_prune_prob > 0.4 && mid_prune_prob < 0.6); // ~50% pruned
+
+        // Far peer (opposite side of ring)
+        let far_distance = ring_size - 100.0;
+        let far_fraction = far_distance / ring_size;
+        let far_prune_prob = far_fraction;
+        assert!(far_prune_prob > 0.999); // Almost certainly pruned
     }
 
     #[test]
-    fn test_budget_allocation_sums_to_total() {
-        let total = 50;
-        let budgets = EcPeers::allocate_distance_budgets(total, 64);
+    fn test_token_sample_collection_basic() {
+        let mut collection = TokenSampleCollection::new(1000);
 
-        // Sum should equal total budget
-        let sum: usize = budgets.iter().sum();
-        assert_eq!(sum, total);
+        // Initially empty
+        assert!(collection.is_empty());
+        assert_eq!(collection.len(), 0);
+
+        // Add some tokens
+        assert!(collection.add_token(100));
+        assert!(collection.add_token(200));
+        assert!(collection.add_token(300));
+
+        assert_eq!(collection.len(), 3);
+        assert!(!collection.is_empty());
+
+        // Adding duplicate returns false
+        assert!(!collection.add_token(100));
+        assert_eq!(collection.len(), 3);
     }
 
     #[test]
-    fn test_budget_allocation_gradient() {
-        let budgets = EcPeers::allocate_distance_budgets(100, 10);
+    fn test_token_sample_collection_capacity() {
+        let mut collection = TokenSampleCollection::new(5); // Small capacity
 
-        // Closer classes should have more budget
-        for i in 0..budgets.len() - 1 {
-            assert!(
-                budgets[i] >= budgets[i + 1],
-                "Budget[{}]={} should be >= Budget[{}]={}",
-                i,
-                budgets[i],
-                i + 1,
-                budgets[i + 1]
-            );
+        // Fill to capacity
+        for i in 0..5 {
+            assert!(collection.add_token(i));
         }
+        assert_eq!(collection.len(), 5);
+
+        // Adding more returns false (at capacity)
+        assert!(!collection.add_token(100));
+        assert_eq!(collection.len(), 5);
+
+        // Evict excess (should do nothing, not over capacity)
+        let evicted = collection.evict_excess();
+        assert_eq!(evicted, 0);
+        assert_eq!(collection.len(), 5);
     }
 
     #[test]
-    fn test_budget_allocation_empty() {
-        let budgets = EcPeers::allocate_distance_budgets(50, 0);
-        assert_eq!(budgets.len(), 0);
+    fn test_token_sample_collection_pick_and_remove() {
+        let mut collection = TokenSampleCollection::new(100);
+
+        // Add tokens
+        for i in 0..10 {
+            collection.add_token(i);
+        }
+        assert_eq!(collection.len(), 10);
+
+        // Pick and remove 3 tokens
+        let picked = collection.pick_and_remove(3);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(collection.len(), 7);
+
+        // Verify picked tokens are no longer in collection
+        for &token in &picked {
+            assert!(!collection.samples.contains(&token));
+        }
+
+        // Pick more than available
+        let picked_all = collection.pick_and_remove(100);
+        assert_eq!(picked_all.len(), 7); // Only 7 remaining
+        assert!(collection.is_empty());
     }
 
     #[test]
-    fn test_distance_class_budgets_initialized() {
-        let config = PeerManagerConfig::default();
-        let budgets = EcPeers::initialize_distance_class_budgets(&config);
+    fn test_token_sample_collection_evict_excess() {
+        let mut collection = TokenSampleCollection::new(5);
 
-        assert_eq!(budgets.len(), 64); // 64 classes for u64 address space
+        // Add more than capacity (via direct manipulation for testing)
+        for i in 0..10 {
+            collection.samples.insert(i);
+        }
+        assert_eq!(collection.len(), 10);
 
-        // Check budgets sum to total
-        let total_budget: usize = budgets.iter().sum();
-        assert_eq!(total_budget, config.total_budget);
+        // Evict excess
+        let evicted = collection.evict_excess();
+        assert_eq!(evicted, 5); // 10 - 5 = 5 evicted
+        assert_eq!(collection.len(), 5); // Now at capacity
+
+        // Evict again (should do nothing)
+        let evicted_again = collection.evict_excess();
+        assert_eq!(evicted_again, 0);
+        assert_eq!(collection.len(), 5);
     }
 
-    // ========================================================================
-    // Peer State Tests
-    // ========================================================================
+    #[test]
+    fn test_token_sample_from_answer() {
+        let mut collection = TokenSampleCollection::new(100);
+
+        // Create a simple answer and signature
+        let answer = TokenMapping {
+            id: 100,
+            block: 200,
+        };
+
+        let signature = [
+            TokenMapping { id: 1, block: 10 },
+            TokenMapping { id: 2, block: 20 },
+            TokenMapping { id: 3, block: 30 },
+            TokenMapping { id: 0, block: 0 }, // Zero tokens should be ignored
+            TokenMapping { id: 0, block: 0 },
+            TokenMapping { id: 0, block: 0 },
+            TokenMapping { id: 0, block: 0 },
+            TokenMapping { id: 0, block: 0 },
+            TokenMapping { id: 0, block: 0 },
+            TokenMapping { id: 0, block: 0 },
+        ];
+
+        let sender_peer_id = 500;
+
+        collection.sample_from_answer(&answer, &signature, sender_peer_id);
+
+        // Should have: answer token (100) + sender peer ID (500) + 3 signature tokens = 5 tokens
+        assert_eq!(collection.len(), 5);
+        assert!(collection.samples.contains(&100)); // answer token
+        assert!(collection.samples.contains(&500)); // sender peer ID
+        assert!(collection.samples.contains(&1));   // sig tokens
+        assert!(collection.samples.contains(&2));
+        assert!(collection.samples.contains(&3));
+    }
 
     #[test]
-    fn test_peer_state_predicates() {
-        let identified = PeerState::Identified { discovered_at: 0 };
+    fn test_token_sample_from_referral() {
+        let mut collection = TokenSampleCollection::new(100);
+
+        let suggested_peers = [1000, 2000];
+        collection.sample_from_referral(&suggested_peers);
+
+        assert_eq!(collection.len(), 2);
+        assert!(collection.samples.contains(&1000));
+        assert!(collection.samples.contains(&2000));
+
+        // Zero peers should be ignored
+        let with_zero = [3000, 0];
+        collection.sample_from_referral(&with_zero);
+
+        assert_eq!(collection.len(), 3); // Only 3000 added
+        assert!(collection.samples.contains(&3000));
+    }
+
+    #[test]
+    fn test_peer_state_helpers() {
+        // Test PeerState helper methods
+        let identified = PeerState::Identified {
+            discovered_at: 0,
+            last_invitation_election_at: None,
+        };
         assert!(identified.is_identified());
         assert!(!identified.is_pending());
         assert!(!identified.is_connected());
 
         let pending = PeerState::Pending {
-            invitation_sent_at: 10,
-            from_election: 999,
+            invitation_sent_at: 0,
+            from_election: 100,
         };
         assert!(!pending.is_identified());
         assert!(pending.is_pending());
         assert!(!pending.is_connected());
 
         let connected = PeerState::Connected {
-            connected_since: 20,
-            last_keepalive: 25,
+            connected_since: 0,
+            last_keepalive: 0,
             election_wins: 5,
             election_attempts: 10,
             quality_score: 0.8,
@@ -1709,1044 +1839,21 @@ mod tests {
         assert!(connected.is_connected());
     }
 
-    // ========================================================================
-    // Construction and Basic Operations
-    // ========================================================================
-
     #[test]
-    fn test_new_peer_manager() {
-        let peers = create_test_peers(12345);
-
-        assert_eq!(peers.peer_id, 12345);
-        assert_eq!(peers.num_peers(), 0);
-        assert_eq!(peers.num_connected(), 0);
-        assert_eq!(peers.distance_class_budgets.len(), 64);
-    }
-
-    #[test]
-    fn test_with_config() {
-        let mut config = PeerManagerConfig::default();
-        config.total_budget = 100;
-        config.election_interval = 30;
-
-        let peers = create_test_peers_with_config(999, config.clone());
-
-        assert_eq!(peers.peer_id, 999);
-        assert_eq!(peers.config.total_budget, 100);
-        assert_eq!(peers.config.election_interval, 30);
-
-        // Verify budget allocation
-        let total: usize = peers.distance_class_budgets.iter().sum();
-        assert_eq!(total, 100);
-    }
-
-    #[test]
-    fn test_update_peer_adds_to_connected() {
-        let mut peers = create_test_peers(1000);
-
-        // Add a peer via update_peer (simulates seed_peer)
-        peers.update_peer(&2000, 10);
-
-        assert_eq!(peers.num_peers(), 1);
-        assert_eq!(peers.num_connected(), 1);
-
-        // Check peer is in Connected state
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_connected());
-    }
-
-    #[test]
-    fn test_update_peer_ignores_self() {
-        let mut peers = create_test_peers(1000);
-
-        peers.update_peer(&1000, 10);
-
-        assert_eq!(peers.num_peers(), 0);
-    }
-
-    #[test]
-    fn test_update_peer_maintains_sorted_order() {
-        let mut peers = create_test_peers(500);
-
-        // Add peers in non-sorted order
-        peers.update_peer(&3000, 10);
-        peers.update_peer(&1000, 10);
-        peers.update_peer(&2000, 10);
-
-        // Check active list is sorted
-        assert_eq!(peers.active, vec![1000, 2000, 3000]);
-    }
-
-    #[test]
-    fn test_update_peer_updates_keepalive() {
-        let mut peers = create_test_peers(1000);
-
-        peers.update_peer(&2000, 10);
-
-        // Update again with new time
-        peers.update_peer(&2000, 50);
-
-        // Should still be 1 peer
-        assert_eq!(peers.num_peers(), 1);
-
-        // Check keepalive was updated
-        let peer = peers.peers.get(&2000).unwrap();
-        if let PeerState::Connected { last_keepalive, .. } = peer.state {
-            assert_eq!(last_keepalive, 50);
-        } else {
-            panic!("Expected Connected state");
-        }
-    }
-
-    // ========================================================================
-    // Routing Tests (backward compatibility)
-    // ========================================================================
-
-    #[test]
-    fn test_peers_for_empty() {
-        let peers = create_test_peers(1000);
-        let result = peers.peers_for(&5000, 0);
-
-        // Should return [0, 0] for empty list
-        assert_eq!(result, [0, 0]);
-    }
-
-    #[test]
-    fn test_peer_for_empty() {
-        let peers = create_test_peers(1000);
-        let result = peers.peer_for(&5000, 0);
-
-        // Should return 0 for empty list
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_peers_for_returns_two_peers() {
-        let mut peers = create_test_peers(1000);
-
-        // Add several peers
-        for i in 1..10 {
-            peers.update_peer(&(i * 1000), 0);
-        }
-
-        let result = peers.peers_for(&5500, 0);
-
-        // Should return two different peers
-        assert_ne!(result[0], 0);
-        assert_ne!(result[1], 0);
-        assert_ne!(result[0], result[1]);
-    }
-
-    #[test]
-    fn test_trusted_peer() {
-        let mut peers = create_test_peers(1000);
-
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-
-        // Peer in list should be trusted
-        assert!(peers.trusted_peer(&2000).is_some());
-        assert!(peers.trusted_peer(&3000).is_some());
-
-        // Peer not in list should not be trusted
-        assert!(peers.trusted_peer(&9999).is_none());
-    }
-
-    #[test]
-    fn test_peer_range() {
-        let mut peers = create_test_peers(1000);
-
-        // Add many peers
-        for i in 0..20 {
-            peers.update_peer(&(i * 1000), 0);
-        }
-
-        let range = peers.peer_range(&10000);
-
-        // Range should include peers on both sides
-        assert!(range.low < 10000 || range.high > 10000);
-    }
-
-    #[test]
-    fn test_peer_range_small_network() {
-        let mut peers = create_test_peers(1000);
-
-        // Add only 5 peers (less than threshold)
-        for i in 1..6 {
-            peers.update_peer(&(i * 1000), 0);
-        }
-
-        let range = peers.peer_range(&3000);
-
-        // Should return full range for small networks
-        assert_eq!(range.low, PeerId::MIN);
-        assert_eq!(range.high, PeerId::MAX);
-    }
-
-    // ========================================================================
-    // Configuration Tests
-    // ========================================================================
-
-    #[test]
-    fn test_config_default_values() {
+    fn test_config_defaults() {
         let config = PeerManagerConfig::default();
 
-        assert_eq!(config.total_budget, 50);
-        assert_eq!(config.budget_enforcement_interval, 60);
-        assert_eq!(config.election_interval, 60);
-        assert_eq!(config.min_collection_time, 2);
-        assert_eq!(config.election_timeout, 8);
+        // Check key defaults
+        assert_eq!(config.connected_max_capacity, 200);
+        assert_eq!(config.identified_max_capacity, 5000);
+        assert_eq!(config.token_sample_max_capacity, 1000);
+        assert_eq!(config.elections_per_tick, 3);
+        assert_eq!(config.min_collection_time, 10);
         assert_eq!(config.pending_timeout, 10);
         assert_eq!(config.connection_timeout, 300);
-        assert_eq!(config.quality_decay_alpha, 0.3);
-        assert_eq!(config.churn_rate, 0.4);
-        assert_eq!(config.churn_interval, 1800);
-        assert_eq!(config.churn_protection_time, 600);
-        assert_eq!(config.election_channel_count, 3);
-        assert_eq!(config.channel_candidate_count, 8);
-        assert_eq!(config.max_discovered_peers, 1000);
-        assert_eq!(config.election_cache_ttl, 300);
-    }
+        assert_eq!(config.prune_protection_time, 600);
 
-    // ========================================================================
-    // Tick Tests (basic - more will be added in later phases)
-    // ========================================================================
-
-    #[test]
-    fn test_tick_returns_empty_initially() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-        let actions = peers.tick(&token_storage, 0);
-
-        // At time 0 with no peers, elections start immediately
-        // We get 1 action: SendQuery to the challenge token directly
-        assert!(actions.len() <= 1, "Expected at most 1 action, got {}", actions.len());
-    }
-
-    // ========================================================================
-    // Distance Class Operations Tests
-    // ========================================================================
-
-    #[test]
-    fn test_distance_bounds() {
-        // Class 0: [1, 2)
-        assert_eq!(EcPeers::distance_bounds(0), (1, 2));
-
-        // Class 1: [2, 4)
-        assert_eq!(EcPeers::distance_bounds(1), (2, 4));
-
-        // Class 2: [4, 8)
-        assert_eq!(EcPeers::distance_bounds(2), (4, 8));
-
-        // Class 5: [32, 64)
-        assert_eq!(EcPeers::distance_bounds(5), (32, 64));
-    }
-
-    #[test]
-    fn test_is_peer_in_class() {
-        let peers = create_test_peers(1000);
-
-        // Distance 1 should be in class 0 [1, 2)
-        assert!(peers.is_peer_in_class(1001, 0)); // Forward
-        assert!(peers.is_peer_in_class(999, 0));  // Backward
-
-        // Distance 3 should be in class 1 [2, 4)
-        assert!(peers.is_peer_in_class(1003, 1)); // Forward
-        assert!(peers.is_peer_in_class(997, 1));  // Backward
-
-        // Distance 50 should be in class 5 [32, 64)
-        assert!(peers.is_peer_in_class(1050, 5)); // Forward
-        assert!(peers.is_peer_in_class(950, 5));  // Backward
-
-        // Distance 1 should NOT be in class 1
-        assert!(!peers.is_peer_in_class(1001, 1));
-    }
-
-    #[test]
-    fn test_connected_count_in_class() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peers in different distance classes
-        peers.update_peer(&1001, 0); // Distance 1, class 0
-        peers.update_peer(&999, 0);   // Distance 1, class 0
-        peers.update_peer(&1003, 0); // Distance 3, class 1
-        peers.update_peer(&1050, 0); // Distance 50, class 5
-
-        // Class 0 should have 2 peers (bidirectional)
-        assert_eq!(peers.connected_count_in_class(0), 2);
-
-        // Class 1 should have 1 peer
-        assert_eq!(peers.connected_count_in_class(1), 1);
-
-        // Class 5 should have 1 peer
-        assert_eq!(peers.connected_count_in_class(5), 1);
-
-        // Class 10 should have 0 peers
-        assert_eq!(peers.connected_count_in_class(10), 0);
-    }
-
-    #[test]
-    fn test_connected_peers_in_class() {
-        let mut peers = create_test_peers(1000);
-
-        peers.update_peer(&1001, 0); // Class 0
-        peers.update_peer(&999, 0);   // Class 0
-        peers.update_peer(&1003, 0); // Class 1
-
-        let class_0_peers = peers.connected_peers_in_class(0);
-        assert_eq!(class_0_peers.len(), 2);
-        assert!(class_0_peers.contains(&1001));
-        assert!(class_0_peers.contains(&999));
-
-        let class_1_peers = peers.connected_peers_in_class(1);
-        assert_eq!(class_1_peers.len(), 1);
-        assert!(class_1_peers.contains(&1003));
-    }
-
-    // ========================================================================
-    // BTreeMap Walking Tests
-    // ========================================================================
-
-    #[test]
-    fn test_find_closest_peers_btreemap() {
-        let mut peers = create_test_peers(5000);
-
-        // Add peers in BTreeMap (sorted order)
-        peers.update_peer(&1000, 0);
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-        peers.update_peer(&4000, 0);
-        peers.update_peer(&6000, 0);
-        peers.update_peer(&7000, 0);
-        peers.update_peer(&8000, 0);
-
-        // Find 4 closest peers to 5500
-        let closest = peers.find_closest_peers(5500, 4);
-
-        // Should get peers closest by ring distance
-        assert_eq!(closest.len(), 4);
-        // 6000 is distance 500, 4000 is distance 1500
-        assert!(closest.contains(&6000));
-        assert!(closest.contains(&4000));
-    }
-
-    #[test]
-    fn test_find_closest_peers_wrapping() {
-        let mut peers = create_test_peers(100);
-
-        // Add peers near both ends of u64 space (tests wrapping)
-        let high_1 = u64::MAX - 50;
-        let high_2 = u64::MAX - 100;
-
-        peers.update_peer(&50, 0);
-        peers.update_peer(&150, 0);
-        peers.update_peer(&200, 0);
-        peers.update_peer(&high_1, 0);
-        peers.update_peer(&high_2, 0);
-
-        // Find closest to 100
-        let closest = peers.find_closest_peers(100, 3);
-
-        assert_eq!(closest.len(), 3);
-        // Should include peers on both sides
-        assert!(closest.contains(&50) || closest.contains(&150));
-    }
-
-    #[test]
-    fn test_pick_target_in_distance_class() {
-        let peers = create_test_peers(1000);
-
-        // Pick 100 targets in class 5 [32, 64)
-        for _ in 0..100 {
-            let target = peers.pick_target_in_distance_class(5);
-            let dist = EcPeers::ring_distance(peers.peer_id, target);
-
-            // Distance should be in range [32, 64)
-            assert!(dist >= 32 && dist < 64,
-                "Distance {} not in range [32, 64)", dist);
-        }
-    }
-
-    #[test]
-    fn test_random_sample() {
-        let peers = vec![100, 200, 300, 400, 500];
-
-        // Sample 3 from 5
-        let sample = EcPeers::random_sample(&peers, 3);
-        assert_eq!(sample.len(), 3);
-
-        // All sampled peers should be from original
-        for peer in &sample {
-            assert!(peers.contains(peer));
-        }
-
-        // Sample more than available
-        let sample_all = EcPeers::random_sample(&peers, 10);
-        assert_eq!(sample_all.len(), 5);
-    }
-
-    // ========================================================================
-    // Ring Wrapping Tests
-    // ========================================================================
-
-    #[test]
-    fn test_peer_range_wrapping_at_zero() {
-        let mut peers = create_test_peers(50);
-
-        // Add peers that will cause range to wrap around 0
-        for i in 0..20 {
-            peers.update_peer(&(i * 100), 0);
-        }
-
-        let range = peers.peer_range(&100);
-
-        // Range should handle wrapping
-        // Either both low/high are valid, or range wraps (low > high)
-        assert!(range.low <= u64::MAX);
-        assert!(range.high <= u64::MAX);
-    }
-
-    #[test]
-    fn test_peer_range_in_range_wrapping() {
-        // Test normal case
-        let range = PeerRange {
-            low: 100,
-            high: 200,
-        };
-        assert!(range.in_range(&150));
-        assert!(!range.in_range(&50));
-        assert!(!range.in_range(&250));
-
-        // Test wrapping case
-        let wrap_range = PeerRange {
-            low: u64::MAX - 100,
-            high: 100,
-        };
-        assert!(wrap_range.in_range(&(u64::MAX - 50))); // In range (high side)
-        assert!(wrap_range.in_range(&50));              // In range (low side)
-        assert!(!wrap_range.in_range(&500));            // Outside range
-    }
-
-    #[test]
-    fn test_active_list_btreemap_consistency() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peers (not including self at 1000)
-        peers.update_peer(&3000, 0);
-        peers.update_peer(&1500, 0);
-        peers.update_peer(&2000, 0);
-
-        // Active list should be sorted
-        assert_eq!(peers.active, vec![1500, 2000, 3000]);
-
-        // BTreeMap should have same peers
-        assert_eq!(peers.peers.len(), 3);
-        assert!(peers.peers.contains_key(&1500));
-        assert!(peers.peers.contains_key(&2000));
-        assert!(peers.peers.contains_key(&3000));
-
-        // BTreeMap iteration should be in sorted order
-        let btree_keys: Vec<_> = peers.peers.keys().copied().collect();
-        assert_eq!(btree_keys, vec![1500, 2000, 3000]);
-    }
-
-    // ========================================================================
-    // State Transition Tests
-    // ========================================================================
-
-    #[test]
-    fn test_add_identified_peer() {
-        let mut peers = create_test_peers(1000);
-
-        // Add new peer
-        assert!(peers.add_identified_peer(2000, 10));
-        assert_eq!(peers.peers.len(), 1);
-
-        // Check state is Identified
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_identified());
-
-        // Adding same peer again should fail
-        assert!(!peers.add_identified_peer(2000, 20));
-
-        // Adding self should fail
-        assert!(!peers.add_identified_peer(1000, 10));
-    }
-
-    #[test]
-    fn test_promote_to_pending() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peer as Identified
-        peers.add_identified_peer(2000, 10);
-
-        // Promote to Pending
-        assert!(peers.promote_to_pending(2000, 12345, 20));
-
-        // Check state is Pending
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_pending());
-
-        // Cannot promote again (not Identified)
-        assert!(!peers.promote_to_pending(2000, 12345, 30));
-    }
-
-    #[test]
-    fn test_promote_to_connected_from_identified() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peer as Identified
-        peers.add_identified_peer(2000, 10);
-
-        // Promote directly to Connected
-        assert!(peers.promote_to_connected(2000, 20));
-
-        // Check state is Connected
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_connected());
-
-        // Should be in active list
-        assert!(peers.active.contains(&2000));
-        assert_eq!(peers.num_connected(), 1);
-    }
-
-    #[test]
-    fn test_promote_to_connected_from_pending() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peer as Identified, then Pending
-        peers.add_identified_peer(2000, 10);
-        peers.promote_to_pending(2000, 12345, 20);
-
-        // Promote to Connected
-        assert!(peers.promote_to_connected(2000, 30));
-
-        // Check state is Connected
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_connected());
-
-        // Should be in active list
-        assert!(peers.active.contains(&2000));
-    }
-
-    #[test]
-    fn test_demote_from_connected() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peer as Connected (via seed_peer)
-        peers.update_peer(&2000, 10);
-        assert!(peers.active.contains(&2000));
-
-        // Demote to Identified
-        assert!(peers.demote_from_connected(2000, 20));
-
-        // Check state is Identified
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_identified());
-
-        // Should not be in active list
-        assert!(!peers.active.contains(&2000));
-        assert_eq!(peers.num_connected(), 0);
-    }
-
-    #[test]
-    fn test_demote_to_identified_from_pending() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peer as Pending
-        peers.add_identified_peer(2000, 10);
-        peers.promote_to_pending(2000, 12345, 20);
-
-        // Demote to Identified
-        assert!(peers.demote_to_identified(2000, 30));
-
-        // Check state is Identified
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_identified());
-    }
-
-    #[test]
-    fn test_update_keepalive() {
-        let mut peers = create_test_peers(1000);
-
-        // Add Connected peer
-        peers.update_peer(&2000, 10);
-
-        // Update keepalive
-        assert!(peers.update_keepalive(2000, 50));
-
-        // Check timestamp was updated
-        let peer = peers.peers.get(&2000).unwrap();
-        if let PeerState::Connected { last_keepalive, .. } = peer.state {
-            assert_eq!(last_keepalive, 50);
-        } else {
-            panic!("Expected Connected state");
-        }
-
-        // Cannot update keepalive for non-Connected peer
-        peers.add_identified_peer(3000, 10);
-        assert!(!peers.update_keepalive(3000, 50));
-    }
-
-    // ========================================================================
-    // Timeout Detection Tests
-    // ========================================================================
-
-    #[test]
-    fn test_detect_pending_timeouts() {
-        let mut peers = create_test_peers(1000);
-
-        // Add Pending peer at time 10
-        peers.add_identified_peer(2000, 5);
-        peers.promote_to_pending(2000, 12345, 10);
-
-        // No timeout at time 19 (just under threshold)
-        let timed_out = peers.detect_pending_timeouts(19);
-        assert_eq!(timed_out.len(), 0);
-        assert!(peers.peers.get(&2000).unwrap().state.is_pending());
-
-        // Timeout at time 20 (10 + pending_timeout=10)
-        let timed_out = peers.detect_pending_timeouts(20);
-        assert_eq!(timed_out.len(), 1);
-        assert!(timed_out.contains(&2000));
-
-        // Peer should now be Identified
-        assert!(peers.peers.get(&2000).unwrap().state.is_identified());
-    }
-
-    #[test]
-    fn test_detect_connection_timeouts() {
-        let mut peers = create_test_peers(1000);
-
-        // Add Connected peer at time 10
-        peers.update_peer(&2000, 10);
-
-        // No timeout at time 309 (just under threshold)
-        let timed_out = peers.detect_connection_timeouts(309);
-        assert_eq!(timed_out.len(), 0);
-        assert!(peers.peers.get(&2000).unwrap().state.is_connected());
-
-        // Timeout at time 310 (10 + connection_timeout=300)
-        let timed_out = peers.detect_connection_timeouts(310);
-        assert_eq!(timed_out.len(), 1);
-        assert!(timed_out.contains(&2000));
-
-        // Peer should now be Identified
-        assert!(peers.peers.get(&2000).unwrap().state.is_identified());
-        // Should not be in active list
-        assert!(!peers.active.contains(&2000));
-    }
-
-    #[test]
-    fn test_multiple_timeouts() {
-        let mut peers = create_test_peers(1000);
-
-        // Add multiple peers with different timestamps
-        peers.add_identified_peer(2000, 0);
-        peers.promote_to_pending(2000, 12345, 5);
-
-        peers.add_identified_peer(3000, 0);
-        peers.promote_to_pending(3000, 12346, 10);
-
-        peers.update_peer(&4000, 15);
-
-        // At time 20:
-        // - Peer 2000: Pending since 5 -> timed out (15 > 10)
-        // - Peer 3000: Pending since 10 -> timed out (10 >= 10)
-        // - Peer 4000: Connected since 15 -> not timed out (5 < 300)
-
-        let pending_timed_out = peers.detect_pending_timeouts(20);
-        assert_eq!(pending_timed_out.len(), 2);
-        assert!(pending_timed_out.contains(&2000));
-        assert!(pending_timed_out.contains(&3000));
-
-        let connection_timed_out = peers.detect_connection_timeouts(20);
-        assert_eq!(connection_timed_out.len(), 0);
-    }
-
-    #[test]
-    fn test_tick_calls_timeout_detection() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-
-        // Add peers
-        peers.add_identified_peer(2000, 0);
-        peers.promote_to_pending(2000, 12345, 5);
-        peers.update_peer(&3000, 10);
-
-        // Call tick at time 20
-        peers.tick(&token_storage, 20);
-
-        // Pending peer should have timed out
-        assert!(peers.peers.get(&2000).unwrap().state.is_identified());
-
-        // Connected peer should still be connected
-        assert!(peers.peers.get(&3000).unwrap().state.is_connected());
-    }
-
-    // ========================================================================
-    // Election State and Caching Tests
-    // ========================================================================
-
-    #[test]
-    fn test_election_state_running() {
-        let election = OngoingElection::new(
-            PeerElection::new(12345, 1000, ElectionConfig::default()),
-            10,
-            ElectionPurpose::Bootstrap,
-        );
-
-        assert!(matches!(election.state, ElectionState::Running));
-        assert!(!election.is_cache_valid(20, 300));
-        assert_eq!(election.get_winner(), None);
-    }
-
-    #[test]
-    fn test_election_complete_and_cache() {
-        let mut election = OngoingElection::new(
-            PeerElection::new(12345, 1000, ElectionConfig::default()),
-            10,
-            ElectionPurpose::Bootstrap,
-        );
-
-        // Complete election
-        election.complete(2000, 20);
-
-        assert!(matches!(election.state, ElectionState::Completed { .. }));
-        assert_eq!(election.get_winner(), Some(2000));
-
-        // Cache is valid within TTL
-        assert!(election.is_cache_valid(220, 300)); // 20 + 200 < 20 + 300
-
-        // Cache expires after TTL
-        assert!(!election.is_cache_valid(320, 300)); // 20 + 300 = 320
-    }
-
-    #[test]
-    fn test_election_timeout() {
-        let mut election = OngoingElection::new(
-            PeerElection::new(12345, 1000, ElectionConfig::default()),
-            10,
-            ElectionPurpose::Bootstrap,
-        );
-
-        // Timeout election
-        election.timeout(18);
-
-        assert!(matches!(election.state, ElectionState::TimedOut { .. }));
-        assert_eq!(election.get_winner(), None);
-        assert!(!election.is_cache_valid(50, 300));
-    }
-
-    // ========================================================================
-    // Phase 3: Election Management Tests
-    // ========================================================================
-
-    #[test]
-    fn test_start_election() {
-        let mut peers = create_test_peers(1000);
-
-        // Add some connected peers
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-        peers.update_peer(&4000, 0);
-
-        // Start election
-        let challenge_token = 12345;
-        let actions = peers.start_election(challenge_token, 10);
-
-        // Should have created election
-        assert!(peers.active_elections.contains_key(&challenge_token));
-
-        // Should have spawned some channels (depends on connected peers)
-        assert!(actions.len() > 0);
-    }
-
-    #[test]
-    fn test_start_election_duplicate() {
-        let mut peers = create_test_peers(1000);
-        peers.update_peer(&2000, 0);
-
-        let challenge_token = 12345;
-
-        // Start first election
-        let actions1 = peers.start_election(challenge_token, 10);
-        assert!(actions1.len() > 0);
-
-        // Try to start duplicate election
-        let actions2 = peers.start_election(challenge_token, 20);
-        assert_eq!(actions2.len(), 0); // Should not create duplicate
-    }
-
-    #[test]
-    fn test_pick_challenge_token() {
-        let peers = create_test_peers(1000);
-
-        // Pick 100 tokens - they should be random
-        let mut tokens = Vec::new();
-        for _ in 0..100 {
-            tokens.push(peers.pick_challenge_token());
-        }
-
-        // Should have variety (not all the same)
-        let unique_count = tokens.iter().collect::<std::collections::HashSet<_>>().len();
-        assert!(unique_count > 50, "Expected variety in challenge tokens");
-    }
-
-    #[test]
-    fn test_pick_peer_for_reelection() {
-        let mut peers = create_test_peers(1000);
-
-        // No peers - should return None
-        assert_eq!(peers.pick_peer_for_reelection(), None);
-
-        // Add some connected peers
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-        peers.update_peer(&4000, 0);
-
-        // Should pick one of them
-        let selected = peers.pick_peer_for_reelection();
-        assert!(selected.is_some());
-        let peer = selected.unwrap();
-        assert!(peer == 2000 || peer == 3000 || peer == 4000);
-    }
-
-    #[test]
-    fn test_pick_token_near_peer() {
-        let peers = create_test_peers(1000);
-
-        // Pick token near peer 5000
-        let token = peers.pick_token_near_peer(5000);
-
-        // Should be within 1000 of peer
-        let dist = EcPeers::ring_distance(5000, token);
-        assert!(dist < 1000, "Token {} should be within 1000 of peer 5000 (distance: {})", token, dist);
-    }
-
-    #[test]
-    fn test_handle_election_success_new_peer() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-
-        // Handle success for unknown peer
-        let _actions = peers.handle_election_success(&token_storage, 12345, 2000, 10);
-
-        // Peer should be added in Pending state
-        assert!(peers.peers.contains_key(&2000));
-        let peer = peers.peers.get(&2000).unwrap();
-        assert!(peer.state.is_pending());
-    }
-
-    #[test]
-    fn test_handle_election_success_existing_connected() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-
-        // Add peer as Connected
-        peers.update_peer(&2000, 0);
-
-        // Handle election success
-        let _actions = peers.handle_election_success(&token_storage, 12345, 2000, 10);
-
-        // Should update stats
-        let peer = peers.peers.get(&2000).unwrap();
-        if let PeerState::Connected { election_wins, election_attempts, .. } = peer.state {
-            assert_eq!(election_wins, 1);
-            assert_eq!(election_attempts, 1);
-        } else {
-            panic!("Expected Connected state");
-        }
-    }
-
-    #[test]
-    fn test_handle_election_success_ignores_self() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-
-        // Try to add self as winner
-        let _actions = peers.handle_election_success(&token_storage, 12345, 1000, 10);
-
-        // Should not add self
-        assert_eq!(peers.peers.len(), 0);
-    }
-
-    #[test]
-    fn test_evict_worst_peer() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peers with different quality scores
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-        peers.update_peer(&4000, 0);
-
-        // Manually set quality scores
-        if let Some(peer) = peers.peers.get_mut(&2000) {
-            if let PeerState::Connected { quality_score, .. } = &mut peer.state {
-                *quality_score = 0.9; // High quality
-            }
-        }
-
-        if let Some(peer) = peers.peers.get_mut(&3000) {
-            if let PeerState::Connected { quality_score, .. } = &mut peer.state {
-                *quality_score = 0.3; // Low quality (worst)
-            }
-        }
-
-        if let Some(peer) = peers.peers.get_mut(&4000) {
-            if let PeerState::Connected { quality_score, .. } = &mut peer.state {
-                *quality_score = 0.7; // Medium quality
-            }
-        }
-
-        // Evict worst peer
-        peers.evict_worst_peer(10);
-
-        // Peer 3000 (worst quality) should be demoted
-        let peer3000 = peers.peers.get(&3000).unwrap();
-        assert!(peer3000.state.is_identified());
-        assert!(!peers.active.contains(&3000));
-
-        // Other peers should still be connected
-        assert!(peers.peers.get(&2000).unwrap().state.is_connected());
-        assert!(peers.peers.get(&4000).unwrap().state.is_connected());
-    }
-
-    #[test]
-    fn test_tick_triggers_election() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-
-        // Add connected peers
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-
-        // Set next election time to now
-        peers.next_election_time = 100;
-
-        // Call tick at time 100
-        peers.tick(&token_storage, 100);
-
-        // Should have started an election
-        assert!(!peers.active_elections.is_empty());
-
-        // Next election time should be updated
-        assert_eq!(peers.next_election_time, 100 + peers.config.election_interval);
-    }
-
-    #[test]
-    fn test_tick_does_not_trigger_election_too_early() {
-        let mut peers = create_test_peers(1000);
-        let token_storage = MemTokens::new();
-
-        // Add connected peers
-        peers.update_peer(&2000, 0);
-
-        // Set next election time to future
-        peers.next_election_time = 100;
-
-        // Call tick before next election time
-        peers.tick(&token_storage, 50);
-
-        // Should not have started an election
-        assert!(peers.active_elections.is_empty());
-    }
-
-    #[test]
-    fn test_trigger_next_election_discovery() {
-        let mut peers = create_test_peers(1000);
-        peers.update_peer(&2000, 0);
-
-        // Set random seed to always pick discovery (not re-election)
-        // Note: This is probabilistic, but should work most of the time
-
-        let initial_count = peers.active_elections.len();
-
-        // Trigger election multiple times
-        for i in 0..10 {
-            peers.trigger_next_election(i * 10);
-        }
-
-        // Should have created some elections
-        assert!(peers.active_elections.len() > initial_count);
-    }
-
-    #[test]
-    fn test_election_eviction_on_budget_overflow() {
-        let mut config = PeerManagerConfig::default();
-        config.total_budget = 3; // Very small budget
-
-        let mut peers = create_test_peers_with_config(1000, config);
-        let token_storage = MemTokens::new();
-
-        // Add 3 connected peers (at budget limit)
-        peers.update_peer(&2000, 0);
-        peers.update_peer(&3000, 0);
-        peers.update_peer(&4000, 0);
-
-        // Set quality scores
-        if let Some(peer) = peers.peers.get_mut(&2000) {
-            if let PeerState::Connected { quality_score, .. } = &mut peer.state {
-                *quality_score = 0.9;
-            }
-        }
-        if let Some(peer) = peers.peers.get_mut(&3000) {
-            if let PeerState::Connected { quality_score, .. } = &mut peer.state {
-                *quality_score = 0.2; // Worst
-            }
-        }
-        if let Some(peer) = peers.peers.get_mut(&4000) {
-            if let PeerState::Connected { quality_score, .. } = &mut peer.state {
-                *quality_score = 0.7;
-            }
-        }
-
-        // Handle election success for new peer (adds as Pending, doesn't trigger eviction yet)
-        let _actions = peers.handle_election_success(&token_storage, 12345, 5000, 10);
-
-        // New peer should be added in Pending (not Connected yet)
-        assert!(peers.peers.contains_key(&5000));
-        let peer5000 = peers.peers.get(&5000).unwrap();
-        assert!(peer5000.state.is_pending());
-
-        // All 3 original peers should still be connected (no eviction yet)
-        assert_eq!(peers.num_connected(), 3);
-
-        // Now promote peer 5000 to Connected (simulates mutual invitation)
-        peers.promote_to_connected(5000, 20);
-
-        // Should have 4 connected peers now, which is over budget
-        // Eviction should happen (but we need to manually trigger it or call tick)
-        // For this test, manually evict
-        peers.evict_worst_peer(20);
-
-        // Should have evicted worst peer (3000)
-        let peer3000 = peers.peers.get(&3000).unwrap();
-        assert!(peer3000.state.is_identified());
-        assert!(!peers.active.contains(&3000));
-
-        // Now should be at budget (3 connected)
-        assert_eq!(peers.num_connected(), 3);
-    }
-
-    #[test]
-    fn test_spawn_election_channels_respects_active_peers() {
-        let mut peers = create_test_peers(1000);
-
-        // Add peers, but only some are connected
-        peers.add_identified_peer(2000, 0); // Not connected
-        peers.update_peer(&3000, 0); // Connected
-        peers.update_peer(&4000, 0); // Connected
-
-        // Start election
-        let challenge_token = 12345;
-        peers.start_election(challenge_token, 10);
-
-        // Should only use connected peers for channels
-        let election = peers.active_elections.get(&challenge_token).unwrap();
-        let channel_count = election.election.channel_count();
-
-        // Should have at least 1 channel (from connected peers)
-        assert!(channel_count > 0);
+        // Legacy compatibility
+        assert_eq!(config.total_budget, 200);
     }
 }

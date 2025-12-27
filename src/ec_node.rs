@@ -392,8 +392,39 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                 }
             }
             Message::Answer { answer, signature } => {
-                self.peers
-                    .handle_answer(answer, signature, msg.ticket, msg.sender, self.time);
+                let actions = self.peers
+                    .handle_answer(answer, signature, msg.ticket, msg.sender, self.time, &self.token_storage);
+
+                // Process returned actions (e.g., Invitations)
+                for action in actions {
+                    match action {
+                        PeerAction::SendInvitation { receiver, answer, signature } => {
+                            responses.push(MessageEnvelope {
+                                receiver,
+                                sender: self.peer_id,
+                                ticket: 0, // Invitation uses ticket=0
+                                time: self.time,
+                                message: Message::Answer { answer, signature },
+                            });
+                        }
+                        PeerAction::SendQuery { receiver, token, ticket } => {
+                            responses.push(MessageEnvelope {
+                                receiver,
+                                sender: self.peer_id,
+                                ticket,
+                                time: self.time,
+                                message: Message::QueryToken {
+                                    token_id: token,
+                                    target: 0,
+                                    ticket,
+                                },
+                            });
+                        }
+                        _ => {
+                            // Ignore other action types
+                        }
+                    }
+                }
             }
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
