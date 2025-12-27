@@ -1024,11 +1024,8 @@ impl EcPeers {
         let challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick);
 
         for challenge_token in challenge_tokens {
-            // Start election
-            self.start_election(challenge_token, time);
-
-            // Spawn channels for this election
-            let channel_actions = self.spawn_election_channels(challenge_token, time);
+            // Start election (which spawns initial channels and returns Query actions)
+            let channel_actions = self.start_election(challenge_token, time);
             actions.extend(channel_actions);
         }
 
@@ -1149,7 +1146,13 @@ impl EcPeers {
 
         // Add closest peers as additional candidates (for DHT-style routing)
         let closest = self.find_closest_peers(challenge_token, CLOSEST_CANDIDATES);
-        candidates.extend(closest);
+
+        // Add closest peers, avoiding duplicates (challenge_token might be in closest list)
+        for peer_id in closest {
+            if !candidates.contains(&peer_id) {
+                candidates.push(peer_id);
+            }
+        }
 
         // Now get mutable access to election
         let Some(ongoing) = self.active_elections.get_mut(&challenge_token) else {
