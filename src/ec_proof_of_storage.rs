@@ -177,8 +177,16 @@ fn generate_ticket(
 
 /// Count common mappings between two signatures
 ///
-/// Helper function for consensus clustering in elections.
-fn count_common_mappings_for_election(sig1: &TokenSignature, sig2: &TokenSignature) -> usize {
+/// Compares the signature arrays (not the answer field) to find matching
+/// (token_id, block_id) pairs. Order doesn't matter - any mapping in sig1
+/// that appears anywhere in sig2 counts as a match.
+///
+/// Used for consensus clustering in elections and signature comparison.
+///
+/// # Performance
+/// O(TOKENS_SIGNATURE_SIZE²) = O(100) for 10-element arrays.
+/// For small signature arrays this is faster than building hash sets.
+pub fn count_common_mappings(sig1: &TokenSignature, sig2: &TokenSignature) -> usize {
     let mut count = 0;
     for mapping1 in &sig1.signature {
         for mapping2 in &sig2.signature {
@@ -231,7 +239,7 @@ pub fn find_all_consensus_clusters(
     for i in 0..n {
         agreement[i][i] = SIGNATURE_CHUNKS;
         for j in (i + 1)..n {
-            let common = count_common_mappings_for_election(&signatures[i], &signatures[j]);
+            let common = count_common_mappings(&signatures[i], &signatures[j]);
             agreement[i][j] = common;
             agreement[j][i] = common;
         }
@@ -974,36 +982,21 @@ impl ProofOfStorage {
     ///
     /// Returns 10 chunks of 10 bits each.
     ///
-    /// # Current Implementation (u64 types for testing/simulation)
+    /// Uses Blake3 for cryptographically secure hashing.
+    /// Hash is computed as: Blake3(peer || token || block)
     ///
-    /// Uses `DefaultHasher` for fast simulation with 64-bit IDs.
-    /// Note: With only 64 bits of hash output, we can only get 6 independent 10-bit chunks,
-    /// so chunks 7-9 reuse bits. This is acceptable for testing but reduces entropy.
-    ///
-    /// # Future Implementation (256-bit types for production)
-    ///
-    /// When migrating to 256-bit IDs, replace this with Blake3-based hashing.
-    /// See `extract_signature_chunks_from_256bit_hash` for the production algorithm.
+    /// This matches the verification logic used in `PeerElection::verify_signature`.
     fn signature_for(token: &TokenId, block: &BlockId, peer: &PeerId) -> [u16; SIGNATURE_CHUNKS] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        // Create Blake3 hash from the three inputs
+        // Order: peer, token, block (same as verify_signature)
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&peer.to_le_bytes());
+        hasher.update(&token.to_le_bytes());
+        hasher.update(&block.to_le_bytes());
+        let hash = hasher.finalize();
 
-        // Create a deterministic hash from the three inputs
-        // TODO: Replace with Blake3 when migrating to 256-bit types
-        let mut hasher = DefaultHasher::new();
-        token.hash(&mut hasher);
-        block.hash(&mut hasher);
-        peer.hash(&mut hasher);
-        let hash = hasher.finish(); // 64 bits
-
-        // Split into 10 chunks of 10 bits each
-        let mut chunks = [0u16; SIGNATURE_CHUNKS];
-        for i in 0..SIGNATURE_CHUNKS {
-            let bit_offset = (i * CHUNK_BITS) % 64;
-            chunks[i] = ((hash >> bit_offset) & CHUNK_MASK) as u16;
-        }
-
-        chunks
+        // Extract 10-bit chunks from the 256-bit hash
+        extract_signature_chunks_from_256bit_hash(hash.as_bytes())
     }
 
     /// Perform signature-based token search
@@ -1058,28 +1051,6 @@ impl ProofOfStorage {
             tokens: found_tokens,
             steps,
         }
-    }
-
-    /// Count how many TokenMappings two signatures have in common
-    ///
-    /// Compares the signature arrays (not the answer field) to find matching
-    /// (token_id, block_id) pairs. Order doesn't matter - any mapping in sig1
-    /// that appears anywhere in sig2 counts as a match.
-    ///
-    /// # Performance
-    /// O(TOKENS_SIGNATURE_SIZE²) = O(100) for 10-element arrays.
-    /// For small signature arrays this is faster than building hash sets.
-    fn count_common_mappings(sig1: &TokenSignature, sig2: &TokenSignature) -> usize {
-        let mut count = 0;
-        for mapping1 in &sig1.signature {
-            for mapping2 in &sig2.signature {
-                if mapping1.id == mapping2.id && mapping1.block == mapping2.block {
-                    count += 1;
-                    break; // Found a match, move to next mapping1
-                }
-            }
-        }
-        count
     }
 
     /// Generate a complete proof-of-storage signature for a token
@@ -1324,7 +1295,7 @@ mod tests {
             ],
         };
 
-        let count = ProofOfStorage::count_common_mappings(&sig1, &sig2);
+        let count = count_common_mappings(&sig1, &sig2);
         assert_eq!(count, 3, "Should find 3 common mappings");
     }
 
@@ -1839,15 +1810,19 @@ mod tests {
     #[test]
     fn test_signature_generation_and_validation() {
         // This test validates the complete signature generation and verification flow
-        // using Blake3 (production algorithm used by PeerElection)
-
-        use crate::ec_interface::TokenMapping;
+        // 1. Use generate_signature to create a signature
+        // 2. Use verify_signature (via handle_answer) to validate it
 
         let my_peer_id = 999u64;
-        let challenge_token = 1000u64;
+        let challenge_token = 100_000u64; // Large enough to avoid underflow
         let response_block_id = 42u64;
 
-        // Calculate expected signature chunks using Blake3 (what PeerElection uses)
+        // Build test backend with signature tokens
+        let mut backend = TestBackend::new();
+        backend.set(&challenge_token, &response_block_id, 100);
+
+        // Calculate expected signature chunks using Blake3
+        // This matches what ProofOfStorage::signature_for will compute
         let mut hasher = blake3::Hasher::new();
         hasher.update(&my_peer_id.to_le_bytes());
         hasher.update(&challenge_token.to_le_bytes());
@@ -1855,42 +1830,45 @@ mod tests {
         let hash = hasher.finalize();
         let expected_chunks = extract_signature_chunks_from_256bit_hash(hash.as_bytes());
 
-        // Manually construct signature with tokens matching expected chunks
-        let mut signature_mappings = [TokenMapping { id: 0, block: 0 }; SIGNATURE_CHUNKS];
-
+        // Add signature tokens to backend with matching last 10 bits
+        // These are the tokens that generate_signature will find
+        // Space them far enough apart (2000) so chunk bits don't affect ordering
         for (i, &expected_chunk) in expected_chunks.iter().enumerate() {
-            // Create token ID with last 10 bits matching expected chunk
-            let base_token = if i < 5 {
-                challenge_token + 100 + (i as u64 * 100)
+            let base_id = if i < 5 {
+                // Above challenge_token (forward search for chunks 0-4)
+                challenge_token + 2000 + (i as u64 * 2000)
             } else {
-                challenge_token - 100 - ((i - 5) as u64 * 100)
+                // Below challenge_token (backward search for chunks 5-9)
+                challenge_token - 2000 - ((i - 5) as u64 * 2000)
             };
 
-            // Set last 10 bits to match expected chunk
-            let token_id = (base_token & !0x3FF) | (expected_chunk as u64);
-            let block_id = 100 + i as u64;
-
-            signature_mappings[i] = TokenMapping {
-                id: token_id,
-                block: block_id,
-            };
+            // Set the last 10 bits to match expected chunk (0x3FF = 1023 max)
+            // Since we space tokens 2000 apart, the chunk bits won't affect ordering
+            let token_with_bits = (base_id & !0x3FF) | (expected_chunk as u64);
+            backend.set(&token_with_bits, &(200 + i as u64), 100);
         }
 
-        // Create answer
-        let answer = TokenMapping {
-            id: challenge_token,
-            block: response_block_id,
-        };
+        // Generate signature using ProofOfStorage
+        let proof_system = ProofOfStorage::new();
+        let signature = proof_system.generate_signature(&backend, &challenge_token, &my_peer_id);
 
-        // Now validate using PeerElection's verification
+        assert!(signature.is_some(), "Signature generation should succeed");
+        let signature = signature.unwrap();
+
+        // Verify the signature structure
+        assert_eq!(signature.answer.id, challenge_token);
+        assert_eq!(signature.answer.block, response_block_id);
+        assert_eq!(signature.signature.len(), SIGNATURE_CHUNKS);
+
+        // Now validate using PeerElection's verify_signature (via handle_answer)
         let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
         let ticket = election.create_channel(100, 100).unwrap();
 
-        // Try to handle the answer with our generated signature
+        // handle_answer calls verify_signature internally
         let result = election.handle_answer(
             ticket,
-            &answer,
-            &signature_mappings,
+            &signature.answer,
+            &signature.signature,
             101, // responder_peer
             200, // received_at
         );
@@ -1901,14 +1879,14 @@ mod tests {
         // Verify channel state updated correctly
         assert_eq!(election.valid_response_count(), 1);
 
-        // Test with wrong signature - modify one mapping's last bits
-        let mut bad_signature = signature_mappings;
+        // Test with corrupted signature - modify one mapping's last bits
+        let mut bad_signature = signature.signature;
         bad_signature[0].id = bad_signature[0].id ^ 0x3FF; // Change all 10 bits
 
         let ticket2 = election.create_channel(200, 110).unwrap();
         let result = election.handle_answer(
             ticket2,
-            &answer,
+            &signature.answer,
             &bad_signature,
             102,
             210,
@@ -1916,6 +1894,6 @@ mod tests {
 
         // Should fail - signature is invalid
         assert_eq!(result, Err(ElectionError::SignatureVerificationFailed),
-                   "Modified signature should fail verification");
+                   "Corrupted signature should fail verification");
     }
 }

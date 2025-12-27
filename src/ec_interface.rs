@@ -10,6 +10,121 @@ pub type BlockId = PeerId;
 pub type EcTime = u64;
 pub type MessageTicket = u64;
 
+// ============================================================================
+// FUTURE REFACTOR: TokenId vs TokenHash Indirection
+// ============================================================================
+//
+// ## Current Implementation (Simulation-Friendly)
+//
+// Currently, `TokenId` is used directly for:
+// - Storage keys (HashMap/RocksDB lookups)
+// - Query messages
+// - Block contents (TokenBlock.token)
+// - Answer messages
+//
+// This works for testing/simulation but lacks two critical security properties:
+// 1. Privacy: Token ownership is revealed by queries
+// 2. Proof-of-knowledge: No cryptographic proof that responder stores the token
+//
+// ## Future Implementation (Production-Ready)
+//
+// Storage will be indexed by `Blake3(TokenId)` instead of `TokenId` directly:
+//
+// ```rust
+// pub type TokenHash = [u8; 32];  // Blake3(TokenId)
+//
+// // Storage layer uses TokenHash as keys
+// impl EcTokens {
+//     fn lookup(&self, token_hash: &TokenHash) -> Option<&BlockTime>;
+//     fn set(&mut self, token_hash: &TokenHash, ...);
+// }
+// ```
+//
+// **Query messages** will use `TokenHash` (challenger doesn't know real token):
+// ```rust
+// QueryToken {
+//     token_hash: TokenHash,  // Blake3(TokenId) - what to look up
+//     ...
+// }
+// ```
+//
+// **Blocks and Answers** will contain real `TokenId` (proves preimage knowledge):
+// ```rust
+// TokenBlock {
+//     token: TokenId,  // Real token ID - proves ownership
+//     ...
+// }
+//
+// Answer {
+//     answer: TokenMapping {
+//         id: TokenId,  // Real token ID, not hash
+//         ...
+//     }
+// }
+// ```
+//
+// ## Security Benefits
+//
+// 1. **Privacy**: Queries use Blake3(TokenId), so observers can't determine token ownership
+// 2. **Proof-of-Knowledge**: Answering with real TokenId proves you know the preimage
+// 3. **Storage Security**: Attacker can't predict storage locations without knowing tokens
+//
+// ## Refactor Scope & Impact
+//
+// **HIGH IMPACT** - Touches core abstractions:
+//
+// ### Interfaces (6 files)
+// - `EcTokens` trait - all methods take TokenHash instead of TokenId
+// - `BlockTime` - might need both TokenId and TokenHash
+// - `Message::QueryToken` - uses TokenHash
+// - ProofOfStorage - signature generation needs both
+//
+// ### Backends (3 files)
+// - `MemoryBackend` - HashMap<TokenHash, BlockTime>
+// - `RocksDB` - keys change from TokenId to TokenHash
+// - `TestBackend` - tests need to hash token IDs
+//
+// ### Core Logic (5 files)
+// - `EcNode::handle_message` - QueryToken handling
+// - `EcMemPool` - token lookups need hashing
+// - `ProofOfStorage` - generate_signature needs to hash for lookups
+// - `EcPeers` - election token queries need hashing
+//
+// ### Simulation & Tests (ALL - ~103 tests)
+// - Every test that creates tokens needs to hash them for storage
+// - Simulators need to track both TokenId and TokenHash
+// - Token generation logic needs to compute hashes
+// - All QueryToken constructions need hashing
+//
+// **Estimated effort**: 2-3 days of focused work + extensive testing
+//
+// ## Migration Strategy - When to Refactor
+//
+// **NOT NOW** - Defer until after these milestones:
+//
+// 1. ✅ Core consensus is stable and well-tested
+// 2. ✅ Proof-of-storage signature mechanism is validated
+// 3. ⏸️ Peer election and discovery is working
+// 4. ⏸️ All major simulation scenarios are passing
+// 5. ⏸️ Performance baselines are established
+//
+// **THEN** - Refactor in dedicated branch:
+//
+// 1. Add `TokenHash` type alongside `TokenId`
+// 2. Deprecate old `EcTokens` trait, create new `EcTokenStorage`
+// 3. Update backends one at a time with compatibility layer
+// 4. Migrate tests in batches (consensus, then peer lifecycle, then proof-of-storage)
+// 5. Update simulators with helper functions to manage hash/id mapping
+// 6. Remove compatibility layer
+//
+// **Why defer?**
+// - Current abstraction works for testing consensus logic
+// - Premature optimization would slow current development velocity
+// - Need stable test suite before breaking changes
+// - TokenHash is a storage/security concern, not a consensus concern
+//
+// ============================================================================
+
 pub const TOKENS_PER_BLOCK: usize = 6;
 /// Number of tokens in a proof-of-storage signature response
 /// This should match SIGNATURE_CHUNKS in ec_tokens.rs (10 chunks)
