@@ -661,6 +661,7 @@ impl EcPeers {
         signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
         ticket: MessageTicket,
         peer_id: PeerId,
+        time: EcTime,
     ) {
         // handle Invitation
         if ticket == 0 {
@@ -676,7 +677,7 @@ impl EcPeers {
 
         if let Some(ongoing) = self.active_elections.get_mut(&challenge_token) {
             // Try to record the answer in the election
-            match ongoing.election.handle_answer(ticket, answer, signature, peer_id) {
+            match ongoing.election.handle_answer(ticket, answer, signature, peer_id, time) {
                 Ok(()) => {
                     // Answer successfully recorded
                     // Winner will be detected in process_elections()
@@ -698,6 +699,7 @@ impl EcPeers {
         token: TokenId,
         suggested_peers: [PeerId; 2],
         sender: PeerId,
+        time: EcTime,
     ) -> Option<PeerAction> {
         // Find the ongoing election for this token
         if let Some(ongoing) = self.active_elections.get_mut(&token) {
@@ -716,7 +718,7 @@ impl EcPeers {
                     // routing to find token owners even if they're not directly connected.
 
                     // Create a new channel to the suggested peer
-                    if let Ok(new_ticket) = ongoing.election.create_channel(next_peer) {
+                    if let Ok(new_ticket) = ongoing.election.create_channel(next_peer, time) {
                         return Some(PeerAction::SendQuery {
                             receiver: next_peer,
                             token,
@@ -1245,7 +1247,7 @@ impl EcPeers {
 
         for first_hop in candidates.iter().take(count) {
             // Create channel
-            match ongoing.election.create_channel(*first_hop) {
+            match ongoing.election.create_channel(*first_hop, time) {
                 Ok(ticket) => {
                     // Create action to send Query message
                     actions.push(PeerAction::SendQuery {

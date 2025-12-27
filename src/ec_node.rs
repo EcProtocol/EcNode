@@ -393,7 +393,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
             }
             Message::Answer { answer, signature } => {
                 self.peers
-                    .handle_answer(answer, signature, msg.ticket, msg.sender);
+                    .handle_answer(answer, signature, msg.ticket, msg.sender, self.time);
             }
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
@@ -438,8 +438,8 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                         },
                     });
                 } else if let Some(peer_action) = self.peers
-                            .handle_referral(msg.ticket, *token, [*high, *low], msg.sender) {
-                    
+                            .handle_referral(msg.ticket, *token, [*high, *low], msg.sender, self.time) {
+
                 }
             }
         }

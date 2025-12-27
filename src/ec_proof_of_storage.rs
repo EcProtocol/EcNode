@@ -199,7 +199,11 @@ fn count_common_mappings_for_election(sig1: &TokenSignature, sig2: &TokenSignatu
 ///
 /// This is used for split-brain detection - if multiple large clusters exist, it indicates
 /// competing views of network state.
-fn find_all_consensus_clusters(
+///
+/// To find a single best cluster (for simple cases), call this function with appropriate
+/// parameters and take the first element from the returned Vec (clusters are sorted by
+/// size and agreement quality).
+pub fn find_all_consensus_clusters(
     signatures: &[TokenSignature],
     min_threshold: usize,
     min_size: usize,
@@ -283,7 +287,20 @@ fn find_all_consensus_clusters(
     }
 
     // Filter out clusters that are strict subsets of larger clusters
-    remove_subset_clusters(all_clusters)
+    let mut maximal_clusters = remove_subset_clusters(all_clusters);
+
+    // Sort clusters by quality: larger size first, then higher avg_agreement
+    maximal_clusters.sort_by(|a, b| {
+        match b.members.len().cmp(&a.members.len()) {
+            std::cmp::Ordering::Equal => b
+                .avg_agreement
+                .partial_cmp(&a.avg_agreement)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            other => other,
+        }
+    });
+
+    maximal_clusters
 }
 
 /// Remove clusters that are strict subsets of other clusters
@@ -556,6 +573,7 @@ impl PeerElection {
     ///
     /// # Arguments
     /// * `first_hop` - The first peer to send the Query to
+    /// * `sent_at` - Time when the challenge is sent
     ///
     /// # Returns
     /// * `Ok(ticket)` - Ticket to include in challenge Query message
@@ -563,7 +581,7 @@ impl PeerElection {
     /// * `Err(ChannelAlreadyExists)` - Channel for this first-hop peer already exists
     /// * `Err(PeerAlreadyParticipating)` - Peer has already responded via another channel
     /// * `Err(SelfReference)` - can not setup a channel for self
-    pub fn create_channel(&mut self, first_hop: PeerId) -> Result<MessageTicket, ElectionError> {
+    pub fn create_channel(&mut self, first_hop: PeerId, sent_at: EcTime) -> Result<MessageTicket, ElectionError> {
         // do not a allow a channel to self
         if self.my_peer_id == first_hop {
             return Err(ElectionError::SelfReference);
@@ -589,7 +607,7 @@ impl PeerElection {
         }
 
         let ticket = generate_ticket(self.challenge_token, first_hop, &self.election_secret);
-        let channel = ElectionChannel::new(ticket, first_hop, 0); // User controls time
+        let channel = ElectionChannel::new(ticket, first_hop, sent_at);
         self.channels.insert(ticket, channel);
         self.first_hop_peers.insert(first_hop, ticket);
 
@@ -606,6 +624,7 @@ impl PeerElection {
     /// * `answer` - The token mapping (token_id, block_id)
     /// * `signature_mappings` - The 10 signature token mappings
     /// * `responder_peer` - The peer that sent the Answer
+    /// * `received_at` - Time when the answer was received
     ///
     /// # Returns
     /// * `Ok(())` - Response verified and stored successfully
@@ -620,6 +639,7 @@ impl PeerElection {
         answer: &TokenMapping,
         signature_mappings: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
         responder_peer: PeerId,
+        received_at: EcTime,
     ) -> Result<(), ElectionError> {
         // Check this election is for the correct token
         if answer.id != self.challenge_token {
@@ -656,7 +676,7 @@ impl PeerElection {
         channel.response = Some(ChannelResponse {
             signature: token_signature,
             responder: responder_peer,
-            received_at: 0, // User controls time
+            received_at,
         });
         channel.state = ChannelState::Responded;
 
@@ -802,8 +822,8 @@ impl PeerElection {
             .map(|(_, resp)| resp.signature.clone())
             .collect();
 
-        // Find ALL consensus clusters
-        let mut all_clusters = find_all_consensus_clusters(
+        // Find ALL consensus clusters (returned sorted by size, then avg_agreement)
+        let all_clusters = find_all_consensus_clusters(
             &signatures,
             self.config.consensus_threshold,
             self.config.min_cluster_size,
@@ -813,17 +833,7 @@ impl PeerElection {
             return WinnerResult::NoConsensus;
         }
 
-        // Sort clusters by strength (size, then avg_agreement)
-        all_clusters.sort_by(|a, b| {
-            match b.members.len().cmp(&a.members.len()) {
-                std::cmp::Ordering::Equal => b
-                    .avg_agreement
-                    .partial_cmp(&a.avg_agreement)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                other => other,
-            }
-        });
-
+        // Strongest cluster is first (results are pre-sorted)
         let strongest_cluster = &all_clusters[0];
         let total_valid = valid_responses.len();
 
@@ -1070,143 +1080,6 @@ impl ProofOfStorage {
             }
         }
         count
-    }
-
-    /// Find the consensus cluster with highest mutual agreement
-    ///
-    /// This finds a group of signatures where all members agree with each other
-    /// above a minimum threshold. Unlike simple ranking, this ensures the cluster
-    /// forms a mutually-agreeing group, not just signatures that individually
-    /// overlap with different subsets.
-    ///
-    /// # Algorithm
-    /// For small N (< 10 signatures), we use an exhaustive search:
-    /// 1. Build pairwise agreement matrix
-    /// 2. Find the largest clique where all pairs agree >= min_threshold
-    /// 3. Among cliques of same size, pick the one with highest average agreement
-    ///
-    /// # Arguments
-    /// - `signatures`: List of signatures to analyze
-    /// - `min_threshold`: Minimum common mappings required between any pair (0-10)
-    ///
-    /// # Returns
-    /// The best consensus cluster, or None if no valid cluster exists
-    ///
-    /// # Example
-    /// ```rust
-    /// use ec_rust::ec_proof_of_storage::ProofOfStorage;
-    /// use ec_rust::ec_interface::TokenSignature;
-    ///
-    /// // Create some example signatures (in practice, these would come from peers)
-    /// let signatures: Vec<TokenSignature> = vec![];
-    ///
-    /// // Find cluster where all pairs agree on at least 7/10 mappings
-    /// if let Some(cluster) = ProofOfStorage::find_consensus_cluster(&signatures, 7) {
-    ///     println!("Found {} agreeing signatures", cluster.members.len());
-    ///     let consensus_sigs: Vec<_> = cluster.members.iter()
-    ///         .map(|&i| &signatures[i])
-    ///         .collect();
-    /// }
-    /// ```
-    pub fn find_consensus_cluster(
-        signatures: &[TokenSignature],
-        min_threshold: usize,
-    ) -> Option<ConsensusCluster> {
-        let n = signatures.len();
-
-        if n == 0 {
-            return None;
-        }
-
-        if n == 1 {
-            return Some(ConsensusCluster {
-                members: vec![0],
-                min_agreement: SIGNATURE_CHUNKS,
-                avg_agreement: SIGNATURE_CHUNKS as f64,
-            });
-        }
-
-        // Build pairwise agreement matrix
-        let mut agreement = vec![vec![0usize; n]; n];
-        for i in 0..n {
-            agreement[i][i] = SIGNATURE_CHUNKS; // Perfect self-agreement
-            for j in (i + 1)..n {
-                let common = Self::count_common_mappings(&signatures[i], &signatures[j]);
-                agreement[i][j] = common;
-                agreement[j][i] = common;
-            }
-        }
-
-        // For N < 10, we can afford to check all subsets
-        // Start with largest possible clusters and work down
-        let mut best_cluster: Option<ConsensusCluster> = None;
-
-        // Check all possible subsets (2^n combinations)
-        // For n=10, this is 1024 checks, which is fine
-        for mask in 1..(1 << n) {
-            let members: Vec<usize> = (0..n).filter(|&i| (mask & (1 << i)) != 0).collect();
-
-            if members.len() < 2 {
-                continue; // Skip single-member clusters
-            }
-
-            // Check if this is a valid cluster (all pairs meet threshold)
-            let mut min_agreement = SIGNATURE_CHUNKS;
-            let mut total_agreement = 0usize;
-            let mut pair_count = 0;
-            let mut valid = true;
-
-            for i in 0..members.len() {
-                for j in (i + 1)..members.len() {
-                    let agree = agreement[members[i]][members[j]];
-                    if agree < min_threshold {
-                        valid = false;
-                        break;
-                    }
-                    min_agreement = min_agreement.min(agree);
-                    total_agreement += agree;
-                    pair_count += 1;
-                }
-                if !valid {
-                    break;
-                }
-            }
-
-            if !valid {
-                continue;
-            }
-
-            let avg_agreement = if pair_count > 0 {
-                total_agreement as f64 / pair_count as f64
-            } else {
-                0.0
-            };
-
-            let cluster = ConsensusCluster {
-                members: members.clone(),
-                min_agreement,
-                avg_agreement,
-            };
-
-            // Update best cluster if this is better
-            // Prioritize: larger size, then higher average agreement
-            best_cluster = Some(match best_cluster {
-                None => cluster,
-                Some(best) => {
-                    if cluster.members.len() > best.members.len() {
-                        cluster
-                    } else if cluster.members.len() == best.members.len()
-                        && cluster.avg_agreement > best.avg_agreement
-                    {
-                        cluster
-                    } else {
-                        best
-                    }
-                }
-            });
-        }
-
-        best_cluster
     }
 
     /// Generate a complete proof-of-storage signature for a token
@@ -1488,10 +1361,10 @@ mod tests {
             },
         ];
 
-        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 10);
+        let clusters = find_all_consensus_clusters(&signatures, 10, 2);
 
-        assert!(cluster.is_some());
-        let cluster = cluster.unwrap();
+        assert!(!clusters.is_empty());
+        let cluster = &clusters[0];
         assert_eq!(cluster.members.len(), 3, "All 3 should be in cluster");
         assert_eq!(cluster.min_agreement, 10, "Perfect agreement");
         assert_eq!(cluster.avg_agreement, 10.0, "Perfect average");
@@ -1544,10 +1417,10 @@ mod tests {
         ];
 
         // With threshold of 8, only sig1 and sig2 should form a cluster
-        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 8);
+        let clusters = find_all_consensus_clusters(&signatures, 8, 2);
 
-        assert!(cluster.is_some());
-        let cluster = cluster.unwrap();
+        assert!(!clusters.is_empty());
+        let cluster = &clusters[0];
         assert_eq!(cluster.members.len(), 2, "Only sig1 and sig2 in cluster");
         assert!(cluster.members.contains(&0) && cluster.members.contains(&1));
         assert_eq!(cluster.min_agreement, 10);
@@ -1612,10 +1485,10 @@ mod tests {
         ];
 
         // With threshold of 8, should find the larger group (Group B with 3 members)
-        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 8);
+        let clusters = find_all_consensus_clusters(&signatures, 8, 2);
 
-        assert!(cluster.is_some());
-        let cluster = cluster.unwrap();
+        assert!(!clusters.is_empty());
+        let cluster = &clusters[0];
         assert_eq!(
             cluster.members.len(),
             3,
@@ -1668,17 +1541,18 @@ mod tests {
         ];
 
         // With very high threshold, no cluster should be found
-        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 9);
+        let clusters = find_all_consensus_clusters(&signatures, 9, 2);
 
         // Should find nothing above threshold 9 (they only agree on 2/10)
-        assert!(cluster.is_none() || cluster.unwrap().members.len() == 1);
+        // min_size=2 means single-signature "clusters" are filtered out
+        assert!(clusters.is_empty());
     }
 
     #[test]
     fn test_consensus_cluster_empty_input() {
         let signatures: Vec<TokenSignature> = vec![];
-        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 5);
-        assert!(cluster.is_none());
+        let clusters = find_all_consensus_clusters(&signatures, 5, 2);
+        assert!(clusters.is_empty());
     }
 
     #[test]
@@ -1690,9 +1564,10 @@ mod tests {
             signature: [TokenMapping { id: 1, block: 1 }; SIGNATURE_CHUNKS],
         }];
 
-        let cluster = ProofOfStorage::find_consensus_cluster(&signatures, 5);
-        assert!(cluster.is_some());
-        let cluster = cluster.unwrap();
+        // Use min_size=1 to allow single-signature clusters
+        let clusters = find_all_consensus_clusters(&signatures, 5, 1);
+        assert!(!clusters.is_empty());
+        let cluster = &clusters[0];
         assert_eq!(cluster.members.len(), 1);
         assert_eq!(cluster.members[0], 0);
     }
@@ -1760,7 +1635,7 @@ mod tests {
         let challenge_token = 1000;
         let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
 
-        let ticket = election.create_channel(100).unwrap();
+        let ticket = election.create_channel(100, 100).unwrap();
         assert!(ticket > 0, "Ticket should be non-zero");
 
         assert_eq!(election.channel_count(), 1);
@@ -1776,13 +1651,13 @@ mod tests {
         let mut election = PeerElection::new(1000, 999, config);
 
         // Create 3 channels (max)
-        assert!(election.create_channel(100).is_ok());
-        assert!(election.create_channel(200).is_ok());
-        assert!(election.create_channel(300).is_ok());
+        assert!(election.create_channel(100, 100).is_ok());
+        assert!(election.create_channel(200, 110).is_ok());
+        assert!(election.create_channel(300, 120).is_ok());
 
         // 4th should fail
         assert_eq!(
-            election.create_channel(400),
+            election.create_channel(400, 130),
             Err(ElectionError::MaxChannelsReached)
         );
     }
@@ -1792,11 +1667,11 @@ mod tests {
         let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
 
         // Create channel for peer 100
-        assert!(election.create_channel(100).is_ok());
+        assert!(election.create_channel(100, 100).is_ok());
 
         // Try to create another channel for same peer
         assert_eq!(
-            election.create_channel(100),
+            election.create_channel(100, 110),
             Err(ElectionError::ChannelAlreadyExists)
         );
     }
@@ -1807,7 +1682,7 @@ mod tests {
         let challenge_token = 1000;
         let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
 
-        let ticket = election.create_channel(100).unwrap();
+        let ticket = election.create_channel(100, 100).unwrap();
 
         // Note: signature verification will fail with test data since we can't easily
         // generate matching signatures. This tests the path up to verification.
@@ -1815,7 +1690,7 @@ mod tests {
         let sig = create_test_signature([(1, 10); SIGNATURE_CHUNKS]);
 
         // Will fail signature verification, but that's expected with test data
-        let result = election.handle_answer(ticket, &answer, &sig.signature, 101);
+        let result = election.handle_answer(ticket, &answer, &sig.signature, 101, 200);
         assert!(result.is_err()); // Signature verification will fail
     }
 
@@ -1825,20 +1700,20 @@ mod tests {
     #[test]
     fn test_election_wrong_token_rejected() {
         let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
-        let ticket = election.create_channel(100).unwrap();
+        let ticket = election.create_channel(100, 100).unwrap();
 
         // Answer for wrong token
         let answer = TokenMapping { id: 9999, block: 42 };
         let sig = create_test_signature([(1, 10); SIGNATURE_CHUNKS]);
 
-        let result = election.handle_answer(ticket, &answer, &sig.signature, 101);
+        let result = election.handle_answer(ticket, &answer, &sig.signature, 101, 200);
         assert_eq!(result, Err(ElectionError::WrongToken));
     }
 
     #[test]
     fn test_election_handle_referral() {
         let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
-        let ticket = election.create_channel(100).unwrap();
+        let ticket = election.create_channel(100, 100).unwrap();
 
         let suggested_peers = [200, 300];
         let result = election.handle_referral(ticket, 1000, suggested_peers, 100);
@@ -1855,7 +1730,7 @@ mod tests {
     #[test]
     fn test_election_referral_wrong_token() {
         let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
-        let ticket = election.create_channel(100).unwrap();
+        let ticket = election.create_channel(100, 100).unwrap();
 
         let suggested_peers = [200, 300];
         let result = election.handle_referral(ticket, 9999, suggested_peers, 100);
@@ -1882,7 +1757,7 @@ mod tests {
         assert_eq!(election.channel_count(), 0);
         assert!(election.can_create_channel());
 
-        election.create_channel(100).unwrap();
+        election.create_channel(100, 100).unwrap();
         assert_eq!(election.channel_count(), 1);
     }
 
@@ -1894,8 +1769,8 @@ mod tests {
         assert_eq!(election.get_participating_peers().len(), 0);
 
         // Create channels to peers 100 and 200
-        election.create_channel(100).unwrap();
-        election.create_channel(200).unwrap();
+        election.create_channel(100, 100).unwrap();
+        election.create_channel(200, 110).unwrap();
 
         // Both first-hop peers should be participating
         let peers = election.get_participating_peers();
@@ -1915,10 +1790,10 @@ mod tests {
         let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
 
         // Create channel to peer 100
-        election.create_channel(100).unwrap();
+        election.create_channel(100, 100).unwrap();
 
         // Try to create another channel to same peer - should fail
-        let result = election.create_channel(100);
+        let result = election.create_channel(100, 110);
         assert_eq!(result, Err(ElectionError::ChannelAlreadyExists));
     }
 
@@ -1927,9 +1802,9 @@ mod tests {
         let mut election = PeerElection::new(1000, 999, ElectionConfig::default());
 
         // Create channels to peers 100, 200, 300
-        let ticket1 = election.create_channel(100).unwrap();
-        election.create_channel(200).unwrap();
-        election.create_channel(300).unwrap();
+        let ticket1 = election.create_channel(100, 100).unwrap();
+        election.create_channel(200, 110).unwrap();
+        election.create_channel(300, 120).unwrap();
 
         // Referral suggests peers 200 and 400
         // Peer 200 is already participating, so should suggest 400
@@ -1937,7 +1812,7 @@ mod tests {
         assert_eq!(suggested, Ok(400));
 
         // Create channel to peer 500
-        let ticket2 = election.create_channel(500).unwrap();
+        let ticket2 = election.create_channel(500, 130).unwrap();
 
         // Referral suggests peers 300 and 200 (both already participating)
         // Should return NoViableSuggestions
@@ -1959,5 +1834,88 @@ mod tests {
         // Note: Full integration testing would require mocking the signature
         // verification to allow duplicate responses, which is beyond unit test scope
         assert!(true); // Placeholder for documentation purposes
+    }
+
+    #[test]
+    fn test_signature_generation_and_validation() {
+        // This test validates the complete signature generation and verification flow
+        // using Blake3 (production algorithm used by PeerElection)
+
+        use crate::ec_interface::TokenMapping;
+
+        let my_peer_id = 999u64;
+        let challenge_token = 1000u64;
+        let response_block_id = 42u64;
+
+        // Calculate expected signature chunks using Blake3 (what PeerElection uses)
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&my_peer_id.to_le_bytes());
+        hasher.update(&challenge_token.to_le_bytes());
+        hasher.update(&response_block_id.to_le_bytes());
+        let hash = hasher.finalize();
+        let expected_chunks = extract_signature_chunks_from_256bit_hash(hash.as_bytes());
+
+        // Manually construct signature with tokens matching expected chunks
+        let mut signature_mappings = [TokenMapping { id: 0, block: 0 }; SIGNATURE_CHUNKS];
+
+        for (i, &expected_chunk) in expected_chunks.iter().enumerate() {
+            // Create token ID with last 10 bits matching expected chunk
+            let base_token = if i < 5 {
+                challenge_token + 100 + (i as u64 * 100)
+            } else {
+                challenge_token - 100 - ((i - 5) as u64 * 100)
+            };
+
+            // Set last 10 bits to match expected chunk
+            let token_id = (base_token & !0x3FF) | (expected_chunk as u64);
+            let block_id = 100 + i as u64;
+
+            signature_mappings[i] = TokenMapping {
+                id: token_id,
+                block: block_id,
+            };
+        }
+
+        // Create answer
+        let answer = TokenMapping {
+            id: challenge_token,
+            block: response_block_id,
+        };
+
+        // Now validate using PeerElection's verification
+        let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
+        let ticket = election.create_channel(100, 100).unwrap();
+
+        // Try to handle the answer with our generated signature
+        let result = election.handle_answer(
+            ticket,
+            &answer,
+            &signature_mappings,
+            101, // responder_peer
+            200, // received_at
+        );
+
+        // Should succeed - signature is valid
+        assert!(result.is_ok(), "Signature verification should succeed: {:?}", result);
+
+        // Verify channel state updated correctly
+        assert_eq!(election.valid_response_count(), 1);
+
+        // Test with wrong signature - modify one mapping's last bits
+        let mut bad_signature = signature_mappings;
+        bad_signature[0].id = bad_signature[0].id ^ 0x3FF; // Change all 10 bits
+
+        let ticket2 = election.create_channel(200, 110).unwrap();
+        let result = election.handle_answer(
+            ticket2,
+            &answer,
+            &bad_signature,
+            102,
+            210,
+        );
+
+        // Should fail - signature is invalid
+        assert_eq!(result, Err(ElectionError::SignatureVerificationFailed),
+                   "Modified signature should fail verification");
     }
 }
