@@ -23,7 +23,7 @@ fn main() {
     config.peer_config.election_config.consensus_threshold = 6; // 6/10 instead of 8/10
 
     // Customize for test
-    config.rounds = 2000;
+    config.rounds = 200;
 
     // Adjust peer management parameters for testing
     config.peer_config.connection_timeout = 10000; // Long timeout to prevent premature disconnects

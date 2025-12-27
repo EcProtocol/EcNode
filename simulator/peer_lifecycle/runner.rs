@@ -135,6 +135,10 @@ impl PeerLifecycleRunner {
             if self.should_sample_metrics() {
                 self.collect_metrics();
             }
+            
+            if round % 10 == 0 {
+                println!("round {}", round);
+            }
         }
 
         // 3. Build final result

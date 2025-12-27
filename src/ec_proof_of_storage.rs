@@ -573,6 +573,99 @@ impl PeerElection {
         }
     }
 
+    /// Create a new election from an invitation (unsolicited Answer message)
+    ///
+    /// This spawns an election with an initial channel already in Responded state,
+    /// based on an Answer we received without sending a Query.
+    ///
+    /// # Arguments
+    /// * `answer` - The token mapping (challenge token in answer.id, response block in answer.block)
+    /// * `signature_mappings` - The 10 signature token mappings from the Answer
+    /// * `responder_peer` - The peer that sent the invitation
+    /// * `time` - Time when the invitation was received (used for both sent_at and received_at)
+    /// * `my_peer_id` - This node's peer ID (the challenger)
+    /// * `config` - Election configuration
+    ///
+    /// # Returns
+    /// * `Ok(PeerElection)` - Election successfully created with initial response
+    /// * `Err(SignatureVerificationFailed)` - Signature doesn't match expected values
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ec_rust::ec_proof_of_storage::{PeerElection, ElectionConfig};
+    /// use ec_rust::ec_interface::{TokenMapping, TOKENS_SIGNATURE_SIZE};
+    ///
+    /// let answer = TokenMapping { id: 1000, block: 42 };
+    /// let signature: [TokenMapping; TOKENS_SIGNATURE_SIZE] = [TokenMapping { id: 0, block: 0 }; TOKENS_SIGNATURE_SIZE];
+    /// let responder = 100;
+    /// let my_peer_id = 999;
+    /// let now = 1000;
+    ///
+    /// let election = PeerElection::from_invitation(
+    ///     &answer,
+    ///     &signature,
+    ///     responder,
+    ///     now,
+    ///     my_peer_id,
+    ///     ElectionConfig::default()
+    /// );
+    /// ```
+    pub fn from_invitation(
+        answer: &TokenMapping,
+        signature_mappings: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
+        responder_peer: PeerId,
+        time: EcTime,
+        my_peer_id: PeerId,
+        config: ElectionConfig,
+    ) -> Result<Self, ElectionError> {
+        let challenge_token = answer.id;
+
+        // Generate secure random election-specific secret
+        let mut election_secret = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut election_secret);
+
+        // Create the election structure
+        let mut election = Self {
+            challenge_token,
+            my_peer_id,
+            election_secret,
+            channels: HashMap::new(),
+            first_hop_peers: HashMap::new(),
+            config,
+        };
+
+        // Verify the signature before creating the channel
+        election.verify_signature(answer.block, signature_mappings)?;
+
+        // Generate ticket for this channel
+        let ticket = generate_ticket(challenge_token, responder_peer, &election.election_secret);
+
+        // Create a channel in Responded state with the answer
+        let token_signature = TokenSignature {
+            answer: *answer,
+            signature: *signature_mappings,
+        };
+
+        let channel = ElectionChannel {
+            ticket,
+            first_hop_peer: responder_peer,
+            sent_at: time,
+            state: ChannelState::Responded,
+            response: Some(ChannelResponse {
+                signature: token_signature,
+                responder: responder_peer,
+                received_at: time,
+            }),
+        };
+
+        // Store the channel
+        election.channels.insert(ticket, channel);
+        election.first_hop_peers.insert(responder_peer, ticket);
+
+        Ok(election)
+    }
+
     /// Create a new channel to a first-hop peer
     ///
     /// Generates a ticket and stores the channel as Pending.

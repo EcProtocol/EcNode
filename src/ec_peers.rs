@@ -131,7 +131,6 @@ impl PeerState {
 
 /// Extended peer information with state
 struct MemPeer {
-    id: PeerId,
     state: PeerState,
     // TODO: network address, shared secret
 }
@@ -236,6 +235,11 @@ impl TokenSampleCollection {
         // Add sender's peer ID as a token
         self.add_token(sender_peer_id);
 
+        // Add the answer token
+        if answer.id != 0 {
+            self.add_token(answer.id);
+        }
+
         // Sample from signature tokens
         for sig_token in signature {
             if sig_token.id != 0 {
@@ -293,16 +297,6 @@ impl TokenSampleCollection {
         }
 
         to_evict.len()
-    }
-
-    /// Get total number of sampled tokens
-    fn len(&self) -> usize {
-        self.samples.len()
-    }
-
-    /// Check if collection is empty
-    fn is_empty(&self) -> bool {
-        self.samples.is_empty()
     }
 }
 
@@ -423,7 +417,7 @@ impl EcPeers {
     }
 
     // ========================================================================
-    // Message Handlers (TODO: will be fully implemented in later phases)
+    // Message Handlers 
     // ========================================================================
 
     /// Handle an Answer message (election response or invitation)
@@ -475,69 +469,50 @@ impl EcPeers {
         _token_storage: &dyn TokenStorageBackend,
     ) -> Vec<PeerAction> {
         use rand::Rng;
+        // TODO Verify the signature BEFORE getting mutable access to channel
+        // (to avoid borrow checker issues)
+        // self.verify_signature(answer.block, signature_mappings)?;
 
-        // Calculate distance-based acceptance probability
-        // Closer peers have higher probability of triggering a response
-        let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
-        let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
-        let distance_fraction = distance / ring_size;
-        let accept_prob = 1.0 - distance_fraction; // Inverse: close = high, far = low
+        if let Some(peer) = self.peers.get_mut(&sender_peer_id) {
+            match peer.state {
+                PeerState::Identified { last_invitation_election_at, .. } => {
+                    // Accepted - check per-peer invitation cooldown
+                    const INVITATION_COOLDOWN: EcTime = 60; // Minimum 60 ticks between invitations from same peer
 
-        // Decide whether to respond to this Invitation
-        if !rand::thread_rng().gen_bool(accept_prob) {
-            // Declined - just add sender to Identified for future consideration
-            self.add_identified_peer(sender_peer_id, time);
-            return Vec::new();
-        }
-
-        // Accepted - check per-peer invitation cooldown
-        const INVITATION_COOLDOWN: EcTime = 60; // Minimum 60 ticks between invitations from same peer
-
-        // Check if sender is already known and has a recent invitation election
-        if let Some(peer) = self.peers.get(&sender_peer_id) {
-            if let PeerState::Identified { last_invitation_election_at, .. } = peer.state {
-                if let Some(last_time) = last_invitation_election_at {
-                    if time - last_time < INVITATION_COOLDOWN {
-                        // Too soon - reject this Invitation
-                        return Vec::new();
+                    if let Some(last_time) = last_invitation_election_at {
+                        if time - last_time < INVITATION_COOLDOWN {
+                            // Too soon - reject this Invitation
+                            return Vec::new();
+                        }
                     }
+
+                    return self.start_election_from_invite(answer, signature, sender_peer_id, time);
+                },
+                PeerState::Connected { .. } => {
+                    self.update_keepalive(sender_peer_id, time);
+                },
+                PeerState::Pending { .. } => {
+                    self.promote_to_connected(sender_peer_id, time);
                 }
             }
-        }
+        } else {
+            // Calculate distance-based acceptance probability
+            // Closer peers have higher probability of triggering a response
+            let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
+            let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
+            let distance_fraction = distance / ring_size;
+            let accept_prob = 1.0 - distance_fraction; // Inverse: close = high, far = low
 
-        // Check if we already have an election for this peer
-        if self.active_elections.contains_key(&sender_peer_id) {
-            // Election already exists, just record this Invitation as an Answer
-            if let Some(ongoing) = self.active_elections.get_mut(&sender_peer_id) {
-                // Use ticket=0 to record the Invitation
-                let _ = ongoing.election.handle_answer(0, answer, signature, sender_peer_id, time);
+            // Decide whether to respond to this Invitation
+            if rand::thread_rng().gen_bool(accept_prob) {
+                return self.start_election_from_invite(answer, signature, sender_peer_id, time);
             }
-            return Vec::new();
+
+            // Declined - just add sender to Identified for future consideration
+            self.add_identified_peer(sender_peer_id, time);
         }
-
-        // Ensure sender is in Identified state before starting election
-        self.add_identified_peer(sender_peer_id, time);
-
-        // Update last_invitation_election_at timestamp
-        if let Some(peer) = self.peers.get_mut(&sender_peer_id) {
-            if let PeerState::Identified { last_invitation_election_at, .. } = &mut peer.state {
-                *last_invitation_election_at = Some(time);
-            }
-        }
-
-        // Start new election on sender's PeerId
-        self.start_election(sender_peer_id, time);
-
-        // Record the Invitation as the first Answer in this election
-        if let Some(ongoing) = self.active_elections.get_mut(&sender_peer_id) {
-            let _ = ongoing.election.handle_answer(0, answer, signature, sender_peer_id, time);
-        }
-
-        // Spawn channels for this election
-        // Mix of closest Identified peers and random Connected peers
-        let channel_actions = self.spawn_election_channels(sender_peer_id, time);
-
-        channel_actions
+        
+        return Vec::new();
     }
 
     /// Handle a Referral message (peer suggestions)
@@ -681,22 +656,6 @@ impl EcPeers {
         *self.active.get(self.idx_adj(idx, adj)).unwrap()
     }
 
-    /// Get peer indices for a token (internal use)
-    fn peers_idx_for(&self, key: &TokenId, time: EcTime) -> Vec<usize> {
-        if self.active.is_empty() {
-            return vec![];
-        }
-
-        let idx = match self.active.binary_search(key) {
-            Ok(i) => (i + 1) % self.active.len(),
-            Err(i) => i % self.active.len(),
-        };
-
-        let adj = (((key ^ self.peer_id) + time) & 0x3) as isize + 1;
-
-        vec![self.idx_adj(idx, -adj), self.idx_adj(idx, adj)]
-    }
-
     /// Get peer ID by index in active list
     pub fn for_index(&self, idx: usize) -> Option<PeerId> {
         self.active.get(idx).copied()
@@ -725,7 +684,6 @@ impl EcPeers {
             self.peers.insert(
                 *key,
                 MemPeer {
-                    id: *key,
                     state: PeerState::Connected {
                         connected_since: time,
                         last_keepalive: time,
@@ -773,7 +731,6 @@ impl EcPeers {
         self.peers.insert(
             peer_id,
             MemPeer {
-                id: peer_id,
                 state: PeerState::Identified {
                     discovered_at: time,
                     last_invitation_election_at: None,
@@ -1114,7 +1071,6 @@ impl EcPeers {
             return Vec::new(); // Election already running
         }
 
-
         // Create new election
         let election = PeerElection::new(
             challenge_token,
@@ -1125,6 +1081,52 @@ impl EcPeers {
         let ongoing = OngoingElection::new(election, time);
 
         self.active_elections.insert(challenge_token, ongoing);
+
+        // Spawn initial channels and return Query actions
+        self.spawn_election_channels(challenge_token, time)
+    }
+
+    /// Start a new peer election from an invitation (unsolicited Answer)
+    fn start_election_from_invite(
+        &mut self,
+        answer: &TokenMapping,
+        signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
+        responder_peer: PeerId,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
+        let challenge_token = answer.id;
+
+        // Check if we already have an election for this token
+        if self.active_elections.contains_key(&challenge_token) {
+            return Vec::new(); // Election already running
+        }
+
+        // Create new election from invitation
+        let election = match PeerElection::from_invitation(
+            answer,
+            signature,
+            responder_peer,
+            time,
+            self.peer_id,
+            self.config.election_config.clone(),
+        ) {
+            Ok(election) => election,
+            Err(_) => {
+                // Signature verification failed or other error
+                return Vec::new();
+            }
+        };
+
+        let ongoing = OngoingElection::new(election, time);
+
+        self.active_elections.insert(challenge_token, ongoing);
+
+        // Update last_invitation_election_at for spam prevention
+        if let Some(peer) = self.peers.get_mut(&responder_peer) {
+            if let PeerState::Identified { last_invitation_election_at, .. } = &mut peer.state {
+                *last_invitation_election_at = Some(time);
+            }
+        }
 
         // Spawn initial channels and return Query actions
         self.spawn_election_channels(challenge_token, time)
@@ -1142,11 +1144,7 @@ impl EcPeers {
         const CLOSEST_CANDIDATES: usize = 8;
 
         let mut actions = Vec::new();
-
-        // OPTIMIZATION: Always try querying the challenge token directly first
-        // If it's a peer ID, that peer owns their own ID token and will Answer immediately
-        // If it's not a peer ID, the query will fail or get Referred to the actual owner
-        let mut candidates = vec![challenge_token];
+        let mut candidates = Vec::new();
 
         // Add closest peers as additional candidates (for DHT-style routing)
         let closest = self.find_closest_peers(challenge_token, CLOSEST_CANDIDATES);
@@ -1182,52 +1180,6 @@ impl EcPeers {
         }
 
         actions
-    }
-
-    /// Pick a challenge token for election
-    /// Strategy: Prioritize peer IDs (guaranteed Answers), build ring with density gradient
-    /// Pick a random challenge token (without removing from collection)
-    /// Used when we need to peek at available tokens
-    fn pick_challenge_token(&self) -> TokenId {
-        use rand::Rng;
-        use rand::seq::IteratorRandom;
-
-        // If we have tokens in the sample collection, pick one randomly
-        if !self.token_samples.is_empty() {
-            if let Some(&token) = self.token_samples.samples.iter().choose(&mut rand::thread_rng()) {
-                return token;
-            }
-        }
-
-        // Fallback: Pure random exploration (bootstrap phase when no samples yet)
-        rand::thread_rng().gen()
-    }
-
-    /// Pick a peer for re-election (peer that hasn't been verified recently)
-    fn pick_peer_for_reelection(&self) -> Option<PeerId> {
-        use rand::seq::SliceRandom;
-
-        let connected_peers: Vec<_> = self.peers
-            .values()
-            .filter(|p| p.state.is_connected())
-            .collect();
-
-        if connected_peers.is_empty() {
-            return None;
-        }
-
-        // Pick random connected peer
-        connected_peers
-            .choose(&mut rand::thread_rng())
-            .map(|p| p.id)
-    }
-
-    /// Pick a token near a peer on the ring (for targeted re-election)
-    /// Simply returns a random offset from the peer ID
-    fn pick_token_near_peer(&self, peer: PeerId) -> TokenId {
-        use rand::Rng;
-        // Pick a random token near the peer (within ~1000 of the peer on the ring)
-        peer.wrapping_add(rand::thread_rng().gen_range(0..1000))
     }
 
     /// Process ongoing elections and check for winners
@@ -1312,82 +1264,17 @@ impl EcPeers {
             return actions;
         }
 
-        // Check if peer already exists
-        if let Some(peer) = self.peers.get_mut(&winner) {
-            // Update election stats if Connected
-            if let PeerState::Connected {
-                election_wins,
-                election_attempts,
-                quality_score,
-                ..
-            } = &mut peer.state
-            {
-                *election_wins += 1;
-                *election_attempts += 1;
-                // Update quality score with exponential moving average
-                const QUALITY_DECAY_ALPHA: f64 = 0.3;
-                *quality_score = QUALITY_DECAY_ALPHA * 1.0 + (1.0 - QUALITY_DECAY_ALPHA) * *quality_score;
-            } else {
-                // Not connected - promote to Pending
-                // This means we should send an Invitation
-                if peer.state.is_identified() {
-                    self.promote_to_pending(winner, _token, time);
-                    // Generate SendInvitation action
-                    if let Some(sig) = self.proof_system.generate_signature(token_storage, &self.peer_id, &winner) {
-                        actions.push(PeerAction::SendInvitation {
-                            receiver: winner,
-                            answer: sig.answer,
-                            signature: sig.signature,
-                        });
-                    }
-                }
-            }
-        } else {
-            // New peer discovered - add to Identified state
-            self.add_identified_peer(winner, time);
-            // Optionally promote to Pending and send invitation
-            self.promote_to_pending(winner, _token, time);
-            // Generate SendInvitation action
-            if let Some(sig) = self.proof_system.generate_signature(token_storage, &self.peer_id, &winner) {
-                actions.push(PeerAction::SendInvitation {
-                    receiver: winner,
-                    answer: sig.answer,
-                    signature: sig.signature,
-                });
-            }
-        }
-
-        // Check if we need to evict peers (over budget)
-        let connected_count = self.num_connected();
-        if connected_count > self.config.total_budget {
-            self.evict_worst_peer(time);
+        self.promote_to_pending(winner, _token, time);
+        // Generate SendInvitation action
+        if let Some(sig) = self.proof_system.generate_signature(token_storage, &self.peer_id, &winner) {
+            actions.push(PeerAction::SendInvitation {
+                receiver: winner,
+                answer: sig.answer,
+                signature: sig.signature,
+            });
         }
 
         actions
-    }
-
-    /// Evict the worst performing peer
-    fn evict_worst_peer(&mut self, time: EcTime) {
-        // Find worst peer by quality score
-        let worst_peer = self.peers
-            .iter()
-            .filter(|(_, p)| p.state.is_connected())
-            .min_by(|(_, a), (_, b)| {
-                let quality_a = match a.state {
-                    PeerState::Connected { quality_score, .. } => quality_score,
-                    _ => 1.0,
-                };
-                let quality_b = match b.state {
-                    PeerState::Connected { quality_score, .. } => quality_score,
-                    _ => 1.0,
-                };
-                quality_a.partial_cmp(&quality_b).unwrap()
-            })
-            .map(|(id, _)| *id);
-
-        if let Some(peer_id) = worst_peer {
-            self.demote_from_connected(peer_id, time);
-        }
     }
 
     // ========================================================================
@@ -1469,28 +1356,6 @@ impl EcPeers {
         actions.extend(new_election_actions);
 
         actions
-    }
-
-    /// Trigger the next election (continuous re-election)
-    /// Returns PeerActions to send Query messages
-    fn trigger_next_election(&mut self, time: EcTime) -> Vec<PeerAction> {
-        use rand::random;
-
-        // 50% of elections: verify existing peer
-        // 50% of elections: discover new peer
-        let challenge_token = if random::<bool>() && !self.peers.is_empty() {
-            // Re-elect existing peer
-            if let Some(peer) = self.pick_peer_for_reelection() {
-                self.pick_token_near_peer(peer)
-            } else {
-                self.pick_challenge_token()
-            }
-        } else {
-            // Discover new peer
-            self.pick_challenge_token()
-        };
-
-        self.start_election(challenge_token, time)
     }
 }
 
@@ -1583,20 +1448,20 @@ mod tests {
         let mut collection = TokenSampleCollection::new(1000);
 
         // Initially empty
-        assert!(collection.is_empty());
-        assert_eq!(collection.len(), 0);
+        assert!(collection.samples.is_empty());
+        assert_eq!(collection.samples.len(), 0);
 
         // Add some tokens
         assert!(collection.add_token(100));
         assert!(collection.add_token(200));
         assert!(collection.add_token(300));
 
-        assert_eq!(collection.len(), 3);
-        assert!(!collection.is_empty());
+        assert_eq!(collection.samples.len(), 3);
+        assert!(!collection.samples.is_empty());
 
         // Adding duplicate returns false
         assert!(!collection.add_token(100));
-        assert_eq!(collection.len(), 3);
+        assert_eq!(collection.samples.len(), 3);
     }
 
     #[test]
@@ -1607,16 +1472,16 @@ mod tests {
         for i in 0..5 {
             assert!(collection.add_token(i));
         }
-        assert_eq!(collection.len(), 5);
+        assert_eq!(collection.samples.len(), 5);
 
         // Adding more returns false (at capacity)
         assert!(!collection.add_token(100));
-        assert_eq!(collection.len(), 5);
+        assert_eq!(collection.samples.len(), 5);
 
         // Evict excess (should do nothing, not over capacity)
         let evicted = collection.evict_excess();
         assert_eq!(evicted, 0);
-        assert_eq!(collection.len(), 5);
+        assert_eq!(collection.samples.len(), 5);
     }
 
     #[test]
@@ -1627,12 +1492,12 @@ mod tests {
         for i in 0..10 {
             collection.add_token(i);
         }
-        assert_eq!(collection.len(), 10);
+        assert_eq!(collection.samples.len(), 10);
 
         // Pick and remove 3 tokens
         let picked = collection.pick_and_remove(3);
         assert_eq!(picked.len(), 3);
-        assert_eq!(collection.len(), 7);
+        assert_eq!(collection.samples.len(), 7);
 
         // Verify picked tokens are no longer in collection
         for &token in &picked {
@@ -1642,7 +1507,7 @@ mod tests {
         // Pick more than available
         let picked_all = collection.pick_and_remove(100);
         assert_eq!(picked_all.len(), 7); // Only 7 remaining
-        assert!(collection.is_empty());
+        assert!(collection.samples.is_empty());
     }
 
     #[test]
@@ -1653,17 +1518,17 @@ mod tests {
         for i in 0..10 {
             collection.samples.insert(i);
         }
-        assert_eq!(collection.len(), 10);
+        assert_eq!(collection.samples.len(), 10);
 
         // Evict excess
         let evicted = collection.evict_excess();
         assert_eq!(evicted, 5); // 10 - 5 = 5 evicted
-        assert_eq!(collection.len(), 5); // Now at capacity
+        assert_eq!(collection.samples.len(), 5); // Now at capacity
 
         // Evict again (should do nothing)
         let evicted_again = collection.evict_excess();
         assert_eq!(evicted_again, 0);
-        assert_eq!(collection.len(), 5);
+        assert_eq!(collection.samples.len(), 5);
     }
 
     #[test]
@@ -1694,7 +1559,7 @@ mod tests {
         collection.sample_from_answer(&answer, &signature, sender_peer_id);
 
         // Should have: answer token (100) + sender peer ID (500) + 3 signature tokens = 5 tokens
-        assert_eq!(collection.len(), 5);
+        assert_eq!(collection.samples.len(), 5);
         assert!(collection.samples.contains(&100)); // answer token
         assert!(collection.samples.contains(&500)); // sender peer ID
         assert!(collection.samples.contains(&1));   // sig tokens
@@ -1709,7 +1574,7 @@ mod tests {
         let suggested_peers = [1000, 2000];
         collection.sample_from_referral(&suggested_peers);
 
-        assert_eq!(collection.len(), 2);
+        assert_eq!(collection.samples.len(), 2);
         assert!(collection.samples.contains(&1000));
         assert!(collection.samples.contains(&2000));
 
@@ -1717,7 +1582,7 @@ mod tests {
         let with_zero = [3000, 0];
         collection.sample_from_referral(&with_zero);
 
-        assert_eq!(collection.len(), 3); // Only 3000 added
+        assert_eq!(collection.samples.len(), 3); // Only 3000 added
         assert!(collection.samples.contains(&3000));
     }
 
