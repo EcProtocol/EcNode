@@ -129,12 +129,10 @@ impl PeerState {
     }
 }
 
-/// Extended peer information with state and distance class
+/// Extended peer information with state
 struct MemPeer {
     id: PeerId,
     state: PeerState,
-    /// Cached distance class for efficient lookups
-    distance_class: usize,
     // TODO: network address, shared secret
 }
 
@@ -338,9 +336,6 @@ pub struct EcPeers {
     /// Connected peer IDs only (Vec = fast binary search routing)
     active: Vec<PeerId>,
 
-    /// Target connections per distance class (computed on-demand)
-    distance_class_budgets: Vec<usize>,
-
     /// Ongoing elections indexed by challenge token
     active_elections: HashMap<TokenId, OngoingElection>,
 
@@ -352,15 +347,6 @@ pub struct EcPeers {
 
     /// Configuration
     config: PeerManagerConfig,
-
-    /// Last time budget enforcement ran
-    last_budget_enforcement: EcTime,
-
-    /// Last time churn was applied
-    last_churn_time: EcTime,
-
-    /// Next time to trigger a new election
-    next_election_time: EcTime,
 }
 
 pub struct PeerRange {
@@ -381,7 +367,7 @@ impl PeerRange {
 
 impl EcPeers {
     // ========================================================================
-    // Distance and Budget Management
+    // Ring Distance and Peer Finding
     // ========================================================================
 
     /// Calculate ring distance between two peer IDs
@@ -389,104 +375,6 @@ impl EcPeers {
         let forward = b.wrapping_sub(a);
         let backward = a.wrapping_sub(b);
         forward.min(backward)
-    }
-
-    /// Calculate which distance class a peer belongs to
-    /// Uses log2-based bucketing: closer peers = lower class index
-    fn calculate_distance_class(&self, peer_id: PeerId) -> usize {
-        let dist = Self::ring_distance(self.peer_id, peer_id);
-        if dist == 0 {
-            return 0;
-        }
-        // Use leading zeros to get log2-based classes
-        // Closer peers (smaller distance) have more leading zeros -> lower class
-        (64 - dist.leading_zeros()) as usize
-    }
-
-    /// Allocate budget across distance classes using exponential gradient
-    /// Closer classes get more connections
-    fn allocate_distance_budgets(total_budget: usize, num_classes: usize) -> Vec<usize> {
-        if num_classes == 0 {
-            return vec![];
-        }
-
-        // Exponential decay: weight[i] = 2^(-i/4)
-        // This gives more weight to closer classes
-        let weights: Vec<f64> = (0..num_classes)
-            .map(|i| 2.0_f64.powf(-(i as f64) / 4.0))
-            .collect();
-
-        let total_weight: f64 = weights.iter().sum();
-
-        // Allocate budget proportionally
-        let mut budgets: Vec<usize> = weights
-            .iter()
-            .map(|&w| ((w / total_weight) * total_budget as f64).round() as usize)
-            .collect();
-
-        // Ensure sum equals total_budget (handle rounding errors)
-        let sum: usize = budgets.iter().sum();
-        if sum < total_budget {
-            // Add remainder to closest class
-            budgets[0] += total_budget - sum;
-        } else if sum > total_budget {
-            // Remove excess from furthest class
-            let excess = sum - total_budget;
-            for i in (0..num_classes).rev() {
-                if budgets[i] >= excess {
-                    budgets[i] -= excess;
-                    break;
-                }
-            }
-        }
-
-        budgets
-    }
-
-    /// Initialize distance class budgets
-    fn initialize_distance_class_budgets(config: &PeerManagerConfig) -> Vec<usize> {
-        // Create 64 distance classes (for u64 address space)
-        const NUM_CLASSES: usize = 64;
-        Self::allocate_distance_budgets(config.total_budget, NUM_CLASSES)
-    }
-
-    /// Distance bounds for a class: [2^i, 2^(i+1))
-    fn distance_bounds(class_index: usize) -> (u64, u64) {
-        let lower = if class_index == 0 { 1 } else { 1u64 << class_index };
-        let upper = 1u64 << (class_index + 1);
-        (lower, upper)
-    }
-
-    /// Check if a peer is in a specific distance class
-    fn is_peer_in_class(&self, peer_id: PeerId, class_index: usize) -> bool {
-        let dist = Self::ring_distance(self.peer_id, peer_id);
-        let (lower, upper) = Self::distance_bounds(class_index);
-        dist >= lower && dist < upper
-    }
-
-    /// Count Connected peers in a distance class (bidirectional)
-    fn connected_count_in_class(&self, class_index: usize) -> usize {
-        let (lower, upper) = Self::distance_bounds(class_index);
-
-        self.active.iter()
-            .filter(|&&peer_id| {
-                let dist = Self::ring_distance(self.peer_id, peer_id);
-                dist >= lower && dist < upper
-            })
-            .count()
-    }
-
-    /// Get Connected peers in a distance class (bidirectional)
-    fn connected_peers_in_class(&self, class_index: usize) -> Vec<PeerId> {
-        let (lower, upper) = Self::distance_bounds(class_index);
-
-        self.active.iter()
-            .filter(|&&peer_id| {
-                let dist = Self::ring_distance(self.peer_id, peer_id);
-                dist >= lower && dist < upper
-            })
-            .copied()
-            .collect()
     }
 
     /// Find closest peers to a target token (for election channels)
@@ -518,28 +406,6 @@ impl EcPeers {
         candidates.into_iter().take(count).collect()
     }
 
-    /// Pick random target token in distance class
-    fn pick_target_in_distance_class(&self, class_index: usize) -> TokenId {
-        let (lower, upper) = Self::distance_bounds(class_index);
-
-        use rand::Rng;
-        let dist = rand::thread_rng().gen_range(lower..upper);
-
-        // Random direction (bidirectional distance class)
-        if rand::random() {
-            self.peer_id.wrapping_add(dist)
-        } else {
-            self.peer_id.wrapping_sub(dist)
-        }
-    }
-
-    /// Random sample from slice (for eviction)
-    fn random_sample(peers: &[PeerId], count: usize) -> Vec<PeerId> {
-        use rand::seq::SliceRandom;
-        peers.choose_multiple(&mut rand::thread_rng(), count.min(peers.len()))
-            .copied()
-            .collect()
-    }
 
     // ========================================================================
     // Legacy Helper Methods (backward compatibility)
@@ -861,7 +727,6 @@ impl EcPeers {
         } else {
             // Add new peer in Connected state (for backward compatibility)
             // This is how seed_peer works - directly to Connected
-            let distance_class = self.calculate_distance_class(*key);
             self.peers.insert(
                 *key,
                 MemPeer {
@@ -873,7 +738,6 @@ impl EcPeers {
                         election_attempts: 0,
                         quality_score: 1.0, // Start with max quality
                     },
-                    distance_class,
                 },
             );
 
@@ -911,7 +775,6 @@ impl EcPeers {
         }
 
         // Add to Identified state
-        let distance_class = self.calculate_distance_class(peer_id);
         self.peers.insert(
             peer_id,
             MemPeer {
@@ -920,7 +783,6 @@ impl EcPeers {
                     discovered_at: time,
                     last_invitation_election_at: None,
                 },
-                distance_class,
             },
         );
 
@@ -1213,7 +1075,6 @@ impl EcPeers {
 
     /// Create a new peer manager with custom configuration
     pub fn with_config(peer_id: PeerId, config: PeerManagerConfig) -> Self {
-        let distance_class_budgets = Self::initialize_distance_class_budgets(&config);
         let proof_system = ProofOfStorage::new();
         let token_samples = TokenSampleCollection::new(config.token_sample_max_capacity);
 
@@ -1221,14 +1082,10 @@ impl EcPeers {
             peer_id,
             peers: BTreeMap::new(),
             active: Vec::new(),
-            distance_class_budgets,
             active_elections: HashMap::new(),
             proof_system,
             token_samples,
             config,
-            last_budget_enforcement: 0,
-            last_churn_time: 0,
-            next_election_time: 0,
         }
     }
 
