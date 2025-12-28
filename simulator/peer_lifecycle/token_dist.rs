@@ -158,6 +158,36 @@ impl GlobalTokenMapping {
     pub fn total_tokens(&self) -> usize {
         self.mappings.len()
     }
+
+    /// Allocate a new peer ID from the existing token pool
+    ///
+    /// Picks a random token that is not already used as a peer ID.
+    /// Returns None if no available tokens exist.
+    pub fn allocate_peer_id(&mut self, existing_peer_ids: &[PeerId]) -> Option<PeerId> {
+        // Get all tokens that are not already peer IDs
+        let available_tokens: Vec<TokenId> = self.mappings.keys()
+            .filter(|&token| !existing_peer_ids.contains(token))
+            .copied()
+            .collect();
+
+        if available_tokens.is_empty() {
+            return None;
+        }
+
+        // Pick a random token
+        use rand::seq::SliceRandom;
+        let peer_id = *available_tokens.choose(&mut self.rng)?;
+
+        // Add to peer_ids list
+        self.peer_ids.push(peer_id);
+
+        Some(peer_id)
+    }
+
+    /// Get all current peer IDs
+    pub fn peer_ids(&self) -> &[PeerId] {
+        &self.peer_ids
+    }
 }
 
 /// Calculate ring distance (shortest path on circular ID space)

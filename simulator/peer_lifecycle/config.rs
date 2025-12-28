@@ -137,6 +137,7 @@ pub enum NetworkEvent {
         count: usize,
         coverage_fraction: f64, // Quality of new peers (0.0-1.0)
         initial_knowledge: Vec<PeerId>, // Bootstrap peers they know
+        group_name: Option<String>, // Optional group identifier for tracking
     },
 
     /// Gracefully remove peers (they send goodbye messages)

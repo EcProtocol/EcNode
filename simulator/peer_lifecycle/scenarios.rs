@@ -84,6 +84,7 @@ impl RoundBuilder {
         count: usize,
         coverage: f64,
         bootstrap_method: BootstrapMethod,
+        group_name: impl Into<String>,
     ) -> ScenarioBuilder {
         let initial_knowledge = match bootstrap_method {
             BootstrapMethod::Random(n) => {
@@ -101,6 +102,7 @@ impl RoundBuilder {
                 count,
                 coverage_fraction: coverage,
                 initial_knowledge,
+                group_name: Some(group_name.into()),
             },
         });
         self.scenario
@@ -177,11 +179,10 @@ impl ScenarioBuilder {
     pub fn steady_state_joins() -> Self {
         Self::new()
             .at_round(100).report_stats("Before joins - steady state")
-            // Note: PeerJoin not yet implemented in runner, just placeholder
-            // .at_round(110).peers_join(5, 0.95, BootstrapMethod::Random(3))
-            // .at_round(120).report_stats("After high-coverage joins")
-            // .at_round(130).peers_join(5, 0.50, BootstrapMethod::Random(3))
-            // .at_round(140).report_stats("After low-coverage joins")
+            .at_round(110).peers_join(5, 0.95, BootstrapMethod::Random(3), "high-coverage")
+            .at_round(120).report_stats("After high-coverage joins")
+            .at_round(130).peers_join(5, 0.50, BootstrapMethod::Random(3), "low-coverage")
+            .at_round(140).report_stats("After low-coverage joins")
             .at_round(150).report_stats("Final state")
     }
 

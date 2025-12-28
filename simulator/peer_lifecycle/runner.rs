@@ -22,6 +22,11 @@ pub struct PeerLifecycleRunner {
 
     // Network state
     peers: BTreeMap<PeerId, SimPeer>,
+    global_mapping: Option<GlobalTokenMapping>,  // Stored for dynamic peer allocation
+
+    // Peer group tracking
+    peer_groups: BTreeMap<String, PeerGroup>,
+    peer_to_group: BTreeMap<PeerId, String>,  // Maps peer ID to group name
 
     // Message queue
     messages: VecDeque<MessageEnvelope>,
@@ -30,6 +35,15 @@ pub struct PeerLifecycleRunner {
     // Metrics tracking
     metrics_history: Vec<RoundMetrics>,
     total_messages: MessageCounter,
+}
+
+/// A group of peers for tracking and analysis
+#[derive(Debug, Clone)]
+pub struct PeerGroup {
+    pub name: String,
+    pub peer_ids: Vec<PeerId>,
+    pub join_round: usize,
+    pub coverage_fraction: f64,
 }
 
 /// A simulated peer
@@ -96,6 +110,9 @@ impl PeerLifecycleRunner {
             rng,
             current_round: 0,
             peers: BTreeMap::new(),
+            global_mapping: None,
+            peer_groups: BTreeMap::new(),
+            peer_to_group: BTreeMap::new(),
             messages: VecDeque::new(),
             delayed_messages: VecDeque::new(),
             metrics_history: Vec::new(),
@@ -201,6 +218,23 @@ impl PeerLifecycleRunner {
 
         // Initialize topology (seed initial peer knowledge and connections)
         self.initialize_topology(&global_mapping, view_width);
+
+        // Store global mapping for dynamic peer allocation
+        self.global_mapping = Some(global_mapping);
+
+        // Create "initial" peer group with all initial peers
+        let peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        let initial_group = PeerGroup {
+            name: "initial".to_string(),
+            peer_ids: peer_ids.clone(),
+            join_round: 0,
+            coverage_fraction: self.config.token_distribution.coverage_fraction,
+        };
+
+        self.peer_groups.insert("initial".to_string(), initial_group);
+        for peer_id in peer_ids {
+            self.peer_to_group.insert(peer_id, "initial".to_string());
+        }
     }
 
     /// Initialize peer topology based on configuration
@@ -625,12 +659,112 @@ impl PeerLifecycleRunner {
                         println!("  [Round {}] Network loss changed to {:.1}%", self.current_round, loss * 100.0);
                     }
                 }
-                // TODO: Implement other events (PeerJoin, PeerCrash, etc.)
+                NetworkEvent::PeerJoin { count, coverage_fraction, initial_knowledge, group_name } => {
+                    self.handle_peer_join(count, coverage_fraction, initial_knowledge, group_name);
+                }
+                // TODO: Implement other events (PeerCrash, PeerLeave, PauseElections)
                 _ => {
                     println!("  [Round {}] Event {:?} not yet implemented", self.current_round, event);
                 }
             }
         }
+    }
+
+    /// Handle PeerJoin event
+    fn handle_peer_join(
+        &mut self,
+        count: usize,
+        coverage_fraction: f64,
+        initial_knowledge: Vec<PeerId>,
+        group_name: Option<String>,
+    ) {
+        let group_name = group_name.unwrap_or_else(|| format!("join-r{}", self.current_round));
+
+        println!("  [Round {}] {} peers joining (group: '{}', coverage: {:.0}%)",
+            self.current_round, count, group_name, coverage_fraction * 100.0);
+
+        let global_mapping = self.global_mapping.as_mut()
+            .expect("Global mapping not initialized");
+
+        // Get existing peer IDs
+        let existing_peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
+
+        // Calculate view_width (same as for initial peers)
+        let total_peers = existing_peer_ids.len() + count;
+        let view_width = GlobalTokenMapping::calculate_view_width(
+            total_peers,
+            self.config.token_distribution.neighbor_overlap,
+        );
+
+        // Allocate new peer IDs and create peers
+        let mut new_peer_ids = Vec::new();
+        for _ in 0..count {
+            // Allocate peer ID from token pool
+            let peer_id = global_mapping.allocate_peer_id(&existing_peer_ids)
+                .expect("Failed to allocate peer ID from token pool");
+
+            // Get this peer's view of the global token mapping
+            let token_view = global_mapping.get_peer_view(
+                peer_id,
+                view_width,
+                coverage_fraction,
+            );
+
+            // Create token storage backend
+            use ec_rust::ec_proof_of_storage::TokenStorageBackend;
+            let mut token_storage = MemTokens::new();
+
+            // Store all tokens from the view
+            let mut known_tokens = Vec::new();
+            for (token_id, block_id) in token_view {
+                token_storage.set(&token_id, &block_id, 0);
+                known_tokens.push(token_id);
+            }
+
+            // Create peer manager
+            let mut peer_manager = EcPeers::with_config(peer_id, self.config.peer_config.clone());
+
+            // Add initial knowledge (bootstrap peers)
+            // Note: initial_knowledge is passed from the event but could also use a strategy
+            for &known_peer_id in &initial_knowledge {
+                if known_peer_id != peer_id && self.peers.contains_key(&known_peer_id) {
+                    peer_manager.add_seed_peer(known_peer_id, self.current_round as EcTime);
+                }
+            }
+
+            let peer = SimPeer {
+                peer_id,
+                peer_manager,
+                token_storage,
+                known_tokens,
+                active: true,
+            };
+
+            self.peers.insert(peer_id, peer);
+            new_peer_ids.push(peer_id);
+        }
+
+        // Create or update peer group
+        if let Some(group) = self.peer_groups.get_mut(&group_name) {
+            // Group already exists, add new peers to it
+            group.peer_ids.extend(new_peer_ids.iter().copied());
+        } else {
+            // Create new group
+            let group = PeerGroup {
+                name: group_name.clone(),
+                peer_ids: new_peer_ids.clone(),
+                join_round: self.current_round,
+                coverage_fraction,
+            };
+            self.peer_groups.insert(group_name.clone(), group);
+        }
+
+        // Map peers to group
+        for peer_id in new_peer_ids {
+            self.peer_to_group.insert(peer_id, group_name.clone());
+        }
+
+        println!("    ✓ {} peers added to group '{}'", count, group_name);
     }
 
     /// Report current statistics (for ReportStats event)
@@ -718,6 +852,54 @@ impl PeerLifecycleRunner {
             self.total_messages.queries,
             self.total_messages.answers,
             self.total_messages.referrals);
+
+        // Per-group statistics
+        if self.peer_groups.len() > 1 {
+            println!("\n╔════════════════════════════════════════════════════════╗");
+            println!("║  Per-Group Statistics                                  ║");
+            println!("╚════════════════════════════════════════════════════════╝");
+
+            for (group_name, group) in &self.peer_groups {
+                // Calculate metrics for this group's peers
+                let mut group_connected: Vec<usize> = Vec::new();
+                let mut group_steepness: Vec<f64> = Vec::new();
+                let mut group_elections_started = 0;
+                let mut group_elections_completed = 0;
+
+                for &peer_id in &group.peer_ids {
+                    if let Some(peer) = self.peers.get(&peer_id) {
+                        if peer.active {
+                            let num_connected = peer.peer_manager.num_connected();
+                            group_connected.push(num_connected);
+
+                            let active_peers = peer.peer_manager.get_active_peers();
+                            let steepness = calculate_gradient_steepness(peer_id, active_peers);
+                            group_steepness.push(steepness);
+
+                            let (started, completed, _, _) = peer.peer_manager.get_election_stats();
+                            group_elections_started += started;
+                            group_elections_completed += completed;
+                        }
+                    }
+                }
+
+                if !group_connected.is_empty() {
+                    let avg_connected = group_connected.iter().sum::<usize>() as f64 / group_connected.len() as f64;
+                    let avg_locality = group_steepness.iter().sum::<f64>() / group_steepness.len() as f64;
+                    let success_rate = if group_elections_started > 0 {
+                        (group_elections_completed as f64 / group_elections_started as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    println!("\n  Group '{}' ({} peers, joined round {}, coverage {:.0}%):",
+                        group_name, group.peer_ids.len(), group.join_round, group.coverage_fraction * 100.0);
+                    println!("    Avg Connected: {:.1}", avg_connected);
+                    println!("    Locality: {:.3}", avg_locality);
+                    println!("    Election Success: {:.1}%", success_rate);
+                }
+            }
+        }
 
         println!();
     }

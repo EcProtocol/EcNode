@@ -42,6 +42,10 @@ path = "simulator/scenario_bootstrap.rs"
 name = "scenario_coverage_comparison"
 path = "simulator/scenario_coverage_comparison.rs"
 
+[[example]]
+name = "scenario_group_comparison"
+path = "simulator/scenario_group_comparison.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"
