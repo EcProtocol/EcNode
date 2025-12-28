@@ -76,6 +76,12 @@ pub enum TopologyMode {
     /// Ring topology with N neighbors on each side, all Connected
     Ring { neighbors: usize },
 
+    /// Bootstrap scenario: Each peer starts with N randomly selected peers in Identified state
+    /// This simulates a bootstrap scenario where peers discover the network gradually
+    RandomIdentified {
+        peers_per_node: usize,  // Number of random Identified peers each node starts with
+    },
+
     /// No initial connections (peers must discover via elections)
     Isolated,
 }
@@ -152,6 +158,12 @@ pub enum NetworkEvent {
     /// Pause elections for N rounds (test recovery)
     PauseElections {
         duration: usize,
+    },
+
+    /// Report current statistics to console
+    /// Useful for monitoring long simulations at checkpoints
+    ReportStats {
+        label: Option<String>,  // Optional label for this checkpoint
     },
 }
 

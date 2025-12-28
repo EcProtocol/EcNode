@@ -1106,6 +1106,12 @@ impl EcPeers {
         )
     }
 
+    /// Get the active (Connected) peer IDs in sorted order
+    /// Used by simulator for connectivity analysis
+    pub fn get_active_peers(&self) -> &[PeerId] {
+        &self.active
+    }
+
     // ========================================================================
     // Election Management (Phase 3)
     // ========================================================================

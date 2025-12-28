@@ -34,6 +34,14 @@ path = "simulator/event_logging_test.rs"
 name = "fixed_seed_test"
 path = "simulator/fixed_seed_test.rs"
 
+[[example]]
+name = "scenario_bootstrap"
+path = "simulator/scenario_bootstrap.rs"
+
+[[example]]
+name = "scenario_coverage_comparison"
+path = "simulator/scenario_coverage_comparison.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"

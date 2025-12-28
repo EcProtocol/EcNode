@@ -8,6 +8,9 @@ use peer_lifecycle::{
     InitialNetworkState,
     TokenDistributionConfig,
     TopologyMode,
+    EventSchedule,
+    ScheduledEvent,
+    NetworkEvent,
 };
 
 fn main() {
@@ -31,14 +34,13 @@ fn main() {
     config.peer_config.min_collection_time = 10; // Wait 10 ticks before checking election completion
     config.peer_config.pending_timeout = 1000; // Long timeout for discovered peers
     config.peer_config.elections_per_tick = 3; // Trigger multiple elections per tick
-    // Network configuration matching Design/peer_lifecycle_simulator.md
-    // Test scenario: 30 connected peers, 90% token coverage, 20% peer knowledge
+    // Bootstrap scenario test: Each peer starts with 5 random Identified peers
+    // This tests the network's ability to bootstrap from minimal initial knowledge
     config.initial_state = InitialNetworkState {
-        num_peers: 30, // Start with 30 connected peers
-        // LocalKnowledge: Peers know subset of neighbors, some are Connected
-        initial_topology: TopologyMode::LocalKnowledge {
-            peer_knowledge_fraction: 0.5, // Know 50% of nearby peers (Identified)
-            connected_fraction: 0.4,       // 40% of known peers start as Connected
+        num_peers: 30, // Start with 30 peers
+        // RandomIdentified: Each peer knows 5 random other peers (Identified state)
+        initial_topology: TopologyMode::RandomIdentified {
+            peers_per_node: 5, // Each peer starts with 5 random Identified peers
         },
         bootstrap_rounds: 100,
     };
@@ -51,6 +53,30 @@ fn main() {
         coverage_fraction: 0.9,    // Know 90% of nearby tokens (high quality)
     };
     config.metrics.sample_interval = 10;
+
+    // Add scheduled events to monitor progress
+    config.events = EventSchedule {
+        events: vec![
+            ScheduledEvent {
+                round: 50,
+                event: NetworkEvent::ReportStats {
+                    label: Some("After bootstrap phase".to_string()),
+                },
+            },
+            ScheduledEvent {
+                round: 100,
+                event: NetworkEvent::ReportStats {
+                    label: Some("Mid-simulation checkpoint".to_string()),
+                },
+            },
+            ScheduledEvent {
+                round: 150,
+                event: NetworkEvent::ReportStats {
+                    label: Some("Near end of simulation".to_string()),
+                },
+            },
+        ],
+    };
 
     println!("Starting simulation...");
     println!("  Peers: {}", config.initial_state.num_peers);

@@ -112,6 +112,9 @@ impl PeerLifecycleRunner {
         for round in 0..self.config.rounds {
             self.current_round = round;
 
+            // Process scheduled events for this round
+            self.process_scheduled_events();
+
             // Deliver delayed messages from previous round
             self.process_delayed_messages();
 
@@ -125,7 +128,7 @@ impl PeerLifecycleRunner {
             if self.should_sample_metrics() {
                 self.collect_metrics();
             }
-            
+
             if round % 10 == 0 {
                 println!("round {}", round);
             }
@@ -281,6 +284,31 @@ impl PeerLifecycleRunner {
                             let backward_idx = (i + sorted_peers.len() - offset) % sorted_peers.len();
                             peer.peer_manager.add_seed_peer(sorted_peers[backward_idx], 0);
                         }
+                    }
+                }
+            }
+
+            TopologyMode::RandomIdentified { peers_per_node } => {
+                // Bootstrap scenario: Each peer gets N random peers in Identified state
+                use rand::seq::SliceRandom;
+
+                for (peer_id, peer) in &mut self.peers {
+                    // Get all other peers
+                    let mut available_peers: Vec<PeerId> = peer_ids.iter()
+                        .filter(|&&id| id != *peer_id)
+                        .copied()
+                        .collect();
+
+                    // Shuffle and take N peers
+                    available_peers.shuffle(&mut self.rng);
+                    let selected_peers: Vec<PeerId> = available_peers.iter()
+                        .take(*peers_per_node)
+                        .copied()
+                        .collect();
+
+                    // Add selected peers as Identified (using add_seed_peer which adds to Identified)
+                    for &other_id in &selected_peers {
+                        peer.peer_manager.add_seed_peer(other_id, 0);
                     }
                 }
             }
@@ -454,6 +482,11 @@ impl PeerLifecycleRunner {
 
     /// Collect metrics for current round
     fn collect_metrics(&mut self) {
+        use std::collections::BTreeMap;
+        use super::stats::calculate_gradient_steepness;
+        use super::stats::calculate_gradient_distribution;
+        use super::stats::calculate_connected_peer_distribution;
+
         let mut metrics = RoundMetrics::new(
             self.current_round,
             self.current_round as u64 * self.config.tick_duration_ms,
@@ -471,6 +504,9 @@ impl PeerLifecycleRunner {
         let mut total_elections_completed = 0;
         let mut total_elections_timeout = 0;
         let mut total_elections_splitbrain = 0;
+
+        // Collect gradient steepness for each peer
+        let mut peer_steepness_map: BTreeMap<PeerId, f64> = BTreeMap::new();
 
         for peer in self.peers.values() {
             if peer.active {
@@ -492,6 +528,11 @@ impl PeerLifecycleRunner {
                 total_elections_completed += completed;
                 total_elections_timeout += timeout;
                 total_elections_splitbrain += splitbrain;
+
+                // Calculate gradient steepness for this peer
+                let active_peers = peer.peer_manager.get_active_peers();
+                let steepness = calculate_gradient_steepness(peer.peer_id, active_peers);
+                peer_steepness_map.insert(peer.peer_id, steepness);
             }
         }
 
@@ -523,6 +564,20 @@ impl PeerLifecycleRunner {
                 .sum::<f64>() / connected_counts.len() as f64;
             let stddev = variance.sqrt();
 
+            // Calculate connected peer count distribution (quartiles by default)
+            let connected_peer_distribution = if !connected_counts.is_empty() {
+                Some(calculate_connected_peer_distribution(&connected_counts, 4))
+            } else {
+                None
+            };
+
+            // Calculate gradient steepness distribution (quartiles by default)
+            let gradient_distribution = if !peer_steepness_map.is_empty() {
+                Some(calculate_gradient_distribution(&peer_steepness_map, 4))
+            } else {
+                None
+            };
+
             metrics.network_health = NetworkHealth {
                 min_connected_peers: min,
                 max_connected_peers: max,
@@ -530,6 +585,8 @@ impl PeerLifecycleRunner {
                 stddev_connected_peers: stddev,
                 ring_coverage_percent: 0.0, // TODO: Calculate
                 partition_detected: false,
+                connected_peer_distribution,
+                gradient_distribution,
             };
         }
 
@@ -540,6 +597,129 @@ impl PeerLifecycleRunner {
         metrics.election_stats.total_split_brain_detected = total_elections_splitbrain;
 
         self.metrics_history.push(metrics);
+    }
+
+    /// Process scheduled events for the current round
+    fn process_scheduled_events(&mut self) {
+        use super::config::NetworkEvent;
+
+        // Find events scheduled for this round
+        let events_for_round: Vec<NetworkEvent> = self.config.events.events
+            .iter()
+            .filter(|e| e.round == self.current_round)
+            .map(|e| e.event.clone())
+            .collect();
+
+        for event in events_for_round {
+            match event {
+                NetworkEvent::ReportStats { label } => {
+                    self.report_current_stats(label);
+                }
+                NetworkEvent::NetworkCondition { delay_fraction, loss_fraction } => {
+                    if let Some(delay) = delay_fraction {
+                        self.config.network.delay_fraction = delay;
+                        println!("  [Round {}] Network delay changed to {:.1}%", self.current_round, delay * 100.0);
+                    }
+                    if let Some(loss) = loss_fraction {
+                        self.config.network.loss_fraction = loss;
+                        println!("  [Round {}] Network loss changed to {:.1}%", self.current_round, loss * 100.0);
+                    }
+                }
+                // TODO: Implement other events (PeerJoin, PeerCrash, etc.)
+                _ => {
+                    println!("  [Round {}] Event {:?} not yet implemented", self.current_round, event);
+                }
+            }
+        }
+    }
+
+    /// Report current statistics (for ReportStats event)
+    fn report_current_stats(&mut self, label: Option<String>) {
+        use super::stats::{RoundMetrics, calculate_gradient_steepness, calculate_gradient_distribution, calculate_connected_peer_distribution};
+        use std::collections::BTreeMap;
+
+        let checkpoint_label = label.unwrap_or_else(|| format!("Round {}", self.current_round));
+
+        println!("\n╔════════════════════════════════════════════════════════╗");
+        println!("║  CHECKPOINT: {:<43} ║", checkpoint_label);
+        println!("╚════════════════════════════════════════════════════════╝");
+
+        // Collect current metrics (similar to collect_metrics but for immediate display)
+        let mut connected_counts: Vec<usize> = Vec::new();
+        let mut peer_steepness_map: BTreeMap<PeerId, f64> = BTreeMap::new();
+
+        let mut total_identified = 0;
+        let mut total_pending = 0;
+        let mut total_connected = 0;
+        let mut active_count = 0;
+
+        let mut total_elections_started = 0;
+        let mut total_elections_completed = 0;
+        let mut total_elections_timeout = 0;
+        let mut total_elections_splitbrain = 0;
+
+        for peer in self.peers.values() {
+            if peer.active {
+                active_count += 1;
+
+                let num_identified = peer.peer_manager.num_identified();
+                let num_pending = peer.peer_manager.num_pending();
+                let num_connected = peer.peer_manager.num_connected();
+
+                total_identified += num_identified;
+                total_pending += num_pending;
+                total_connected += num_connected;
+                connected_counts.push(num_connected);
+
+                let (started, completed, timeout, splitbrain) = peer.peer_manager.get_election_stats();
+                total_elections_started += started;
+                total_elections_completed += completed;
+                total_elections_timeout += timeout;
+                total_elections_splitbrain += splitbrain;
+
+                let active_peers = peer.peer_manager.get_active_peers();
+                let steepness = calculate_gradient_steepness(peer.peer_id, active_peers);
+                peer_steepness_map.insert(peer.peer_id, steepness);
+            }
+        }
+
+        println!("\n  Peer States:");
+        println!("    Active: {}", active_count);
+        println!("    Identified: {} avg", if active_count > 0 { total_identified / active_count } else { 0 });
+        println!("    Pending: {} avg", if active_count > 0 { total_pending / active_count } else { 0 });
+        println!("    Connected: {} avg", if active_count > 0 { total_connected / active_count } else { 0 });
+
+        println!("\n  Elections:");
+        println!("    Started: {}", total_elections_started);
+        println!("    Completed: {}", total_elections_completed);
+        println!("    Timed Out: {}", total_elections_timeout);
+        if total_elections_started > 0 {
+            let success_rate = (total_elections_completed as f64 / total_elections_started as f64) * 100.0;
+            println!("    Success Rate: {:.1}%", success_rate);
+        }
+
+        if !connected_counts.is_empty() {
+            let min = *connected_counts.iter().min().unwrap();
+            let max = *connected_counts.iter().max().unwrap();
+            let avg = connected_counts.iter().sum::<usize>() as f64 / connected_counts.len() as f64;
+
+            println!("\n  Connected Peers: min={}, max={}, avg={:.1}", min, max, avg);
+        }
+
+        if !peer_steepness_map.is_empty() {
+            let gradient_dist = calculate_gradient_distribution(&peer_steepness_map, 4);
+            println!("\n  Locality Gradient: avg={:.3}, strong (≥0.7)={:.1}%",
+                gradient_dist.avg_steepness,
+                gradient_dist.near_ideal_percent);
+        }
+
+        println!("\n  Messages: {} total ({} queries, {} answers, {} referrals)",
+            self.total_messages.queries + self.total_messages.answers + self.total_messages.referrals,
+            self.total_messages.queries,
+            self.total_messages.answers,
+            self.total_messages.referrals);
+
+        println!();
     }
 
     /// Build final simulation result

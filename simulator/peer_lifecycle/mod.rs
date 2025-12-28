@@ -4,6 +4,7 @@ pub mod config;
 pub mod stats;
 pub mod token_dist;
 pub mod runner;
+pub mod scenarios;
 
 // Re-export commonly used types
 pub use config::{
@@ -11,6 +12,7 @@ pub use config::{
     InitialNetworkState,
     TokenDistributionConfig,
     EventSchedule,
+    ScheduledEvent,
     NetworkEvent,
     PeerSelection,
     TopologyMode,
@@ -25,3 +27,4 @@ pub use stats::{
 
 pub use token_dist::GlobalTokenMapping;
 pub use runner::PeerLifecycleRunner;
+pub use scenarios::{ScenarioBuilder, BootstrapMethod};
