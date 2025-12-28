@@ -142,6 +142,7 @@ struct MemPeer {
 /// Actions that EcPeers requests EcNode to perform
 #[derive(Debug, Clone)]
 pub enum PeerAction {
+    // TDOO handle forward / on-behalf-of
     /// Send a Query message to a peer (for elections)
     SendQuery {
         receiver: PeerId,
@@ -236,24 +237,18 @@ impl TokenSampleCollection {
         self.add_token(sender_peer_id);
 
         // Add the answer token
-        if answer.id != 0 {
-            self.add_token(answer.id);
-        }
+        self.add_token(answer.id);
 
         // Sample from signature tokens
         for sig_token in signature {
-            if sig_token.id != 0 {
-                self.add_token(sig_token.id);
-            }
+            self.add_token(sig_token.id);
         }
     }
 
     /// Sample peer IDs from a Referral message
     fn sample_from_referral(&mut self, suggested_peers: &[PeerId; 2]) {
         for &peer_id in suggested_peers {
-            if peer_id != 0 {
-                self.add_token(peer_id);
-            }
+            self.add_token(peer_id);
         }
     }
 
@@ -381,6 +376,8 @@ impl EcPeers {
     fn find_closest_peers(&self, target: TokenId, count: usize) -> Vec<PeerId> {
         let mut candidates = Vec::new();
 
+        // TODO just next/next_back into vec. No sort etc.
+
         // Walk forward from target (including target)
         let forward: Vec<_> = self.peers.range(target..)
             .take(count)
@@ -482,9 +479,7 @@ impl EcPeers {
         _token_storage: &dyn TokenStorageBackend,
     ) -> Vec<PeerAction> {
         use rand::Rng;
-        // TODO Verify the signature BEFORE getting mutable access to channel
-        // (to avoid borrow checker issues)
-        // self.verify_signature(answer.block, signature_mappings)?;
+        let mut trigger_election = false;
 
         if let Some(peer) = self.peers.get_mut(&sender_peer_id) {
             match peer.state {
@@ -493,13 +488,10 @@ impl EcPeers {
                     const INVITATION_COOLDOWN: EcTime = 60; // Minimum 60 ticks between invitations from same peer
 
                     if let Some(last_time) = last_invitation_election_at {
-                        if time - last_time < INVITATION_COOLDOWN {
-                            // Too soon - reject this Invitation
-                            return Vec::new();
+                        if time - last_time > INVITATION_COOLDOWN {
+                            trigger_election = true
                         }
                     }
-
-                    return self.start_election_from_invite(answer, signature, sender_peer_id, time);
                 },
                 PeerState::Connected { .. } => {
                     self.update_keepalive(sender_peer_id, time);
@@ -509,6 +501,10 @@ impl EcPeers {
                 }
             }
         } else {
+            trigger_election = true
+        }
+        
+        if trigger_election {
             // Calculate distance-based acceptance probability
             // Closer peers have higher probability of triggering a response
             let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
@@ -544,12 +540,6 @@ impl EcPeers {
             match ongoing.election.handle_referral(ticket, token, suggested_peers, sender) {
                 Ok(next_peer) => {
                     // Election returned a suggested peer to try next
-                    self.token_samples.sample_from_referral(&suggested_peers);
-
-                    // Note: We DO allow querying non-Connected peers during discovery!
-                    // The referral mechanism needs to work across the whole network,
-                    // not just among already-Connected peers. This allows DHT-style
-                    // routing to find token owners even if they're not directly connected.
 
                     // Create a new channel to the suggested peer
                     if let Ok(new_ticket) = ongoing.election.create_channel(next_peer, time) {
@@ -571,10 +561,13 @@ impl EcPeers {
             None
         };
 
-        // Add suggested peers to Identified state (after releasing mutable borrow)
-        for &peer_id in &suggested_peers {
-            if peer_id != 0 {
-                self.add_identified_peer(peer_id, time);
+        // DOC only if we recognize this Referral
+        if action.is_some() {
+            // Add suggested peers to Identified state (after releasing mutable borrow)
+            for &peer_id in &suggested_peers {
+                if peer_id != 0 {
+                    self.add_identified_peer(peer_id, time);
+                }
             }
         }
 
@@ -613,6 +606,11 @@ impl EcPeers {
                 ticket,
             });
         }
+
+        // Note: We DO allow querying non-Connected peers during discovery!
+        // The referral mechanism needs to work across the whole network,
+        // not just among already-Connected peers. This allows DHT-style
+        // routing to find token owners even if they're not directly connected.
 
         // We don't own the token - find closest Connected Peers to refer
         let closest = self.find_closest_peers(token, 2);
@@ -1350,51 +1348,6 @@ impl EcPeers {
     // Main Tick Method (Phase 3)
     // ========================================================================
 
-    /// Send random Invitations to Identified peers
-    /// This converts Identified peers to Pending/Connected state
-    fn send_random_invitations(
-        &mut self,
-        token_storage: &dyn TokenStorageBackend,
-        time: EcTime,
-    ) -> Vec<PeerAction> {
-        use rand::seq::SliceRandom;
-        let mut actions = Vec::new();
-
-        // Get list of Identified peers
-        let identified_peers: Vec<PeerId> = self.peers
-            .iter()
-            .filter(|(_, p)| p.state.is_identified())
-            .map(|(id, _)| *id)
-            .collect();
-
-        if identified_peers.is_empty() {
-            return actions;
-        }
-
-        // Send invitations to 1-3 random Identified peers per tick
-        let num_invitations = (identified_peers.len().min(3)).max(1);
-        let selected = identified_peers
-            .choose_multiple(&mut rand::thread_rng(), num_invitations)
-            .copied()
-            .collect::<Vec<_>>();
-
-        for peer_id in selected {
-            // Promote to Pending
-            if self.promote_to_pending(peer_id, self.peer_id, time) {
-                // Generate Invitation (Answer with our own ID as token)
-                if let Some(sig) = self.proof_system.generate_signature(token_storage, &self.peer_id, &peer_id) {
-                    actions.push(PeerAction::SendInvitation {
-                        receiver: peer_id,
-                        answer: sig.answer,
-                        signature: sig.signature,
-                    });
-                }
-            }
-        }
-
-        actions
-    }
-
     /// Main tick function - returns actions for EcNode to execute
     pub fn tick(&mut self, token_storage: &dyn TokenStorageBackend, time: EcTime) -> Vec<PeerAction> {
         let mut actions = Vec::new();
@@ -1416,11 +1369,7 @@ impl EcPeers {
         // Phase 5: Prune Connected peers by distance (distance-based probability)
         self.prune_connected_by_distance(time);
 
-        // Phase 6: Send random Invitations to Identified peers
-        let invitation_actions = self.send_random_invitations(token_storage, time);
-        actions.extend(invitation_actions);
-
-        // Phase 7: Trigger new elections (pick and remove tokens, or use random tokens if low)
+        // Phase 6: Trigger new elections (pick and remove tokens, or use random tokens if low)
         let new_election_actions = self.trigger_multiple_elections(token_storage, time);
         actions.extend(new_election_actions);
 
