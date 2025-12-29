@@ -2,7 +2,7 @@
 
 pub mod config;
 pub mod stats;
-pub mod token_dist;
+pub mod token_allocation;
 pub mod runner;
 pub mod scenarios;
 
@@ -16,6 +16,7 @@ pub use config::{
     NetworkEvent,
     PeerSelection,
     TopologyMode,
+    BootstrapMethod,
 };
 
 pub use stats::{
@@ -25,6 +26,6 @@ pub use stats::{
     NetworkHealth,
 };
 
-pub use token_dist::GlobalTokenMapping;
+pub use token_allocation::GlobalTokenMapping;
 pub use runner::PeerLifecycleRunner;
-pub use scenarios::{ScenarioBuilder, BootstrapMethod};
+pub use scenarios::ScenarioBuilder;

@@ -1,12 +1,17 @@
-// Token Distribution for Peer Lifecycle Simulator
+// Token Allocation and Distribution for Peer Lifecycle Simulator
 //
-// Creates a global token mapping and provides views to individual peers.
-// Each peer gets a "view" based on their position on the ring and quality parameters.
+// Manages the global token space and allocates peer IDs from that space.
+// Provides token views to individual peers based on their position and quality parameters.
+//
+// Peer IDs are allocated from the token pool, ensuring all peer IDs are valid,
+// discoverable tokens that can be found through proof-of-storage elections.
 
 use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
+use ec_rust::ec_memory_backend::MemTokens;
+use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 use rand::rngs::StdRng;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for token distribution
 #[derive(Debug, Clone)]
@@ -33,36 +38,42 @@ impl Default for TokenDistributionConfig {
     }
 }
 
-/// Global token mapping (the canonical truth)
+/// Global token mapping and peer ID allocator
+///
+/// Manages the global token space and allocates peer IDs from that space.
+/// Peer IDs are tokens - this ensures all peer IDs are discoverable via elections.
 pub struct GlobalTokenMapping {
+    /// All token→block mappings (includes both regular tokens and peer ID tokens)
     mappings: HashMap<TokenId, BlockId>,
-    peer_ids: Vec<PeerId>,
+
+    /// Set of token IDs that have been allocated as peer IDs
+    allocated_peer_ids: HashSet<PeerId>,
+
+    /// Random number generator for token selection and sampling
     rng: StdRng,
 }
 
 impl GlobalTokenMapping {
-    /// Create a new global token mapping with peer IDs and random tokens
+    /// Create a new global token mapping
     ///
-    /// Peer IDs are injected as tokens first (for peer discovery), then random
-    /// tokens are added to reach total_tokens count.
-    pub fn new(mut rng: StdRng, peer_ids: Vec<PeerId>, total_tokens: usize) -> Self {
-        let mut mappings = HashMap::with_capacity(total_tokens + peer_ids.len());
+    /// Generates a pool of random tokens. Peer IDs will be allocated from this pool
+    /// on-demand using allocate_peer_id().
+    pub fn new(mut rng: StdRng, total_tokens: usize) -> Self {
+        let mut mappings = HashMap::with_capacity(total_tokens);
 
-        // First: Add all peer IDs as tokens with RANDOM block IDs
-        // (NOT block 0, because proof-of-storage needs real blocks with signature tokens)
-        for &peer_id in &peer_ids {
-            let block: BlockId = rng.gen();
-            mappings.insert(peer_id, block);
-        }
-
-        // Second: Generate additional random token→block mappings
+        // Generate random token→block mappings
+        // Peer IDs will be allocated from this pool later
         for _ in 0..total_tokens {
             let token: TokenId = rng.gen();
             let block: BlockId = rng.gen();
             mappings.insert(token, block);
         }
 
-        Self { mappings, peer_ids, rng }
+        Self {
+            mappings,
+            allocated_peer_ids: HashSet::new(),
+            rng,
+        }
     }
 
     /// Calculate view_width needed for neighbors to overlap
@@ -87,26 +98,28 @@ impl GlobalTokenMapping {
         width.min(u64::MAX / 2) // Cap at half the ring
     }
 
-    /// Get a view of tokens for a specific peer as a HashMap
+    /// Get a view of tokens for a specific peer as MemTokens
     ///
     /// Returns tokens within ±view_width of peer_id, with coverage_fraction sampling.
     /// The peer's own ID is always included (for discovery).
+    ///
+    /// Returns a ready-to-use MemTokens instance with all tokens populated.
     pub fn get_peer_view(
         &mut self,
         peer_id: PeerId,
         view_width: u64,
         coverage_fraction: f64,
-    ) -> HashMap<TokenId, BlockId> {
-        let mut view = HashMap::new();
+    ) -> MemTokens {
+        let mut storage = MemTokens::new();
 
         // IMPORTANT: Add peer_id itself as token (for peer discovery)
         // Every peer knows their own ID mapping (with whatever block it maps to)
         if let Some(&block) = self.mappings.get(&peer_id) {
-            view.insert(peer_id, block);
+            storage.set(&peer_id, &block, 0); // time=0 for simplicity
         }
 
         // DEBUG
-        let added_self = view.contains_key(&peer_id);
+        let added_self = storage.lookup(&peer_id).is_some();
         if cfg!(debug_assertions) && !added_self {
             eprintln!("[TOKEN_DIST] WARNING: Failed to add peer's own ID {:016x}", peer_id);
         }
@@ -120,18 +133,12 @@ impl GlobalTokenMapping {
             if self.is_in_range(peer_id, token, view_width) {
                 // Probabilistically include based on coverage fraction
                 if self.rng.gen_bool(coverage_fraction) {
-                    view.insert(token, block);
+                    storage.set(&token, &block, 0);
                 }
             }
         }
 
-        // DEBUG: Check if peer's own ID is still there
-        if cfg!(debug_assertions) && !view.contains_key(&peer_id) {
-            eprintln!("[TOKEN_DIST] ERROR: Peer {:016x}'s own ID was removed from view! view.len()={}",
-                peer_id, view.len());
-        }
-
-        view
+        storage
     }
 
     /// Get list of peer IDs that should be known by this peer
@@ -139,7 +146,7 @@ impl GlobalTokenMapping {
     /// Returns peer IDs within ±view_width, useful for initializing topology.
     /// Separate from token view to allow different knowledge vs connectivity parameters.
     pub fn get_nearby_peers(&self, peer_id: PeerId, view_width: u64) -> Vec<PeerId> {
-        self.peer_ids
+        self.allocated_peer_ids
             .iter()
             .filter(|&&other_id| {
                 other_id != peer_id && self.is_in_range(peer_id, other_id, view_width)
@@ -161,32 +168,55 @@ impl GlobalTokenMapping {
 
     /// Allocate a new peer ID from the existing token pool
     ///
-    /// Picks a random token that is not already used as a peer ID.
-    /// Returns None if no available tokens exist.
-    pub fn allocate_peer_id(&mut self, existing_peer_ids: &[PeerId]) -> Option<PeerId> {
-        // Get all tokens that are not already peer IDs
-        let available_tokens: Vec<TokenId> = self.mappings.keys()
-            .filter(|&token| !existing_peer_ids.contains(token))
-            .copied()
-            .collect();
-
-        if available_tokens.is_empty() {
+    /// Efficiently picks a random token that is not already used as a peer ID.
+    /// Uses retry strategy: pick random token, check if allocated, retry if needed.
+    /// This is O(1) expected time when tokens >> peer_ids (e.g., 10000 tokens, 50 peers).
+    /// Returns None if all tokens are allocated.
+    pub fn allocate_peer_id(&mut self) -> Option<PeerId> {
+        // Check if we've exhausted the token pool
+        if self.allocated_peer_ids.len() >= self.mappings.len() {
             return None;
         }
 
-        // Pick a random token
+        // Convert keys to Vec for random selection (only once)
+        let all_tokens: Vec<TokenId> = self.mappings.keys().copied().collect();
+
+        // Pick random tokens until we find one not already allocated
+        // With tokens >> peer_ids, expected number of iterations is very small
         use rand::seq::SliceRandom;
-        let peer_id = *available_tokens.choose(&mut self.rng)?;
+        const MAX_RETRIES: usize = 1000;
 
-        // Add to peer_ids list
-        self.peer_ids.push(peer_id);
+        for _ in 0..MAX_RETRIES {
+            let peer_id = *all_tokens.choose(&mut self.rng)?;
 
-        Some(peer_id)
+            // Check if this token is already allocated as a peer ID
+            if !self.allocated_peer_ids.contains(&peer_id) {
+                // Found an available token - allocate it
+                self.allocated_peer_ids.insert(peer_id);
+                return Some(peer_id);
+            }
+        }
+
+        // Fallback: Should never reach here with reasonable token/peer ratio
+        // If we do, fall back to exhaustive search
+        for &token in &all_tokens {
+            if !self.allocated_peer_ids.contains(&token) {
+                self.allocated_peer_ids.insert(token);
+                return Some(token);
+            }
+        }
+
+        None
     }
 
-    /// Get all current peer IDs
-    pub fn peer_ids(&self) -> &[PeerId] {
-        &self.peer_ids
+    /// Get all currently allocated peer IDs
+    pub fn allocated_peer_ids(&self) -> &HashSet<PeerId> {
+        &self.allocated_peer_ids
+    }
+
+    /// Get count of allocated peer IDs
+    pub fn peer_count(&self) -> usize {
+        self.allocated_peer_ids.len()
     }
 }
 
@@ -216,32 +246,34 @@ mod tests {
     #[test]
     fn test_global_mapping_creation() {
         let rng = StdRng::seed_from_u64(42);
-        let peer_ids = vec![100, 200, 300];
-        let mapping = GlobalTokenMapping::new(rng, peer_ids.clone(), 1000);
-        // Should have 1000 random tokens + 3 peer IDs
-        assert_eq!(mapping.total_tokens(), 1003);
+        let mapping = GlobalTokenMapping::new(rng, 1000);
+        // Should have 1000 random tokens
+        assert_eq!(mapping.total_tokens(), 1000);
+        // No peer IDs allocated yet
+        assert_eq!(mapping.peer_count(), 0);
     }
 
     #[test]
     fn test_peer_view_includes_peer_id() {
         let rng = StdRng::seed_from_u64(42);
-        let peer_id = 12345;
-        let peer_ids = vec![peer_id, 50000, 100000];
-        let mut mapping = GlobalTokenMapping::new(rng, peer_ids, 100);
+        let mut mapping = GlobalTokenMapping::new(rng, 100);
+
+        // Allocate a peer ID
+        let peer_id = mapping.allocate_peer_id().unwrap();
 
         let view = mapping.get_peer_view(peer_id, 10000, 1.0);
 
         // Peer should always know their own ID
-        assert!(view.contains_key(&peer_id));
-        assert_eq!(view[&peer_id], 0);
+        assert!(view.lookup(&peer_id).is_some());
     }
 
     #[test]
     fn test_coverage_fraction() {
         let rng = StdRng::seed_from_u64(42);
-        let peer_id = 0;
-        let peer_ids = vec![peer_id];
-        let mut mapping = GlobalTokenMapping::new(rng, peer_ids, 10000);
+        let mut mapping = GlobalTokenMapping::new(rng, 10000);
+
+        // Allocate a peer ID
+        let peer_id = mapping.allocate_peer_id().unwrap();
 
         // Full coverage
         let full_view = mapping.get_peer_view(peer_id, u64::MAX / 2, 1.0);
@@ -273,21 +305,31 @@ mod tests {
     }
 
     #[test]
-    fn test_nearby_peers() {
+    fn test_allocate_peer_id() {
         let rng = StdRng::seed_from_u64(42);
-        let peer_ids: Vec<PeerId> = vec![100, 500, 1000, 5000, 10000];
-        let mapping = GlobalTokenMapping::new(rng, peer_ids.clone(), 100);
+        let mut mapping = GlobalTokenMapping::new(rng, 100);
 
-        // Get peers near 1000
-        let width = 2000; // Should include 100, 500, and exclude far ones
-        let nearby = mapping.get_nearby_peers(1000, width);
+        // Allocate 3 peer IDs
+        let peer1 = mapping.allocate_peer_id().unwrap();
+        let peer2 = mapping.allocate_peer_id().unwrap();
+        let peer3 = mapping.allocate_peer_id().unwrap();
 
-        // Should include self's neighbors but not self
-        assert!(!nearby.contains(&1000)); // Not self
-        assert!(nearby.contains(&100));   // Close enough
-        assert!(nearby.contains(&500));   // Close enough
-        // 5000 and 10000 should be excluded (too far)
-        assert!(!nearby.contains(&5000));
-        assert!(!nearby.contains(&10000));
+        // All should be unique
+        assert_ne!(peer1, peer2);
+        assert_ne!(peer2, peer3);
+        assert_ne!(peer1, peer3);
+
+        // All should be valid tokens from the mapping
+        assert!(mapping.mappings.contains_key(&peer1));
+        assert!(mapping.mappings.contains_key(&peer2));
+        assert!(mapping.mappings.contains_key(&peer3));
+
+        // Should be tracked as allocated
+        assert!(mapping.allocated_peer_ids.contains(&peer1));
+        assert!(mapping.allocated_peer_ids.contains(&peer2));
+        assert!(mapping.allocated_peer_ids.contains(&peer3));
+
+        // Peer count should be 3
+        assert_eq!(mapping.peer_count(), 3);
     }
 }

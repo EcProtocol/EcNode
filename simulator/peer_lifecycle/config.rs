@@ -136,7 +136,7 @@ pub enum NetworkEvent {
     PeerJoin {
         count: usize,
         coverage_fraction: f64, // Quality of new peers (0.0-1.0)
-        initial_knowledge: Vec<PeerId>, // Bootstrap peers they know
+        bootstrap_method: BootstrapMethod, // How new peers learn about existing peers
         group_name: Option<String>, // Optional group identifier for tracking
     },
 
@@ -182,6 +182,19 @@ pub enum PeerSelection {
 
     /// By token count (richest or poorest)
     ByTokenCount { count: usize, most: bool },
+}
+
+/// Methods for bootstrapping new peers
+#[derive(Debug, Clone)]
+pub enum BootstrapMethod {
+    /// Know N random existing peers
+    Random(usize),
+
+    /// Know specific peer IDs
+    Specific(Vec<PeerId>),
+
+    /// No initial knowledge (isolated)
+    None,
 }
 
 // ============================================================================

@@ -1,8 +1,8 @@
 // Peer Lifecycle Simulator Runner
 
-use super::config::PeerLifecycleConfig;
+use super::config::{PeerLifecycleConfig, BootstrapMethod};
 use super::stats::*;
-use super::token_dist::GlobalTokenMapping;
+use super::token_allocation::GlobalTokenMapping;
 use ec_rust::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_peers::{EcPeers, PeerAction};
@@ -168,17 +168,19 @@ impl PeerLifecycleRunner {
     fn initialize_network(&mut self) {
         let num_peers = self.config.initial_state.num_peers;
 
-        // Generate peer IDs
-        let peer_ids: Vec<PeerId> = (0..num_peers)
-            .map(|_| self.rng.gen())
-            .collect();
-
-        // Create global token mapping with peer IDs injected as tokens
+        // Create global token mapping (no peer IDs yet - they will be allocated)
         let mut global_mapping = GlobalTokenMapping::new(
             StdRng::from_seed(self.rng.gen()),
-            peer_ids.clone(),
             self.config.token_distribution.total_tokens,
         );
+
+        // Allocate peer IDs from the token pool
+        let mut peer_ids = Vec::with_capacity(num_peers);
+        for _ in 0..num_peers {
+            let peer_id = global_mapping.allocate_peer_id()
+                .expect("Failed to allocate peer ID from token pool - increase total_tokens");
+            peer_ids.push(peer_id);
+        }
 
         // Calculate view_width from neighbor_overlap parameter
         let view_width = GlobalTokenMapping::calculate_view_width(
@@ -188,28 +190,15 @@ impl PeerLifecycleRunner {
 
         // Create peers with views of the global mapping
         for peer_id in peer_ids {
-            // Get this peer's view of the global token mapping
-            let token_view = global_mapping.get_peer_view(
+            // Get this peer's view as ready-to-use MemTokens
+            let token_storage = global_mapping.get_peer_view(
                 peer_id,
                 view_width,
                 self.config.token_distribution.coverage_fraction,
             );
 
-            // Create token storage backend (MemTokens)
-            use ec_rust::ec_proof_of_storage::TokenStorageBackend;
-            let mut token_storage = MemTokens::new();
-
-            // Store all tokens from the view
-            let mut known_tokens = Vec::new();
-            let mut has_self_id = false;
-            for (token_id, block_id) in token_view {
-                token_storage.set(&token_id, &block_id, 0); // time=0 for simplicity
-                known_tokens.push(token_id);
-
-                if token_id == peer_id {
-                    has_self_id = true;
-                }
-            }
+            // known_tokens is now just for tracking (empty for now)
+            let known_tokens = Vec::new();
 
             // Create peer manager with seeded RNG
             let peer_rng = StdRng::from_seed(self.rng.gen());
@@ -669,8 +658,8 @@ impl PeerLifecycleRunner {
                         println!("  [Round {}] Network loss changed to {:.1}%", self.current_round, loss * 100.0);
                     }
                 }
-                NetworkEvent::PeerJoin { count, coverage_fraction, initial_knowledge, group_name } => {
-                    self.handle_peer_join(count, coverage_fraction, initial_knowledge, group_name);
+                NetworkEvent::PeerJoin { count, coverage_fraction, bootstrap_method, group_name } => {
+                    self.handle_peer_join(count, coverage_fraction, bootstrap_method, group_name);
                 }
                 // TODO: Implement other events (PeerCrash, PeerLeave, PauseElections)
                 _ => {
@@ -685,7 +674,7 @@ impl PeerLifecycleRunner {
         &mut self,
         count: usize,
         coverage_fraction: f64,
-        initial_knowledge: Vec<PeerId>,
+        bootstrap_method: BootstrapMethod,
         group_name: Option<String>,
     ) {
         let group_name = group_name.unwrap_or_else(|| format!("join-r{}", self.current_round));
@@ -695,6 +684,24 @@ impl PeerLifecycleRunner {
 
         let global_mapping = self.global_mapping.as_mut()
             .expect("Global mapping not initialized");
+
+        // Resolve bootstrap method to actual peer IDs
+        let initial_knowledge = match bootstrap_method {
+            BootstrapMethod::Random(n) => {
+                // Get existing peer IDs and randomly select N
+                use rand::seq::SliceRandom;
+                let existing_peers: Vec<PeerId> = global_mapping.allocated_peer_ids()
+                    .iter()
+                    .copied()
+                    .collect();
+
+                existing_peers.choose_multiple(&mut self.rng, n)
+                    .copied()
+                    .collect()
+            }
+            BootstrapMethod::Specific(peers) => peers,
+            BootstrapMethod::None => vec![],
+        };
 
         // Get existing peer IDs
         let existing_peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
@@ -710,26 +717,18 @@ impl PeerLifecycleRunner {
         let mut new_peer_ids = Vec::new();
         for _ in 0..count {
             // Allocate peer ID from token pool
-            let peer_id = global_mapping.allocate_peer_id(&existing_peer_ids)
-                .expect("Failed to allocate peer ID from token pool");
+            let peer_id = global_mapping.allocate_peer_id()
+                .expect("Failed to allocate peer ID from token pool - increase total_tokens");
 
-            // Get this peer's view of the global token mapping
-            let token_view = global_mapping.get_peer_view(
+            // Get this peer's view as ready-to-use MemTokens
+            let token_storage = global_mapping.get_peer_view(
                 peer_id,
                 view_width,
                 coverage_fraction,
             );
 
-            // Create token storage backend
-            use ec_rust::ec_proof_of_storage::TokenStorageBackend;
-            let mut token_storage = MemTokens::new();
-
-            // Store all tokens from the view
-            let mut known_tokens = Vec::new();
-            for (token_id, block_id) in token_view {
-                token_storage.set(&token_id, &block_id, 0);
-                known_tokens.push(token_id);
-            }
+            // known_tokens is just for tracking (empty for now)
+            let known_tokens = Vec::new();
 
             // Create peer manager with seeded RNG
             let peer_rng = StdRng::from_seed(self.rng.gen());

@@ -3,8 +3,7 @@
 // Provides a fluent API for defining simulation scenarios with scheduled events
 
 use super::config::{
-    EventSchedule, ScheduledEvent, NetworkEvent, PeerSelection, InitialNetworkState,
-    TokenDistributionConfig, TopologyMode, PeerLifecycleConfig,
+    EventSchedule, ScheduledEvent, NetworkEvent, PeerSelection, BootstrapMethod,
 };
 use ec_rust::ec_interface::PeerId;
 
@@ -86,22 +85,12 @@ impl RoundBuilder {
         bootstrap_method: BootstrapMethod,
         group_name: impl Into<String>,
     ) -> ScenarioBuilder {
-        let initial_knowledge = match bootstrap_method {
-            BootstrapMethod::Random(n) => {
-                // In a real implementation, we'd select N random peers
-                // For now, this is a placeholder - the simulator will handle it
-                vec![]
-            }
-            BootstrapMethod::Specific(peers) => peers,
-            BootstrapMethod::None => vec![],
-        };
-
         self.scenario.events.push(ScheduledEvent {
             round: self.round,
             event: NetworkEvent::PeerJoin {
                 count,
                 coverage_fraction: coverage,
-                initial_knowledge,
+                bootstrap_method,
                 group_name: Some(group_name.into()),
             },
         });
@@ -141,23 +130,6 @@ impl RoundBuilder {
         });
         self.scenario
     }
-}
-
-// ============================================================================
-// Bootstrap Methods
-// ============================================================================
-
-/// Methods for bootstrapping new peers
-#[derive(Debug, Clone)]
-pub enum BootstrapMethod {
-    /// Know N random existing peers
-    Random(usize),
-
-    /// Know specific peer IDs
-    Specific(Vec<PeerId>),
-
-    /// No initial knowledge (isolated)
-    None,
 }
 
 // ============================================================================
