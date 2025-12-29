@@ -112,10 +112,12 @@ impl GlobalTokenMapping {
     ) -> MemTokens {
         let mut mappings = Vec::new();
 
+        use ec_rust::ec_interface::GENESIS_BLOCK_ID;
+
         // IMPORTANT: Add peer_id itself as token (for peer discovery)
         // Every peer knows their own ID mapping (with whatever block it maps to)
         if let Some(&block) = self.mappings.get(&peer_id) {
-            mappings.push((peer_id, block, 0)); // time=0 for simplicity
+            mappings.push((peer_id, block, GENESIS_BLOCK_ID, 0)); // parent=GENESIS for initial allocation, time=0
         } else if cfg!(debug_assertions) {
             eprintln!("[TOKEN_DIST] WARNING: Failed to add peer's own ID {:016x}", peer_id);
         }
@@ -129,7 +131,7 @@ impl GlobalTokenMapping {
             if self.is_in_range(peer_id, token, view_width) {
                 // Probabilistically include based on coverage fraction
                 if self.rng.gen_bool(coverage_fraction) {
-                    mappings.push((token, block, 0)); // time=0 for simplicity
+                    mappings.push((token, block, GENESIS_BLOCK_ID, 0)); // parent=GENESIS for initial allocation, time=0
                 }
             }
         }

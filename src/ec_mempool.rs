@@ -404,7 +404,8 @@ impl EcMemPool {
                             },
                         );
 
-                        batch.update_token(&block.parts[i].token, &block.id, block.time);
+                        // Update token with parent (block.parts[i].last is the parent block ID)
+                        batch.update_token(&block.parts[i].token, &block.id, &block.parts[i].last, block.time);
                     }
                 }
 
@@ -480,11 +481,12 @@ mod tests {
             self.tokens.get(token)
         }
 
-        fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+        fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
             self.tokens.insert(
                 *token,
                 BlockTime {
                     block: *block,
+                    parent: *parent,
                     time,
                 },
             );

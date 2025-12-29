@@ -55,7 +55,9 @@ pub trait TokenStorageBackend {
     fn lookup(&self, token: &TokenId) -> Option<BlockTime>;
 
     /// Set or update a token's block mapping
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime);
+    ///
+    /// For newly created tokens (genesis transactions), use GENESIS_BLOCK_ID as the parent.
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime);
 
     /// Search for tokens matching signature chunks in ring topology
     ///
@@ -1269,8 +1271,8 @@ mod tests {
             self.tokens.get(token).copied()
         }
 
-        fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-            self.tokens.insert(*token, BlockTime { block: *block, time });
+        fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+            self.tokens.insert(*token, BlockTime { block: *block, parent: *parent, time });
         }
 
         fn search_signature(
@@ -1356,8 +1358,9 @@ mod tests {
 
     #[test]
     fn test_proof_of_storage_with_backend() {
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut backend = TestBackend::new();
-        backend.set(&100, &1, 10);
+        backend.set(&100, &1, &GENESIS_BLOCK_ID, 10);
 
         let proof = ProofOfStorage::new();
 
@@ -1960,8 +1963,9 @@ mod tests {
         let response_block_id = 42u64;
 
         // Build test backend with signature tokens
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut backend = TestBackend::new();
-        backend.set(&challenge_token, &response_block_id, 100);
+        backend.set(&challenge_token, &response_block_id, &GENESIS_BLOCK_ID, 100);
 
         // Calculate expected signature chunks using Blake3
         // This matches what ProofOfStorage::signature_for will compute
@@ -1987,7 +1991,7 @@ mod tests {
             // Set the last 10 bits to match expected chunk (0x3FF = 1023 max)
             // Since we space tokens 2000 apart, the chunk bits won't affect ordering
             let token_with_bits = (base_id & !0x3FF) | (expected_chunk as u64);
-            backend.set(&token_with_bits, &(200 + i as u64), 100);
+            backend.set(&token_with_bits, &(200 + i as u64), &GENESIS_BLOCK_ID, 100);
         }
 
         // Generate signature using ProofOfStorage

@@ -154,6 +154,66 @@ pub struct Block {
     pub signatures: [Option<Signature>; TOKENS_PER_BLOCK],
 }
 
+// ============================================================================
+// Commit Chain Types
+// ============================================================================
+
+/// Commit block ID type - Blake3 hash of commit block contents
+/// In simulation: u64 for simplicity
+/// In production: [u8; 32] Blake3 hash
+pub type CommitBlockId = BlockId;
+
+/// A commit block in the commit chain
+///
+/// CommitBlocks form a blockchain tracking which transaction blocks were committed.
+/// Each node builds its own commit chain and syncs with neighbors for bootstrap/validation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitBlock {
+    /// Blake3 hash of (previous + time + committed_blocks)
+    pub id: CommitBlockId,
+
+    /// Hash of previous commit block (chain linkage)
+    pub previous: CommitBlockId,
+
+    /// Time when these blocks were committed
+    pub time: EcTime,
+
+    /// Block IDs (transaction IDs) committed in this commit
+    pub committed_blocks: Vec<BlockId>,
+}
+
+impl CommitBlock {
+    /// Create a new commit block
+    ///
+    /// Note: In simulation, the id is just assigned sequentially.
+    /// In production, it should be Blake3(previous || time || committed_blocks)
+    pub fn new(id: CommitBlockId, previous: CommitBlockId, time: EcTime, committed_blocks: Vec<BlockId>) -> Self {
+        Self {
+            id,
+            previous,
+            time,
+            committed_blocks,
+        }
+    }
+
+    /// Calculate Blake3 hash of this commit block (for production use)
+    ///
+    /// Currently unused in simulation, but provided for future migration
+    #[allow(dead_code)]
+    pub fn calculate_hash(&self) -> CommitBlockId {
+        // In simulation with u64 IDs, just use the assigned ID
+        // In production with [u8; 32], this would be:
+        // let mut hasher = blake3::Hasher::new();
+        // hasher.update(&self.previous.to_le_bytes());
+        // hasher.update(&self.time.to_le_bytes());
+        // for block_id in &self.committed_blocks {
+        //     hasher.update(&block_id.to_le_bytes());
+        // }
+        // *hasher.finalize().as_bytes()
+        self.id
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenMapping {
     pub id: TokenId,
@@ -191,6 +251,7 @@ pub enum Message {
     Answer {
         answer: TokenMapping,
         signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
+        head_of_chain: CommitBlockId,  // Head of sender's commit chain (0 for nodes without commit chain)
     },
     Block {
         block: Block,
@@ -199,6 +260,14 @@ pub enum Message {
         token: TokenId,
         high: PeerId,
         low: PeerId,
+    },
+    // Commit chain messages
+    QueryCommitBlock {
+        block_id: CommitBlockId,
+        ticket: MessageTicket,
+    },
+    CommitBlock {
+        block: CommitBlock,
     },
 }
 
@@ -241,21 +310,30 @@ pub struct MessageEnvelope {
 ///
 ///
 
+/// Genesis block ID constant - used for tokens with no parent (newly created tokens)
+pub const GENESIS_BLOCK_ID: BlockId = 0;
+
 #[derive(Copy, Clone, Debug)]
 pub struct BlockTime {
     pub(crate) block: BlockId,
+    pub(crate) parent: BlockId,  // Parent block in token chain (GENESIS_BLOCK_ID for new tokens)
     pub(crate) time: EcTime,
 }
 
 impl BlockTime {
     /// Create a new BlockTime
-    pub fn new(block: BlockId, time: EcTime) -> Self {
-        Self { block, time }
+    pub fn new(block: BlockId, parent: BlockId, time: EcTime) -> Self {
+        Self { block, parent, time }
     }
 
     /// Get the block ID
     pub fn block(&self) -> BlockId {
         self.block
+    }
+
+    /// Get the parent block ID
+    pub fn parent(&self) -> BlockId {
+        self.parent
     }
 
     /// Get the time
@@ -267,7 +345,7 @@ impl BlockTime {
 pub trait EcTokens {
     fn lookup(&self, token: &TokenId) -> Option<&BlockTime>;
 
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime);
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime);
 
     /// Generate a proof-of-storage signature for a token
     ///
@@ -293,6 +371,29 @@ pub trait EcBlocks {
     fn exists(&self, block: &BlockId) -> bool;
 
     fn save(&mut self, block: &Block);
+}
+
+// ============================================================================
+// Commit Chain Backend
+// ============================================================================
+
+/// Backend storage for commit chain blocks
+///
+/// Provides storage and retrieval of CommitBlocks that form the commit chain.
+/// For MVP, this is a simple in-memory implementation.
+/// For production, this would use RocksDB or file-based storage.
+pub trait EcCommitChainBackend {
+    /// Lookup a commit block by its ID
+    fn lookup(&self, id: &CommitBlockId) -> Option<CommitBlock>;
+
+    /// Save a commit block
+    fn save(&mut self, block: &CommitBlock);
+
+    /// Get the current head of our commit chain
+    fn get_head(&self) -> Option<CommitBlockId>;
+
+    /// Set the current head of our commit chain
+    fn set_head(&mut self, id: &CommitBlockId);
 }
 
 // ============================================================================
@@ -347,8 +448,9 @@ pub trait StorageBatch {
 
     /// Update a single token mapping
     ///
-    /// Updates the token to point to the specified block at the given time.
-    fn update_token(&mut self, token: &TokenId, block: &BlockId, time: EcTime);
+    /// Updates the token to point to the specified block with the given parent at the given time.
+    /// For newly created tokens (genesis transactions), use GENESIS_BLOCK_ID as the parent.
+    fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime);
 
     /// Commit all batched operations atomically
     ///

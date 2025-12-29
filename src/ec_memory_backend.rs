@@ -50,7 +50,8 @@ use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
 /// ```
 pub struct MemTokens {
     /// Token mappings sorted by TokenId for binary search and range scans
-    tokens: Vec<(TokenId, BlockId, EcTime)>,
+    /// Format: (TokenId, BlockId, ParentBlockId, EcTime)
+    tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,
 }
 
 impl MemTokens {
@@ -62,8 +63,8 @@ impl MemTokens {
     }
 
     /// Create from unsorted mappings (will be sorted internally)
-    pub fn from_mappings(mut mappings: Vec<(TokenId, BlockId, EcTime)>) -> Self {
-        mappings.sort_by_key(|(token, _, _)| *token);
+    pub fn from_mappings(mut mappings: Vec<(TokenId, BlockId, BlockId, EcTime)>) -> Self {
+        mappings.sort_by_key(|(token, _, _, _)| *token);
         Self { tokens: mappings }
     }
 
@@ -100,27 +101,28 @@ impl Default for MemTokens {
 impl TokenStorageBackend for MemTokens {
     fn lookup(&self, token: &TokenId) -> Option<BlockTime> {
         self.tokens
-            .binary_search_by_key(token, |(t, _, _)| *t)
+            .binary_search_by_key(token, |(t, _, _, _)| *t)
             .ok()
             .map(|idx| {
-                let (_, block, time) = self.tokens[idx];
-                BlockTime::new(block, time)
+                let (_, block, parent, time) = self.tokens[idx];
+                BlockTime::new(block, parent, time)
             })
     }
 
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-        match self.tokens.binary_search_by_key(token, |(t, _, _)| *t) {
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        match self.tokens.binary_search_by_key(token, |(t, _, _, _)| *t) {
             Ok(idx) => {
                 // Token exists - only update if new time is newer
-                let (_, existing_block, existing_time) = &mut self.tokens[idx];
+                let (_, existing_block, existing_parent, existing_time) = &mut self.tokens[idx];
                 if *existing_time < time {
                     *existing_block = *block;
+                    *existing_parent = *parent;
                     *existing_time = time;
                 }
             }
             Err(idx) => {
                 // Token doesn't exist - insert at correct position to maintain sort order
-                self.tokens.insert(idx, (*token, *block, time));
+                self.tokens.insert(idx, (*token, *block, *parent, time));
             }
         }
     }
@@ -143,7 +145,7 @@ impl TokenStorageBackend for MemTokens {
         }
 
         // Find starting position for forward search using binary search
-        let start_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _, _)| *t) {
+        let start_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _, _, _)| *t) {
             Ok(idx) => idx + 1,  // Found exact match, start after it
             Err(idx) => idx,     // Not found, idx is insertion point (first token > lookup_token)
         };
@@ -151,7 +153,7 @@ impl TokenStorageBackend for MemTokens {
         // Search forward (above) for first 5 chunks
         for i in start_idx..self.tokens.len() {
             steps += 1;
-            let (token, _, _) = self.tokens[i];
+            let (token, _, _, _) = self.tokens[i];
             if matches_chunk(&token, signature_chunks[chunk_idx]) {
                 found_tokens.push(token);
                 chunk_idx += 1;
@@ -165,7 +167,7 @@ impl TokenStorageBackend for MemTokens {
         if chunk_idx < 5 {
             for i in 0..start_idx.saturating_sub(1) {
                 steps += 1;
-                let (token, _, _) = self.tokens[i];
+                let (token, _, _, _) = self.tokens[i];
                 if matches_chunk(&token, signature_chunks[chunk_idx]) {
                     found_tokens.push(token);
                     chunk_idx += 1;
@@ -177,7 +179,7 @@ impl TokenStorageBackend for MemTokens {
         }
 
         // Find starting position for backward search
-        let end_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _, _)| *t) {
+        let end_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _, _, _)| *t) {
             Ok(idx) => idx.saturating_sub(1),  // Found exact match, start before it
             Err(idx) => idx.saturating_sub(1), // Not found, start at position before insertion point
         };
@@ -186,7 +188,7 @@ impl TokenStorageBackend for MemTokens {
         if end_idx < self.tokens.len() {
             for i in (0..=end_idx).rev() {
                 steps += 1;
-                let (token, _, _) = self.tokens[i];
+                let (token, _, _, _) = self.tokens[i];
                 if matches_chunk(&token, signature_chunks[chunk_idx]) {
                     found_tokens.push(token);
                     chunk_idx += 1;
@@ -201,7 +203,7 @@ impl TokenStorageBackend for MemTokens {
         if chunk_idx < SIGNATURE_CHUNKS && end_idx < self.tokens.len() {
             for i in (end_idx + 1..self.tokens.len()).rev() {
                 steps += 1;
-                let (token, _, _) = self.tokens[i];
+                let (token, _, _, _) = self.tokens[i];
                 if matches_chunk(&token, signature_chunks[chunk_idx]) {
                     found_tokens.push(token);
                     chunk_idx += 1;
@@ -236,7 +238,7 @@ impl<'a> TokenStorageBackend for MemTokensRef<'a> {
         TokenStorageBackend::lookup(self.0, token)
     }
 
-    fn set(&mut self, _token: &TokenId, _block: &BlockId, _time: EcTime) {
+    fn set(&mut self, _token: &TokenId, _block: &BlockId, _parent: &BlockId, _time: EcTime) {
         panic!("Cannot mutate through MemTokensRef");
     }
 
@@ -266,8 +268,8 @@ impl EcTokens for MemTokens {
         unimplemented!("EcTokens::lookup not supported for sorted Vec backend - use TokenStorageBackend::lookup instead")
     }
 
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-        TokenStorageBackend::set(self, token, block, time)
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        TokenStorageBackend::set(self, token, block, parent, time)
     }
 
     fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature> {
@@ -435,7 +437,7 @@ impl Default for MemoryBackend {
 pub struct MemoryBatch<'a> {
     backend: &'a mut MemoryBackend,
     blocks: Vec<Block>,
-    tokens: Vec<(TokenId, BlockId, EcTime)>,
+    tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,  // (token, block, parent, time)
 }
 
 impl<'a> StorageBatch for MemoryBatch<'a> {
@@ -443,8 +445,8 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
         self.blocks.push(*block);
     }
 
-    fn update_token(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-        self.tokens.push((*token, *block, time));
+    fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        self.tokens.push((*token, *block, *parent, time));
     }
 
     fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
@@ -454,8 +456,8 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
         }
 
         // Apply all token updates
-        for (token, block, time) in &self.tokens {
-            TokenStorageBackend::set(&mut self.backend.tokens, token, block, *time);
+        for (token, block, parent, time) in &self.tokens {
+            TokenStorageBackend::set(&mut self.backend.tokens, token, block, parent, *time);
         }
 
         Ok(())
@@ -482,8 +484,8 @@ impl EcTokens for MemoryBackend {
         EcTokens::lookup(&self.tokens, token)
     }
 
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-        EcTokens::set(&mut self.tokens, token, block, time)
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        EcTokens::set(&mut self.tokens, token, block, parent, time)
     }
 
     fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature> {
@@ -497,8 +499,8 @@ impl TokenStorageBackend for MemoryBackend {
         TokenStorageBackend::lookup(&self.tokens, token)
     }
 
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
-        TokenStorageBackend::set(&mut self.tokens, token, block, time)
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        TokenStorageBackend::set(&mut self.tokens, token, block, parent, time)
     }
 
     fn search_signature(
@@ -544,6 +546,7 @@ mod tests {
 
     #[test]
     fn test_mem_tokens_basic_operations() {
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut storage = MemTokens::new();
         assert!(TokenStorageBackend::is_empty(&storage));
 
@@ -551,7 +554,7 @@ mod tests {
         let block: BlockId = 1;
         let time: EcTime = 42;
 
-        TokenStorageBackend::set(&mut storage, &token, &block, time);
+        TokenStorageBackend::set(&mut storage, &token, &block, &GENESIS_BLOCK_ID, time);
         assert_eq!(TokenStorageBackend::len(&storage), 1);
 
         let result = TokenStorageBackend::lookup(&storage, &token);
@@ -562,37 +565,40 @@ mod tests {
 
     #[test]
     fn test_mem_tokens_update_only_newer() {
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut storage = MemTokens::new();
 
         let token: TokenId = 100;
         let block1: BlockId = 1;
         let block2: BlockId = 2;
 
-        TokenStorageBackend::set(&mut storage, &token, &block1, 10);
-        TokenStorageBackend::set(&mut storage, &token, &block2, 5); // Older time, should not update
+        TokenStorageBackend::set(&mut storage, &token, &block1, &GENESIS_BLOCK_ID, 10);
+        TokenStorageBackend::set(&mut storage, &token, &block2, &block1, 5); // Older time, should not update
 
         let result = TokenStorageBackend::lookup(&storage, &token).unwrap();
         assert_eq!(result.block, block1, "Should keep newer mapping");
 
-        TokenStorageBackend::set(&mut storage, &token, &block2, 20); // Newer time, should update
+        TokenStorageBackend::set(&mut storage, &token, &block2, &block1, 20); // Newer time, should update
         let result = TokenStorageBackend::lookup(&storage, &token).unwrap();
         assert_eq!(result.block, block2, "Should update with newer mapping");
     }
 
     #[test]
     fn test_mem_tokens_with_proof_system() {
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut storage = MemTokens::new();
 
         let token: TokenId = 50000;
         let block: BlockId = 100;
         let peer: PeerId = 777;
 
-        TokenStorageBackend::set(&mut storage, &token, &block, 1);
+        TokenStorageBackend::set(&mut storage, &token, &block, &GENESIS_BLOCK_ID, 1);
 
         // Add many tokens to potentially complete a signature
         for i in 0..2000 {
             let test_token = (token + i * 100) | (i % 1024);
-            TokenStorageBackend::set(&mut storage, &test_token, &(block + i), i);
+            let parent = if i == 0 { GENESIS_BLOCK_ID } else { block + i - 1 };
+            TokenStorageBackend::set(&mut storage, &test_token, &(block + i), &parent, i);
         }
 
         // Test using EcTokens interface (backward compatible)
@@ -606,8 +612,9 @@ mod tests {
 
     #[test]
     fn test_into_proof_system() {
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut storage = MemTokens::new();
-        TokenStorageBackend::set(&mut storage, &100, &1, 10);
+        TokenStorageBackend::set(&mut storage, &100, &1, &GENESIS_BLOCK_ID, 10);
 
         // Verify storage has the token before conversion
         assert_eq!(TokenStorageBackend::len(&storage), 1);
@@ -696,11 +703,12 @@ mod tests {
 
     #[test]
     fn test_memory_backend_separate_access() {
+        use crate::ec_interface::GENESIS_BLOCK_ID;
         let mut backend = MemoryBackend::new();
 
         // Add tokens
-        TokenStorageBackend::set(backend.tokens_mut(), &100, &1, 10);
-        TokenStorageBackend::set(backend.tokens_mut(), &200, &2, 20);
+        TokenStorageBackend::set(backend.tokens_mut(), &100, &1, &GENESIS_BLOCK_ID, 10);
+        TokenStorageBackend::set(backend.tokens_mut(), &200, &2, &GENESIS_BLOCK_ID, 20);
 
         // Add blocks
         let block = Block {
@@ -754,7 +762,7 @@ mod tests {
             batch.save_block(&block);
             // Add token updates
             for i in 0..block.used as usize {
-                batch.update_token(&block.parts[i].token, &block.id, block.time);
+                batch.update_token(&block.parts[i].token, &block.id, &block.parts[i].last, block.time);
             }
             assert_eq!(batch.block_count(), 1);
             batch.commit().unwrap();
@@ -850,7 +858,7 @@ mod tests {
                 batch.save_block(block);
                 // Add token updates for this block
                 for i in 0..block.used as usize {
-                    batch.update_token(&block.parts[i].token, &block.id, block.time);
+                    batch.update_token(&block.parts[i].token, &block.id, &block.parts[i].last, block.time);
                 }
             }
             assert_eq!(batch.block_count(), 3);

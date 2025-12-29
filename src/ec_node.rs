@@ -347,7 +347,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                                 receiver,
                                 ticket,
                                 time: self.time,
-                                message: Message::Answer { answer, signature },
+                                message: Message::Answer { answer, signature, head_of_chain: 0 },
                             });
                         }
                         PeerAction::SendReferral {
@@ -391,7 +391,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                     }
                 }
             }
-            Message::Answer { answer, signature } => {
+            Message::Answer { answer, signature, head_of_chain: _ } => {
                 let actions = self.peers
                     .handle_answer(answer, signature, msg.ticket, msg.sender, self.time, &self.token_storage);
 
@@ -404,7 +404,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                                 sender: self.peer_id,
                                 ticket: 0, // Invitation uses ticket=0
                                 time: self.time,
-                                message: Message::Answer { answer, signature },
+                                message: Message::Answer { answer, signature, head_of_chain: 0 },
                             });
                         }
                         PeerAction::SendQuery { receiver, token, ticket } => {
@@ -472,6 +472,14 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                             .handle_referral(msg.ticket, *token, [*high, *low], msg.sender, self.time) {
 
                 }
+            }
+            Message::QueryCommitBlock { .. } => {
+                // TODO: Implement commit chain query handler
+                // For now, ignore these messages until commit chain module is implemented
+            }
+            Message::CommitBlock { .. } => {
+                // TODO: Implement commit block handler
+                // For now, ignore these messages until commit chain module is implemented
             }
         }
     }
