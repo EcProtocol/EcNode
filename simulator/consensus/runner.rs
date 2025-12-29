@@ -10,12 +10,13 @@ use rand::seq::SliceRandom;
 use rand::{Rng, RngCore, SeedableRng};
 
 use ec_rust::ec_memory_backend::MemoryBackend;
-use ec_rust::ec_hashmap_backend::HashMapTokens;
 use ec_rust::ec_interface::{
     Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock, TokenId,
     TOKENS_PER_BLOCK,
 };
 use ec_rust::ec_node::EcNode;
+
+use super::hashmap_tokens::HashMapTokens;
 
 use super::config::{SimConfig, TopologyConfig, TopologyMode};
 use super::event_sinks::{ConsoleEventSink, CsvEventSink, MultiEventSink};

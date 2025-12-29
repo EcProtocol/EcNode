@@ -12,6 +12,7 @@
 
 mod config;
 mod event_sinks;
+mod hashmap_tokens;
 mod runner;
 mod stats;
 

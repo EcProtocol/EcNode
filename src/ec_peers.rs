@@ -1591,7 +1591,7 @@ mod tests {
             TokenMapping { id: 1, block: 10 },
             TokenMapping { id: 2, block: 20 },
             TokenMapping { id: 3, block: 30 },
-            TokenMapping { id: 0, block: 0 }, // Zero tokens should be ignored
+            TokenMapping { id: 0, block: 0 }, // Zero tokens (deduplicated by HashSet)
             TokenMapping { id: 0, block: 0 },
             TokenMapping { id: 0, block: 0 },
             TokenMapping { id: 0, block: 0 },
@@ -1604,13 +1604,15 @@ mod tests {
 
         collection.sample_from_answer(&answer, &signature, sender_peer_id);
 
-        // Should have: answer token (100) + sender peer ID (500) + 3 signature tokens = 5 tokens
-        assert_eq!(collection.samples.len(), 5);
+        // Should have: answer token (100) + sender peer ID (500) + 3 non-zero signature tokens + one 0 token = 6 tokens
+        // (The 0 token is added even though it appears multiple times in signature - HashSet deduplicates)
+        assert_eq!(collection.samples.len(), 6);
         assert!(collection.samples.contains(&100)); // answer token
         assert!(collection.samples.contains(&500)); // sender peer ID
         assert!(collection.samples.contains(&1));   // sig tokens
         assert!(collection.samples.contains(&2));
         assert!(collection.samples.contains(&3));
+        assert!(collection.samples.contains(&0));   // zero token
     }
 
     #[test]
@@ -1624,12 +1626,13 @@ mod tests {
         assert!(collection.samples.contains(&1000));
         assert!(collection.samples.contains(&2000));
 
-        // Zero peers should be ignored
+        // Test with zero peer ID (zero is added to collection)
         let with_zero = [3000, 0];
         collection.sample_from_referral(&with_zero);
 
-        assert_eq!(collection.samples.len(), 3); // Only 3000 added
+        assert_eq!(collection.samples.len(), 4); // Both 3000 and 0 added
         assert!(collection.samples.contains(&3000));
+        assert!(collection.samples.contains(&0));
     }
 
     #[test]

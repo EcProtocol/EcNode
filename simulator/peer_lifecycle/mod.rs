@@ -3,7 +3,6 @@
 pub mod config;
 pub mod stats;
 pub mod token_allocation;
-pub mod sim_token_storage;
 pub mod runner;
 pub mod scenarios;
 

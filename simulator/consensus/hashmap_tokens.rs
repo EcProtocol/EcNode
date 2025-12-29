@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use crate::ec_interface::{BlockId, BlockTime, EcTime, TokenId};
-use crate::ec_proof_of_storage::{SignatureSearchResult, TokenStorageBackend};
+use ec_rust::ec_interface::{BlockId, BlockTime, EcTime, TokenId};
+use ec_rust::ec_proof_of_storage::{SignatureSearchResult, TokenStorageBackend};
 
 /// Simple HashMap-based token storage
 ///
@@ -57,9 +57,9 @@ impl TokenStorageBackend for HashMapTokens {
     fn search_signature(
         &self,
         _lookup_token: &TokenId,
-        _signature_chunks: &[u16; crate::ec_proof_of_storage::SIGNATURE_CHUNKS],
+        _signature_chunks: &[u16; ec_rust::ec_proof_of_storage::SIGNATURE_CHUNKS],
     ) -> SignatureSearchResult {
-        panic!("HashMapTokens does not support signature search - use MemTokens or SimulatorTokenStorage instead");
+        panic!("HashMapTokens does not support signature search - use MemTokens or similar instead");
     }
 
     fn len(&self) -> usize {

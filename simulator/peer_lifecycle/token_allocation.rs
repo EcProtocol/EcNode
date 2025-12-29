@@ -7,12 +7,11 @@
 // discoverable tokens that can be found through proof-of-storage elections.
 
 use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
-use ec_rust::ec_proof_of_storage::TokenStorageBackend;
+use ec_rust::ec_memory_backend::MemTokens;
+use ec_rust::ec_proof_of_storage::{ring_distance, TokenStorageBackend};
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
-
-use super::sim_token_storage::SimulatorTokenStorage;
 
 /// Configuration for token distribution
 #[derive(Debug, Clone)]
@@ -99,18 +98,18 @@ impl GlobalTokenMapping {
         width.min(u64::MAX / 2) // Cap at half the ring
     }
 
-    /// Get a view of tokens for a specific peer as SimulatorTokenStorage
+    /// Get a view of tokens for a specific peer as MemTokens
     ///
     /// Returns tokens within ±view_width of peer_id, with coverage_fraction sampling.
     /// The peer's own ID is always included (for discovery).
     ///
-    /// Returns a ready-to-use SimulatorTokenStorage instance optimized for signature searches.
+    /// Returns a ready-to-use MemTokens instance optimized for signature searches.
     pub fn get_peer_view(
         &mut self,
         peer_id: PeerId,
         view_width: u64,
         coverage_fraction: f64,
-    ) -> SimulatorTokenStorage {
+    ) -> MemTokens {
         let mut mappings = Vec::new();
 
         // IMPORTANT: Add peer_id itself as token (for peer discovery)
@@ -135,8 +134,8 @@ impl GlobalTokenMapping {
             }
         }
 
-        // Create SimulatorTokenStorage (will sort internally for fast searches)
-        SimulatorTokenStorage::new(mappings)
+        // Create MemTokens (will sort internally for fast searches)
+        MemTokens::from_mappings(mappings)
     }
 
     /// Get list of peer IDs that should be known by this peer
@@ -216,13 +215,6 @@ impl GlobalTokenMapping {
     pub fn peer_count(&self) -> usize {
         self.allocated_peer_ids.len()
     }
-}
-
-/// Calculate ring distance (shortest path on circular ID space)
-fn ring_distance(a: u64, b: u64) -> u64 {
-    let forward = b.wrapping_sub(a);
-    let backward = a.wrapping_sub(b);
-    forward.min(backward)
 }
 
 #[cfg(test)]
