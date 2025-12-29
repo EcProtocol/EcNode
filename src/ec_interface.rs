@@ -396,6 +396,21 @@ pub trait EcCommitChainBackend {
     fn set_head(&mut self, id: &CommitBlockId);
 }
 
+/// Trait for backends that support commit chain operations
+///
+/// This trait provides access to the commit chain functionality embedded
+/// within a backend implementation.
+pub trait EcCommitChainAccess {
+    /// Get the current head of the commit chain
+    fn get_commit_chain_head(&self) -> Option<CommitBlockId>;
+
+    /// Query a commit block by ID
+    fn query_commit_block(&self, block_id: CommitBlockId) -> Option<CommitBlock>;
+
+    /// Handle an incoming commit block from a peer
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId);
+}
+
 // ============================================================================
 // Batch Commit Abstraction
 // ============================================================================

@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ec_interface::{
-    BatchedBackend, Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, Message,
-    MessageEnvelope, MessageTicket, NoOpSink, PeerId,
+    BatchedBackend, Block, BlockId, EcBlocks, EcCommitChainAccess, EcTime, EcTokens, Event,
+    EventSink, Message, MessageEnvelope, MessageTicket, NoOpSink, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
 use crate::ec_peers::{EcPeers, PeerAction};
@@ -11,7 +11,10 @@ use crate::ec_proof_of_storage::TokenStorageBackend;
 
 use crate::ec_mempool::MessageRequest;
 
-pub struct EcNode<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> {
+pub struct EcNode<
+    B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static,
+    T: TokenStorageBackend,
+> {
     backend: Rc<RefCell<B>>,
     token_storage: T,
     peers: EcPeers,
@@ -23,7 +26,9 @@ pub struct EcNode<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenSto
     event_sink: Box<dyn EventSink>,
 }
 
-impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> EcNode<B, T> {
+impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T: TokenStorageBackend>
+    EcNode<B, T>
+{
     /// Create a new node with default NoOpSink (zero overhead)
     pub fn new(backend: Rc<RefCell<B>>, id: PeerId, time: EcTime, token_storage: T) -> Self {
         Self::new_with_sink(backend, id, time, token_storage, Box::new(NoOpSink))
@@ -342,12 +347,17 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                             signature,
                             ticket,
                         } => {
+                            let head_of_chain = self.backend.borrow().get_commit_chain_head().unwrap_or(0);
                             responses.push(MessageEnvelope {
                                 sender: self.peer_id,
                                 receiver,
                                 ticket,
                                 time: self.time,
-                                message: Message::Answer { answer, signature, head_of_chain: 0 },
+                                message: Message::Answer {
+                                    answer,
+                                    signature,
+                                    head_of_chain,
+                                },
                             });
                         }
                         PeerAction::SendReferral {
@@ -398,13 +408,22 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
                 // Process returned actions (e.g., Invitations)
                 for action in actions {
                     match action {
-                        PeerAction::SendInvitation { receiver, answer, signature } => {
+                        PeerAction::SendInvitation {
+                            receiver,
+                            answer,
+                            signature,
+                        } => {
+                            let head_of_chain = self.backend.borrow().get_commit_chain_head().unwrap_or(0);
                             responses.push(MessageEnvelope {
                                 receiver,
                                 sender: self.peer_id,
                                 ticket: 0, // Invitation uses ticket=0
                                 time: self.time,
-                                message: Message::Answer { answer, signature, head_of_chain: 0 },
+                                message: Message::Answer {
+                                    answer,
+                                    signature,
+                                    head_of_chain,
+                                },
                             });
                         }
                         PeerAction::SendQuery { receiver, token, ticket } => {
@@ -473,13 +492,28 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + 'static, T: TokenStorageBackend> 
 
                 }
             }
-            Message::QueryCommitBlock { .. } => {
-                // TODO: Implement commit chain query handler
-                // For now, ignore these messages until commit chain module is implemented
+            Message::QueryCommitBlock { block_id, ticket } => {
+                // Query our commit chain for the requested block
+                let backend = self.backend.borrow();
+                if let Some(commit_block) = backend.query_commit_block(*block_id) {
+                    // We have it - send it back
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: msg.sender,
+                        ticket: *ticket,
+                        time: self.time,
+                        message: Message::CommitBlock {
+                            block: commit_block,
+                        },
+                    });
+                }
+                // If we don't have it, ignore the query (could forward in the future)
             }
-            Message::CommitBlock { .. } => {
-                // TODO: Implement commit block handler
-                // For now, ignore these messages until commit chain module is implemented
+            Message::CommitBlock { block } => {
+                // Handle incoming commit block from peer
+                let mut backend = self.backend.borrow_mut();
+                backend.handle_commit_block(block.clone(), msg.sender);
+                // For MVP, handle_commit_block is a stub and doesn't store/validate yet
             }
         }
     }

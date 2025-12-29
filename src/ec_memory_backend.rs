@@ -14,6 +14,7 @@ use crate::ec_interface::{
     EcCommitChainBackend, EcTime, EcTokens, PeerId, StorageBatch, TokenId, TokenSignature,
 };
 use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
+use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 
 // ============================================================================
 // In-Memory Token Storage
@@ -388,14 +389,27 @@ impl EcBlocks for MemBlocks {
 pub struct MemoryBackend {
     tokens: MemTokens,
     blocks: MemBlocks,
+    commit_chain: EcCommitChain,
+    commit_chain_backend: MemCommitChain,
+    peer_id: PeerId,
 }
 
 impl MemoryBackend {
     /// Create a new empty memory backend
+    ///
+    /// Note: For proper initialization, use new_with_peer_id instead
     pub fn new() -> Self {
+        Self::new_with_peer_id(0)
+    }
+
+    /// Create a new memory backend for a specific peer
+    pub fn new_with_peer_id(peer_id: PeerId) -> Self {
         Self {
             tokens: MemTokens::new(),
             blocks: MemBlocks::new(),
+            commit_chain: EcCommitChain::new(peer_id, CommitChainConfig::default()),
+            commit_chain_backend: MemCommitChain::new(),
+            peer_id,
         }
     }
 
@@ -458,6 +472,22 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
         // Apply all token updates
         for (token, block, parent, time) in &self.tokens {
             TokenStorageBackend::set(&mut self.backend.tokens, token, block, parent, *time);
+        }
+
+        // Create commit block if we committed any blocks
+        if !self.blocks.is_empty() {
+            // Use the max time from all blocks as the commit block time
+            let commit_time = self.blocks.iter().map(|b| b.time).max().unwrap_or(0);
+
+            // Collect block IDs
+            let block_ids: Vec<BlockId> = self.blocks.iter().map(|b| b.id).collect();
+
+            // Create commit block
+            self.backend.commit_chain.create_commit_block(
+                &mut self.backend.commit_chain_backend,
+                block_ids,
+                commit_time,
+            );
         }
 
         Ok(())
@@ -532,6 +562,23 @@ impl EcBlocks for MemoryBackend {
 
     fn save(&mut self, block: &Block) {
         self.blocks.save(block)
+    }
+}
+
+// Implement EcCommitChainAccess for MemoryBackend
+impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
+    fn get_commit_chain_head(&self) -> Option<CommitBlockId> {
+        self.commit_chain.get_head(&self.commit_chain_backend)
+    }
+
+    fn query_commit_block(&self, block_id: CommitBlockId) -> Option<CommitBlock> {
+        self.commit_chain
+            .handle_query_commit_block(&self.commit_chain_backend, block_id)
+    }
+
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId) {
+        self.commit_chain
+            .handle_commit_block(&mut self.commit_chain_backend, block, sender);
     }
 }
 

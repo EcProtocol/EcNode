@@ -78,7 +78,7 @@ impl SimRunner {
         // Create nodes with topology
         let mut nodes: BTreeMap<PeerId, EcNode<MemoryBackend, HashMapTokens>> = BTreeMap::new();
         for peer_id in &peers {
-            let backend = Rc::new(RefCell::new(MemoryBackend::new()));
+            let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(*peer_id)));
             let token_storage = HashMapTokens::new();
 
             // Create event sink based on configuration
