@@ -1,5 +1,5 @@
 use crate::ec_interface::{
-    EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
+    CommitBlockId, EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
 };
 use crate::ec_proof_of_storage::{ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend};
 use serde::{Serialize, Deserialize};
@@ -133,6 +133,8 @@ impl PeerState {
 /// Extended peer information with state
 struct MemPeer {
     state: PeerState,
+    /// Last known commit chain head for this peer (if available)
+    commit_chain_head: Option<CommitBlockId>,
     // TODO: network address, shared secret
 }
 
@@ -375,7 +377,7 @@ impl EcPeers {
 
     /// Find closest peers to a target token (for election channels)
     /// Walks BTreeMap in both directions from target
-    fn find_closest_peers(&self, target: TokenId, count: usize) -> Vec<PeerId> {
+    pub fn find_closest_peers(&self, target: TokenId, count: usize) -> Vec<PeerId> {
         let mut candidates = Vec::new();
 
         // TODO just next/next_back into vec. No sort etc.
@@ -441,7 +443,13 @@ impl EcPeers {
         peer_id: PeerId,
         time: EcTime,
         token_storage: &dyn TokenStorageBackend,
+        head_of_chain: CommitBlockId,
     ) -> Vec<PeerAction> {
+        // Track peer's commit chain head if provided (non-zero)
+        if head_of_chain > 0 {
+            self.update_peer_commit_chain_head(&peer_id, head_of_chain);
+        }
+
         // handle Invitation (ticket == 0)
         if ticket == 0 {
             return self.handle_invitation(answer, signature, peer_id, time, token_storage);
@@ -704,6 +712,7 @@ impl EcPeers {
                         election_attempts: 0,
                         quality_score: 1.0, // Start with max quality
                     },
+                    commit_chain_head: None, // Unknown until we get an Answer message
                 },
             );
 
@@ -748,6 +757,7 @@ impl EcPeers {
                     discovered_at: time,
                     last_invitation_election_at: None,
                 },
+                commit_chain_head: None, // Unknown until we get an Answer message
             },
         );
 
@@ -1126,6 +1136,23 @@ impl EcPeers {
     /// Used by simulator for connectivity analysis
     pub fn get_active_peers(&self) -> &[PeerId] {
         &self.active
+    }
+
+    /// Get the last known commit chain head for a peer
+    ///
+    /// Returns None if peer is unknown or head has not been learned yet.
+    pub fn get_peer_commit_chain_head(&self, peer_id: &PeerId) -> Option<CommitBlockId> {
+        self.peers.get(peer_id).and_then(|peer| peer.commit_chain_head)
+    }
+
+    /// Update the commit chain head for a peer
+    ///
+    /// Called when we receive an Answer message with head_of_chain field.
+    /// Only updates Identified or Connected peers.
+    pub fn update_peer_commit_chain_head(&mut self, peer_id: &PeerId, head: CommitBlockId) {
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            peer.commit_chain_head = Some(head);
+        }
     }
 
     // ========================================================================

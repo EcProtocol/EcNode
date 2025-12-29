@@ -187,6 +187,14 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                 }
             }
         }
+
+        // Phase 4: Commit chain sync
+        // Periodically query nearby peers to keep our commit chain up to date
+        let sync_messages = {
+            let mut backend = self.backend.borrow_mut();
+            backend.commit_chain_tick(&self.peers, self.time)
+        };
+        responses.extend(sync_messages);
     }
 
     /*
@@ -401,9 +409,20 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     }
                 }
             }
-            Message::Answer { answer, signature, head_of_chain: _ } => {
-                let actions = self.peers
-                    .handle_answer(answer, signature, msg.ticket, msg.sender, self.time, &self.token_storage);
+            Message::Answer {
+                answer,
+                signature,
+                head_of_chain,
+            } => {
+                let actions = self.peers.handle_answer(
+                    answer,
+                    signature,
+                    msg.ticket,
+                    msg.sender,
+                    self.time,
+                    &self.token_storage,
+                    *head_of_chain,
+                );
 
                 // Process returned actions (e.g., Invitations)
                 for action in actions {
@@ -512,8 +531,11 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             Message::CommitBlock { block } => {
                 // Handle incoming commit block from peer
                 let mut backend = self.backend.borrow_mut();
-                backend.handle_commit_block(block.clone(), msg.sender);
-                // For MVP, handle_commit_block is a stub and doesn't store/validate yet
+                if let Some(mut parent_request) = backend.handle_commit_block(block.clone(), msg.sender) {
+                    // Block didn't connect - need to request parent
+                    parent_request.time = self.time;
+                    responses.push(parent_request);
+                }
             }
         }
     }

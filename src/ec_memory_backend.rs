@@ -576,9 +576,18 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
             .handle_query_commit_block(&self.commit_chain_backend, block_id)
     }
 
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId) {
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId) -> Option<crate::ec_interface::MessageEnvelope> {
         self.commit_chain
-            .handle_commit_block(&mut self.commit_chain_backend, block, sender);
+            .handle_commit_block(block, sender)
+    }
+
+    fn commit_chain_tick(
+        &mut self,
+        peers: &crate::ec_peers::EcPeers,
+        time: EcTime,
+    ) -> Vec<crate::ec_interface::MessageEnvelope> {
+        self.commit_chain
+            .tick(&self.commit_chain_backend, peers, time)
     }
 }
 

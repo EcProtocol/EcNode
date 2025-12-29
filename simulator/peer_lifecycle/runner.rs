@@ -430,6 +430,7 @@ impl PeerLifecycleRunner {
                         envelope.from,
                         current_time,
                         &peer.token_storage,
+                        0, // head_of_chain not used in peer lifecycle sim
                     );
                 }
             }

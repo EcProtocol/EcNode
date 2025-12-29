@@ -5,9 +5,10 @@
 //! tracking which transaction blocks were committed.
 
 use crate::ec_interface::{
-    BlockId, CommitBlock, CommitBlockId, EcCommitChainBackend, EcTime, MessageEnvelope,
+    BlockId, CommitBlock, CommitBlockId, EcCommitChainBackend, EcTime, Message, MessageEnvelope,
     MessageTicket, PeerId, GENESIS_BLOCK_ID,
 };
+use crate::ec_peers::EcPeers;
 
 /// Configuration for commit chain behavior
 #[derive(Debug, Clone)]
@@ -28,16 +29,86 @@ impl Default for CommitChainConfig {
     }
 }
 
+use std::collections::HashMap;
+
+/// Tracks a single peer's commit chain for sync purposes
+#[derive(Debug, Clone)]
+struct PeerChainLog {
+    /// Their last known head block ID
+    last_known_head: CommitBlockId,
+    /// Blocks we've collected from this peer (in order)
+    /// Last element is the latest block we have
+    blocks: Vec<CommitBlock>,
+    /// Out-of-order blocks waiting for their parents
+    /// Maps parent_id -> block
+    orphaned_blocks: HashMap<CommitBlockId, CommitBlock>,
+}
+
+impl PeerChainLog {
+    fn new(head: CommitBlockId) -> Self {
+        Self {
+            last_known_head: head,
+            blocks: Vec::new(),
+            orphaned_blocks: HashMap::new(),
+        }
+    }
+
+    /// Get the ID of the latest block we have in this chain
+    fn get_chain_tip(&self) -> Option<CommitBlockId> {
+        self.blocks.last().map(|b| b.id)
+    }
+
+    /// Try to add a block to the chain
+    ///
+    /// If it connects to the tip, adds it and checks for orphans that can now connect.
+    /// If it doesn't connect, stores it in orphaned_blocks.
+    /// Returns true if block was successfully added to the chain.
+    fn try_add_block(&mut self, block: CommitBlock) -> bool {
+        let chain_tip = self.get_chain_tip();
+
+        // Check if this block connects to our current tip
+        if chain_tip == Some(block.previous) || (chain_tip.is_none() && block.previous == GENESIS_BLOCK_ID) {
+            // Block connects! Add it to the chain
+            self.blocks.push(block.clone());
+
+            // Check if any orphaned blocks can now connect
+            let mut connected_something = true;
+            while connected_something {
+                connected_something = false;
+                let current_tip = self.get_chain_tip().unwrap();
+
+                // Look for an orphan that points to current tip
+                if let Some(orphan) = self.orphaned_blocks.remove(&current_tip) {
+                    self.blocks.push(orphan);
+                    connected_something = true;
+                }
+            }
+
+            true
+        } else {
+            // Block doesn't connect - store as orphan
+            self.orphaned_blocks.insert(block.previous, block);
+            false
+        }
+    }
+}
+
+/// Number of peer chains to track concurrently
+const MAX_TRACKED_PEERS: usize = 4;
+
 /// Main commit chain coordinator
 ///
-/// For MVP: Simple implementation that just creates and stores commit blocks.
-/// Future: Will add bootstrap sync, peer tracking, fraud detection.
+/// Tracks multiple peer chains for sync and creates our own commit blocks.
 pub struct EcCommitChain {
     peer_id: PeerId,
     config: CommitChainConfig,
 
     /// Next commit block ID to assign (sequential in simulation)
     next_commit_block_id: CommitBlockId,
+
+    /// Tracks peer chains we're following for sync (up to 4)
+    /// Maps PeerId -> PeerChainLog
+    tracked_peers: HashMap<PeerId, PeerChainLog>,
 }
 
 impl EcCommitChain {
@@ -47,6 +118,7 @@ impl EcCommitChain {
             peer_id,
             config,
             next_commit_block_id: 1, // Start from 1 (0 is reserved for genesis)
+            tracked_peers: HashMap::new(),
         }
     }
 
@@ -94,21 +166,37 @@ impl EcCommitChain {
 
     /// Handle an incoming commit block from a peer
     ///
-    /// For MVP: Just store it if we don't have it.
-    /// Future: Validate chain, detect conflicts, track peer heads.
+    /// Processes the block if it's from a tracked peer:
+    /// - Tries to add it to the chain using try_add_block
+    /// - If it connects, stores it in the peer log
+    /// - If it doesn't connect and we're still tracking this peer, stores as orphan
+    /// - Returns optional message to request parent if needed
     pub fn handle_commit_block(
         &mut self,
-        _backend: &mut dyn EcCommitChainBackend,
-        _block: CommitBlock,
-        _sender: PeerId,
-    ) {
-        // TODO: Implement commit block validation and storage
-        // For now, we just ignore incoming commit blocks
-        // Full implementation will:
-        // - Validate chain linkage
-        // - Store if valid
-        // - Update peer head tracking
-        // - Detect fraud
+        block: CommitBlock,
+        sender: PeerId,
+    ) -> Option<MessageEnvelope> {
+        // Only process if we're tracking this peer
+        let log = self.tracked_peers.get_mut(&sender)?;
+
+        // Try to add the block
+        if log.try_add_block(block.clone()) {
+            // Block was added successfully (and maybe some orphans too)
+            None
+        } else {
+            // Block was stored as orphan
+            // Request the parent block to try to connect it
+            Some(MessageEnvelope {
+                sender: self.peer_id,
+                receiver: sender,
+                ticket: 0,
+                time: 0, // Will be filled by caller
+                message: Message::QueryCommitBlock {
+                    block_id: block.previous,
+                    ticket: 0,
+                },
+            })
+        }
     }
 
     /// Get the current head of our commit chain
@@ -118,20 +206,79 @@ impl EcCommitChain {
 
     /// Main tick function for commit chain operations
     ///
-    /// For MVP: Does nothing (no active sync yet).
-    /// Future: Will handle bootstrap sync, peer tracking, fraud detection.
+    /// Manages peer chain tracking and requests missing blocks.
+    ///
+    /// Strategy:
+    /// - Maintain up to 4 peer chain logs (HashMap)
+    /// - Fill slots with closest peers that have heads
+    /// - Detect when peer heads change and request missing blocks
     pub fn tick(
         &mut self,
-        _backend: &mut dyn EcCommitChainBackend,
-        _time: EcTime,
+        _backend: &dyn EcCommitChainBackend,
+        peers: &EcPeers,
+        time: EcTime,
     ) -> Vec<MessageEnvelope> {
-        // For MVP, commit chain is passive - it only responds to queries
-        // Future phases will add:
-        // - Bootstrap sync state machine
-        // - Peer head tracking and refresh
-        // - Fraud evidence pruning
-        // - Continuous background sync
-        Vec::new()
+        let mut messages = Vec::new();
+
+        // Only run sync logic periodically (every 100 ticks)
+        if time % 100 != 0 {
+            return messages;
+        }
+
+        // Step 1: Fill empty slots with new peers (up to MAX_TRACKED_PEERS)
+        if self.tracked_peers.len() < MAX_TRACKED_PEERS {
+            // Find closest peers
+            let closest = peers.find_closest_peers(self.peer_id, 10);
+
+            // Look for a peer we're not already tracking that has a known head
+            for candidate_peer in closest {
+                if candidate_peer == self.peer_id {
+                    continue; // Skip ourselves
+                }
+
+                // Check if already tracking this peer
+                if self.tracked_peers.contains_key(&candidate_peer) {
+                    continue;
+                }
+
+                // Check if this peer has a known head
+                if let Some(head) = peers.get_peer_commit_chain_head(&candidate_peer) {
+                    // Start tracking this peer
+                    self.tracked_peers.insert(candidate_peer, PeerChainLog::new(head));
+
+                    // Stop if we've reached max capacity
+                    if self.tracked_peers.len() >= MAX_TRACKED_PEERS {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Step 2: Check each tracked peer for head changes and request missing blocks
+        for (peer_id, log) in &mut self.tracked_peers {
+            // Get current head from peers
+            if let Some(current_head) = peers.get_peer_commit_chain_head(peer_id) {
+                // Check if head has changed
+                if current_head != log.last_known_head {
+                    // Head changed! We need to sync
+                    log.last_known_head = current_head;
+
+                    // Request the block at the new head
+                    messages.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: *peer_id,
+                        ticket: 0,
+                        time,
+                        message: Message::QueryCommitBlock {
+                            block_id: current_head,
+                            ticket: 0,
+                        },
+                    });
+                }
+            }
+        }
+
+        messages
     }
 }
 

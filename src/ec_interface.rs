@@ -408,7 +408,16 @@ pub trait EcCommitChainAccess {
     fn query_commit_block(&self, block_id: CommitBlockId) -> Option<CommitBlock>;
 
     /// Handle an incoming commit block from a peer
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId);
+    ///
+    /// Stores block in peer log if from tracked peer.
+    /// Returns optional message to request parent block if needed.
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId) -> Option<MessageEnvelope>;
+
+    /// Tick function for commit chain sync operations
+    ///
+    /// Returns messages to send (e.g., QueryCommitBlock messages).
+    /// Requires peers reference to find neighbors for sync.
+    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<MessageEnvelope>;
 }
 
 // ============================================================================
