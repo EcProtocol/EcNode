@@ -531,7 +531,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             Message::CommitBlock { block } => {
                 // Handle incoming commit block from peer
                 let mut backend = self.backend.borrow_mut();
-                if let Some(mut parent_request) = backend.handle_commit_block(block.clone(), msg.sender) {
+                if let Some(mut parent_request) = backend.handle_commit_block(block.clone(), msg.sender, msg.ticket) {
                     // Block didn't connect - need to request parent
                     parent_request.time = self.time;
                     responses.push(parent_request);

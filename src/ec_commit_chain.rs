@@ -10,6 +10,10 @@ use crate::ec_interface::{
 };
 use crate::ec_peers::EcPeers;
 
+/// Internal secret for generating message tickets
+/// In production this would be cryptographically secure random bytes
+type TicketSecret = u64;
+
 /// Configuration for commit chain behavior
 #[derive(Debug, Clone)]
 pub struct CommitChainConfig {
@@ -109,17 +113,45 @@ pub struct EcCommitChain {
     /// Tracks peer chains we're following for sync (up to 4)
     /// Maps PeerId -> PeerChainLog
     tracked_peers: HashMap<PeerId, PeerChainLog>,
+
+    /// Secret for generating message tickets
+    /// Used to verify that commit blocks are responses to our requests
+    ticket_secret: TicketSecret,
 }
 
 impl EcCommitChain {
     /// Create a new commit chain coordinator
     pub fn new(peer_id: PeerId, config: CommitChainConfig) -> Self {
+        // Generate a random secret for ticket generation
+        // In simulation: use peer_id as seed for determinism
+        // In production: use cryptographically secure random
+        let ticket_secret = peer_id.wrapping_mul(0x9e3779b97f4a7c15); // Simple hash
+
         Self {
             peer_id,
             config,
             next_commit_block_id: 1, // Start from 1 (0 is reserved for genesis)
             tracked_peers: HashMap::new(),
+            ticket_secret,
         }
+    }
+
+    /// Generate a ticket for requesting a specific commit block
+    ///
+    /// Ticket = Hash(block_id XOR secret)
+    /// This allows us to verify that incoming blocks are responses to our requests.
+    fn generate_ticket(&self, block_id: CommitBlockId) -> MessageTicket {
+        // Simple hash function for simulation
+        // In production, use proper cryptographic hash
+        let combined = block_id.wrapping_add(self.ticket_secret);
+        combined.wrapping_mul(0x9e3779b97f4a7c15)
+    }
+
+    /// Verify that a ticket is valid for a given block ID
+    ///
+    /// Returns true if the ticket matches what we would generate for this block.
+    fn verify_ticket(&self, block_id: CommitBlockId, ticket: MessageTicket) -> bool {
+        self.generate_ticket(block_id) == ticket
     }
 
     /// Create a new commit block for committed transaction blocks
@@ -166,7 +198,8 @@ impl EcCommitChain {
 
     /// Handle an incoming commit block from a peer
     ///
-    /// Processes the block if it's from a tracked peer:
+    /// Processes the block if it's from a tracked peer and ticket is valid:
+    /// - Verifies ticket to prevent unsolicited blocks
     /// - Tries to add it to the chain using try_add_block
     /// - If it connects, stores it in the peer log
     /// - If it doesn't connect and we're still tracking this peer, stores as orphan
@@ -175,7 +208,14 @@ impl EcCommitChain {
         &mut self,
         block: CommitBlock,
         sender: PeerId,
+        ticket: MessageTicket,
     ) -> Option<MessageEnvelope> {
+        // Verify ticket first - this proves the block is a response to our request
+        if !self.verify_ticket(block.id, ticket) {
+            // Invalid ticket - ignore this block (likely spam or attack)
+            return None;
+        }
+
         // Only process if we're tracking this peer
         let log = self.tracked_peers.get_mut(&sender)?;
 
@@ -185,15 +225,18 @@ impl EcCommitChain {
             None
         } else {
             // Block was stored as orphan
+            // Generate ticket for parent request
+            let parent_ticket = self.generate_ticket(block.previous);
+
             // Request the parent block to try to connect it
             Some(MessageEnvelope {
                 sender: self.peer_id,
                 receiver: sender,
-                ticket: 0,
+                ticket: parent_ticket,
                 time: 0, // Will be filled by caller
                 message: Message::QueryCommitBlock {
                     block_id: block.previous,
-                    ticket: 0,
+                    ticket: parent_ticket,
                 },
             })
         }
@@ -255,27 +298,35 @@ impl EcCommitChain {
         }
 
         // Step 2: Check each tracked peer for head changes and request missing blocks
-        for (peer_id, log) in &mut self.tracked_peers {
-            // Get current head from peers
-            if let Some(current_head) = peers.get_peer_commit_chain_head(peer_id) {
-                // Check if head has changed
-                if current_head != log.last_known_head {
-                    // Head changed! We need to sync
-                    log.last_known_head = current_head;
+        // Collect peer IDs and current heads first to avoid borrow conflicts
+        let peer_head_changes: Vec<(PeerId, CommitBlockId)> = self.tracked_peers.iter()
+            .filter_map(|(peer_id, log)| {
+                peers.get_peer_commit_chain_head(peer_id)
+                    .filter(|&current_head| current_head != log.last_known_head)
+                    .map(|current_head| (*peer_id, current_head))
+            })
+            .collect();
 
-                    // Request the block at the new head
-                    messages.push(MessageEnvelope {
-                        sender: self.peer_id,
-                        receiver: *peer_id,
-                        ticket: 0,
-                        time,
-                        message: Message::QueryCommitBlock {
-                            block_id: current_head,
-                            ticket: 0,
-                        },
-                    });
-                }
+        // Now update logs and generate messages
+        for (peer_id, current_head) in peer_head_changes {
+            if let Some(log) = self.tracked_peers.get_mut(&peer_id) {
+                log.last_known_head = current_head;
             }
+
+            // Generate ticket for this request
+            let ticket = self.generate_ticket(current_head);
+
+            // Request the block at the new head
+            messages.push(MessageEnvelope {
+                sender: self.peer_id,
+                receiver: peer_id,
+                ticket,
+                time,
+                message: Message::QueryCommitBlock {
+                    block_id: current_head,
+                    ticket,
+                },
+            });
         }
 
         messages

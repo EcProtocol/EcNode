@@ -576,9 +576,9 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
             .handle_query_commit_block(&self.commit_chain_backend, block_id)
     }
 
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId) -> Option<crate::ec_interface::MessageEnvelope> {
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket) -> Option<crate::ec_interface::MessageEnvelope> {
         self.commit_chain
-            .handle_commit_block(block, sender)
+            .handle_commit_block(block, sender, ticket)
     }
 
     fn commit_chain_tick(

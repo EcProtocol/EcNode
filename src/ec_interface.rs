@@ -409,9 +409,9 @@ pub trait EcCommitChainAccess {
 
     /// Handle an incoming commit block from a peer
     ///
-    /// Stores block in peer log if from tracked peer.
+    /// Verifies ticket and stores block in peer log if from tracked peer.
     /// Returns optional message to request parent block if needed.
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId) -> Option<MessageEnvelope>;
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: MessageTicket) -> Option<MessageEnvelope>;
 
     /// Tick function for commit chain sync operations
     ///
