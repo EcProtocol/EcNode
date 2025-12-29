@@ -42,16 +42,15 @@ impl TokenStorageBackend for HashMapTokens {
         self.tokens.get(token).copied()
     }
 
-    fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime) {
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
         self.tokens
             .entry(*token)
             .and_modify(|m| {
-                if m.time < time {
-                    m.time = time;
-                    m.block = *block;
+                if m.time() < time {
+                    *m = BlockTime::new(*block, *parent, time);
                 }
             })
-            .or_insert_with(|| BlockTime::new(*block, time));
+            .or_insert_with(|| BlockTime::new(*block, *parent, time));
     }
 
     fn search_signature(

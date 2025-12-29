@@ -576,9 +576,14 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
             .handle_query_commit_block(&self.commit_chain_backend, block_id)
     }
 
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket) -> Option<crate::ec_interface::MessageEnvelope> {
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket, current_time: EcTime) -> Option<crate::ec_interface::MessageEnvelope> {
         self.commit_chain
-            .handle_commit_block(block, sender, ticket)
+            .handle_commit_block(block, sender, ticket, current_time)
+    }
+
+    fn handle_block(&mut self, block: crate::ec_interface::Block, ticket: crate::ec_interface::MessageTicket) -> bool {
+        self.commit_chain
+            .handle_block(block, ticket)
     }
 
     fn commit_chain_tick(
@@ -587,7 +592,7 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
         time: EcTime,
     ) -> Vec<crate::ec_interface::MessageEnvelope> {
         self.commit_chain
-            .tick(&self.commit_chain_backend, peers, time)
+            .tick(&mut self.commit_chain_backend, &self.blocks, &self.tokens, peers, time)
     }
 }
 

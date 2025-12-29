@@ -286,6 +286,8 @@ impl SimRunner {
                     Message::Block { .. } => self.message_counters.2 += 1,
                     Message::Answer { .. } => self.message_counters.3 += 1,
                     Message::Referral { .. } => (),
+                    Message::QueryCommitBlock { .. } => (),
+                    Message::CommitBlock { .. } => (),
                 };
                 node.handle_message(m, &mut next);
             }

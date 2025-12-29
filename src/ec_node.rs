@@ -469,9 +469,10 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                 if msg.ticket == self.block_req_ticket ^ block.id
                     || msg.ticket == self.parent_block_req_ticket ^ block.id
                 {
+                    // Block request from mempool
                     if self.mem_pool.block(block, self.time) {
                         // TODO DOS-protection: Balance creations of entries from peers/clients
-                 
+
                         self.event_sink.log(
                             self.time,
                             self.peer_id,
@@ -483,8 +484,15 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                         );
                     }
                 } else {
-                    // else other req for blocks - or discard
-                    self.mem_pool.validate_with(block, &msg.ticket)
+                    // Try commit chain first (it verifies ticket internally)
+                    let mut backend = self.backend.borrow_mut();
+                    if backend.handle_block(block.clone(), msg.ticket) {
+                        // Block was accepted by commit chain - ticket was valid
+                    } else {
+                        // Not a commit chain block - try validate_with for other requests
+                        drop(backend); // Release borrow before calling mempool
+                        self.mem_pool.validate_with(block, &msg.ticket)
+                    }
                 }
             }
             Message::Referral { token, high, low } => {
@@ -531,7 +539,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             Message::CommitBlock { block } => {
                 // Handle incoming commit block from peer
                 let mut backend = self.backend.borrow_mut();
-                if let Some(mut parent_request) = backend.handle_commit_block(block.clone(), msg.sender, msg.ticket) {
+                if let Some(mut parent_request) = backend.handle_commit_block(block.clone(), msg.sender, msg.ticket, self.time) {
                     // Block didn't connect - need to request parent
                     parent_request.time = self.time;
                     responses.push(parent_request);

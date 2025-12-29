@@ -287,7 +287,7 @@ mod tests {
     fn test_view_width_calculation() {
         // With 10 peers and 2 neighbor overlap, should cover ~20% of ring on each side
         let width = GlobalTokenMapping::calculate_view_width(10, 2);
-        let expected = (u64::MAX / 10) * 2 * 12 / 10; // avg_distance * overlap * 1.2
+        let expected = u64::MAX / 100 * 24; // (avg_distance * overlap * 1.2) avoiding overflow
         assert_eq!(width, expected);
 
         // With 100 peers and 5 neighbor overlap
