@@ -10,6 +10,7 @@ use crate::ec_interface::{
     BlockId, BlockTime, EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TokenSignature,
     TOKENS_SIGNATURE_SIZE,
 };
+use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 
 /// Number of signature chunks (10-bit each = 100 bits total)
@@ -408,7 +409,7 @@ impl ElectionChannel {
 // ============================================================================
 
 /// Configuration for peer elections
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElectionConfig {
     /// Minimum agreement required for consensus (default: 8/10 mappings)
     pub consensus_threshold: usize,

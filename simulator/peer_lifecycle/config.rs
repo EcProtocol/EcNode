@@ -2,13 +2,14 @@
 
 use ec_rust::ec_peers::PeerManagerConfig;
 use ec_rust::ec_interface::PeerId;
+use serde::{Serialize, Deserialize};
 
 // ============================================================================
 // Main Configuration
 // ============================================================================
 
 /// Main configuration for peer lifecycle simulation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerLifecycleConfig {
     /// Total number of simulation rounds
     pub rounds: usize,
@@ -46,7 +47,7 @@ pub struct PeerLifecycleConfig {
 // ============================================================================
 
 /// Configuration for initial network topology
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitialNetworkState {
     /// Number of peers to create initially
     pub num_peers: usize,
@@ -59,7 +60,7 @@ pub struct InitialNetworkState {
 }
 
 /// Topology modes for initial peer discovery and knowledge
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TopologyMode {
     /// All peers know all other peers (100% knowledge)
     /// connected_fraction controls how many become Connected vs just Identified
@@ -95,7 +96,7 @@ pub enum TopologyMode {
 /// Uses a global token mapping with per-peer views based on:
 /// - neighbor_overlap: How many neighbors on each side should overlap (determines view_width)
 /// - coverage_fraction: Quality parameter - fraction of tokens within range that peer knows (0.0-1.0)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenDistributionConfig {
     /// Total number of tokens in the global mapping (excluding peer IDs)
     pub total_tokens: usize,
@@ -114,13 +115,13 @@ pub struct TokenDistributionConfig {
 // ============================================================================
 
 /// Schedule of network events
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventSchedule {
     pub events: Vec<ScheduledEvent>,
 }
 
 /// A single scheduled event
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledEvent {
     /// Round number when event triggers
     pub round: usize,
@@ -130,7 +131,7 @@ pub struct ScheduledEvent {
 }
 
 /// Types of network events
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkEvent {
     /// Add new peers to the network
     PeerJoin {
@@ -169,7 +170,7 @@ pub enum NetworkEvent {
 }
 
 /// Methods for selecting which peers to affect
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PeerSelection {
     /// Random selection
     Random { count: usize },
@@ -185,7 +186,7 @@ pub enum PeerSelection {
 }
 
 /// Methods for bootstrapping new peers
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BootstrapMethod {
     /// Know N random existing peers
     Random(usize),
@@ -202,7 +203,7 @@ pub enum BootstrapMethod {
 // ============================================================================
 
 /// Network behavior simulation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Fraction of messages delayed to next round (0.0 to 1.0)
     pub delay_fraction: f64,
@@ -216,7 +217,7 @@ pub struct NetworkConfig {
 // ============================================================================
 
 /// Configuration for metrics tracking
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
     /// Track peer state distribution
     pub track_peer_states: bool,
@@ -245,7 +246,7 @@ pub struct MetricsConfig {
 // ============================================================================
 
 /// Configuration for output and logging
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
     /// Enable console event logging
     pub enable_console: bool,

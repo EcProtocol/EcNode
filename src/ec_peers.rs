@@ -2,6 +2,7 @@ use crate::ec_interface::{
     EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
 };
 use crate::ec_proof_of_storage::{ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend};
+use serde::{Serialize, Deserialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ============================================================================
@@ -9,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 // ============================================================================
 
 /// Configuration for the peer management system
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerManagerConfig {
     // ===== Capacity Limits =====
     /// Maximum number of Connected peers (default: 200)

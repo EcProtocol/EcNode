@@ -1,0 +1,57 @@
+# Scenario 1: Bootstrap with Shared State (High Token Coverage)
+#
+# This scenario demonstrates that peers with high token coverage (95%)
+# can bootstrap into a working network even with minimal initial peer knowledge.
+
+meta:
+  name: "Bootstrap with Shared State"
+  description: |
+    Peers with high token coverage (95%) should bootstrap into a
+    functional network despite having minimal initial peer knowledge.
+  hypothesis: |
+    Despite minimal initial peer knowledge (3 peers), high token
+    coverage (95%) enables the network to form connections through
+    successful elections and mutual discovery.
+
+config:
+  rounds: 200
+  tick_duration_ms: 100
+
+  # Initial network state
+  initial_state:
+    num_peers: 30
+    # Each peer starts knowing only 3 random peers
+    initial_topology: !RandomIdentified
+      peers_per_node: 3
+    bootstrap_rounds: 100
+
+  # HIGH token coverage - this is the key factor
+  token_distribution:
+    total_tokens: 100000
+    neighbor_overlap: 10
+    coverage_fraction: 0.95  # 95% - excellent shared state knowledge
+
+  # Election tuning for faster convergence
+  peer_config:
+    elections_per_tick: 3
+    election_timeout: 100
+    min_collection_time: 10
+    pending_timeout: 1000
+    connection_timeout: 10000
+    election_consensus_threshold: 6
+    election_majority_threshold: 0.1
+
+# Event schedule with checkpoints
+events:
+  events:
+    - round: 50
+      event: !ReportStats
+        label: "Early bootstrap"
+
+    - round: 100
+      event: !ReportStats
+        label: "Mid bootstrap"
+
+    - round: 150
+      event: !ReportStats
+        label: "Late bootstrap"

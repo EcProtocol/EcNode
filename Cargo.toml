@@ -9,6 +9,11 @@ path = "src/lib.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Binary for running scenarios from YAML files
+[[bin]]
+name = "scenario_runner"
+path = "simulator/scenario_runner.rs"
+
 # Examples are in the simulator/ directory
 [[example]]
 name = "basic_simulation"
@@ -52,3 +57,5 @@ rand = "0.8.5"
 simple_logger = "4.2.0"
 hashbrown = "0.13.2"
 blake3 = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
