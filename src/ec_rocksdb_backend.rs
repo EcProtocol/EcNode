@@ -273,26 +273,121 @@ impl TokenStorageBackend for RocksDbTokens {
         }
     }
 
-    fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; crate::ec_proof_of_storage::SIGNATURE_CHUNKS],
+    ) -> crate::ec_proof_of_storage::SignatureSearchResult {
+        use crate::ec_proof_of_storage::{SignatureSearchResult, SIGNATURE_CHUNKS};
+
+        let mut found_tokens = Vec::with_capacity(SIGNATURE_CHUNKS);
+        let mut steps = 0;
+        let mut chunk_idx = 0;
+
+        // Helper to match signature chunk
+        #[inline]
+        fn matches_chunk(token: &TokenId, chunk_value: u16) -> bool {
+            (token & 0x3FF) as u16 == chunk_value
+        }
+
         let cf = self.cf_handle();
-        let start_key = Self::encode_key(start);
+        let lookup_key = Self::encode_key(lookup_token);
+
+        // Search above (forward) for first 5 chunks
         let iter = self
             .db
-            .iterator_cf(cf, IteratorMode::From(&start_key, Direction::Forward))
-            .skip(1); // Skip the start key itself
+            .iterator_cf(cf, IteratorMode::From(&lookup_key, Direction::Forward))
+            .skip(1); // Skip lookup_token itself
 
-        Box::new(RocksDbTokenIterator::new(iter))
-    }
+        for result in iter {
+            if let Ok((key, _value)) = result {
+                steps += 1;
+                if let Ok(token_bytes) = TryInto::<[u8; 8]>::try_into(key.as_ref()) {
+                    let token = u64::from_be_bytes(token_bytes);
+                    if matches_chunk(&token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(token);
+                        chunk_idx += 1;
+                        if chunk_idx >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
-    fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        let cf = self.cf_handle();
-        let end_key = Self::encode_key(end);
+        // Ring wrap forward: from beginning to lookup_token
+        if chunk_idx < 5 {
+            let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+            for result in iter {
+                if let Ok((key, _value)) = result {
+                    if let Ok(token_bytes) = TryInto::<[u8; 8]>::try_into(key.as_ref()) {
+                        let token = u64::from_be_bytes(token_bytes);
+                        if token >= *lookup_token {
+                            break; // Reached lookup_token
+                        }
+                        steps += 1;
+                        if matches_chunk(&token, signature_chunks[chunk_idx]) {
+                            found_tokens.push(token);
+                            chunk_idx += 1;
+                            if chunk_idx >= 5 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Search below (backward) for last 5 chunks
         let iter = self
             .db
-            .iterator_cf(cf, IteratorMode::From(&end_key, Direction::Reverse))
-            .skip(1); // Skip the end key itself
+            .iterator_cf(cf, IteratorMode::From(&lookup_key, Direction::Reverse))
+            .skip(1); // Skip lookup_token itself
 
-        Box::new(RocksDbTokenIterator::new(iter))
+        for result in iter {
+            if let Ok((key, _value)) = result {
+                steps += 1;
+                if let Ok(token_bytes) = TryInto::<[u8; 8]>::try_into(key.as_ref()) {
+                    let token = u64::from_be_bytes(token_bytes);
+                    if matches_chunk(&token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(token);
+                        chunk_idx += 1;
+                        if chunk_idx >= SIGNATURE_CHUNKS {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ring wrap backward: from end backwards to lookup_token
+        if chunk_idx < SIGNATURE_CHUNKS {
+            let iter = self.db.iterator_cf(cf, IteratorMode::End);
+            for result in iter {
+                if let Ok((key, _value)) = result {
+                    if let Ok(token_bytes) = TryInto::<[u8; 8]>::try_into(key.as_ref()) {
+                        let token = u64::from_be_bytes(token_bytes);
+                        if token <= *lookup_token {
+                            break; // Reached lookup_token
+                        }
+                        steps += 1;
+                        if matches_chunk(&token, signature_chunks[chunk_idx]) {
+                            found_tokens.push(token);
+                            chunk_idx += 1;
+                            if chunk_idx >= SIGNATURE_CHUNKS {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        SignatureSearchResult {
+            complete: chunk_idx == SIGNATURE_CHUNKS,
+            tokens: found_tokens,
+            steps,
+        }
     }
 
     fn len(&self) -> usize {

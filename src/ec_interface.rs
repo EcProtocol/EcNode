@@ -247,6 +247,23 @@ pub struct BlockTime {
     pub(crate) time: EcTime,
 }
 
+impl BlockTime {
+    /// Create a new BlockTime
+    pub fn new(block: BlockId, time: EcTime) -> Self {
+        Self { block, time }
+    }
+
+    /// Get the block ID
+    pub fn block(&self) -> BlockId {
+        self.block
+    }
+
+    /// Get the time
+    pub fn time(&self) -> EcTime {
+        self.time
+    }
+}
+
 pub trait EcTokens {
     fn lookup(&self, token: &TokenId) -> Option<&BlockTime>;
 

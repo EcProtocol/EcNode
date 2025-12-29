@@ -109,12 +109,82 @@ impl TokenStorageBackend for MemTokens {
             });
     }
 
-    fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        Box::new(self.tokens.range((Excluded(start), Unbounded)).map(|(k, v)| (*k, *v)))
-    }
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; crate::ec_proof_of_storage::SIGNATURE_CHUNKS],
+    ) -> crate::ec_proof_of_storage::SignatureSearchResult {
+        use crate::ec_proof_of_storage::{SignatureSearchResult, SIGNATURE_CHUNKS};
 
-    fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        Box::new(self.tokens.range((Unbounded, Excluded(end))).rev().map(|(k, v)| (*k, *v)))
+        let mut found_tokens = Vec::with_capacity(SIGNATURE_CHUNKS);
+        let mut steps = 0;
+        let mut chunk_idx = 0;
+
+        // Helper to check if a token's last 10 bits match a signature chunk
+        #[inline]
+        fn matches_chunk(token: &TokenId, chunk_value: u16) -> bool {
+            (token & 0x3FF) as u16 == chunk_value
+        }
+
+        // Search above (forward) for first 5 chunks
+        // First pass: from lookup_token to end
+        for (token, _) in self.tokens.range((Excluded(lookup_token), Unbounded)) {
+            steps += 1;
+            if matches_chunk(token, signature_chunks[chunk_idx]) {
+                found_tokens.push(*token);
+                chunk_idx += 1;
+                if chunk_idx >= 5 {
+                    break;
+                }
+            }
+        }
+
+        // Ring wrap: from beginning to lookup_token
+        if chunk_idx < 5 {
+            for (token, _) in self.tokens.range((Unbounded, Excluded(lookup_token))) {
+                steps += 1;
+                if matches_chunk(token, signature_chunks[chunk_idx]) {
+                    found_tokens.push(*token);
+                    chunk_idx += 1;
+                    if chunk_idx >= 5 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Search below (backward) for last 5 chunks
+        // First pass: from lookup_token backwards to beginning
+        for (token, _) in self.tokens.range((Unbounded, Excluded(lookup_token))).rev() {
+            steps += 1;
+            if matches_chunk(token, signature_chunks[chunk_idx]) {
+                found_tokens.push(*token);
+                chunk_idx += 1;
+                if chunk_idx >= SIGNATURE_CHUNKS {
+                    break;
+                }
+            }
+        }
+
+        // Ring wrap: from end backwards to lookup_token
+        if chunk_idx < SIGNATURE_CHUNKS {
+            for (token, _) in self.tokens.range((Excluded(lookup_token), Unbounded)).rev() {
+                steps += 1;
+                if matches_chunk(token, signature_chunks[chunk_idx]) {
+                    found_tokens.push(*token);
+                    chunk_idx += 1;
+                    if chunk_idx >= SIGNATURE_CHUNKS {
+                        break;
+                    }
+                }
+            }
+        }
+
+        SignatureSearchResult {
+            complete: chunk_idx == SIGNATURE_CHUNKS,
+            tokens: found_tokens,
+            steps,
+        }
     }
 
     fn len(&self) -> usize {
@@ -138,12 +208,12 @@ impl<'a> TokenStorageBackend for MemTokensRef<'a> {
         panic!("Cannot mutate through MemTokensRef");
     }
 
-    fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        Box::new(self.0.tokens.range((Excluded(start), Unbounded)).map(|(k, v)| (*k, *v)))
-    }
-
-    fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        Box::new(self.0.tokens.range((Unbounded, Excluded(end))).rev().map(|(k, v)| (*k, *v)))
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; crate::ec_proof_of_storage::SIGNATURE_CHUNKS],
+    ) -> crate::ec_proof_of_storage::SignatureSearchResult {
+        self.0.search_signature(lookup_token, signature_chunks)
     }
 
     fn len(&self) -> usize {
@@ -398,12 +468,12 @@ impl TokenStorageBackend for MemoryBackend {
         TokenStorageBackend::set(&mut self.tokens, token, block, time)
     }
 
-    fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        TokenStorageBackend::range_after(&self.tokens, start)
-    }
-
-    fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-        TokenStorageBackend::range_before(&self.tokens, end)
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; crate::ec_proof_of_storage::SIGNATURE_CHUNKS],
+    ) -> crate::ec_proof_of_storage::SignatureSearchResult {
+        TokenStorageBackend::search_signature(&self.tokens, lookup_token, signature_chunks)
     }
 
     fn len(&self) -> usize {
@@ -474,32 +544,6 @@ mod tests {
         TokenStorageBackend::set(&mut storage, &token, &block2, 20); // Newer time, should update
         let result = TokenStorageBackend::lookup(&storage, &token).unwrap();
         assert_eq!(result.block, block2, "Should update with newer mapping");
-    }
-
-    #[test]
-    fn test_mem_tokens_range_iteration() {
-        let mut storage = MemTokens::new();
-
-        // Insert tokens at intervals
-        for i in 0..10 {
-            TokenStorageBackend::set(&mut storage, &(i * 100), &i, i);
-        }
-
-        // Test range_after
-        let tokens_after: Vec<_> = TokenStorageBackend::range_after(&storage, &250)
-            .take(3)
-            .map(|(t, _)| t)
-            .collect();
-
-        assert_eq!(tokens_after, vec![300, 400, 500]);
-
-        // Test range_before
-        let tokens_before: Vec<_> = TokenStorageBackend::range_before(&storage, &250)
-            .take(3)
-            .map(|(t, _)| t)
-            .collect();
-
-        assert_eq!(tokens_before, vec![200, 100, 0]);
     }
 
     #[test]

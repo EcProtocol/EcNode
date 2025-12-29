@@ -53,6 +53,7 @@ pub mod ec_proof_of_storage;
 
 // Storage backends
 pub mod ec_memory_backend;
+pub mod ec_hashmap_backend;
 
 #[cfg(feature = "rocksdb-backend")]
 pub mod ec_rocksdb_backend;

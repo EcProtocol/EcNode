@@ -3,8 +3,8 @@
 use super::config::{PeerLifecycleConfig, BootstrapMethod};
 use super::stats::*;
 use super::token_allocation::GlobalTokenMapping;
+use super::sim_token_storage::SimulatorTokenStorage;
 use ec_rust::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
-use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_peers::{EcPeers, PeerAction};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -51,7 +51,7 @@ pub struct PeerGroup {
 struct SimPeer {
     peer_id: PeerId,
     peer_manager: EcPeers,
-    token_storage: MemTokens,
+    token_storage: SimulatorTokenStorage,
     known_tokens: Vec<TokenId>,  // Tokens in this peer's view
     active: bool,
 }

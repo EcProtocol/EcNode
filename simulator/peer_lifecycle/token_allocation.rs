@@ -7,11 +7,12 @@
 // discoverable tokens that can be found through proof-of-storage elections.
 
 use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
-use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+
+use super::sim_token_storage::SimulatorTokenStorage;
 
 /// Configuration for token distribution
 #[derive(Debug, Clone)]
@@ -98,29 +99,25 @@ impl GlobalTokenMapping {
         width.min(u64::MAX / 2) // Cap at half the ring
     }
 
-    /// Get a view of tokens for a specific peer as MemTokens
+    /// Get a view of tokens for a specific peer as SimulatorTokenStorage
     ///
     /// Returns tokens within ±view_width of peer_id, with coverage_fraction sampling.
     /// The peer's own ID is always included (for discovery).
     ///
-    /// Returns a ready-to-use MemTokens instance with all tokens populated.
+    /// Returns a ready-to-use SimulatorTokenStorage instance optimized for signature searches.
     pub fn get_peer_view(
         &mut self,
         peer_id: PeerId,
         view_width: u64,
         coverage_fraction: f64,
-    ) -> MemTokens {
-        let mut storage = MemTokens::new();
+    ) -> SimulatorTokenStorage {
+        let mut mappings = Vec::new();
 
         // IMPORTANT: Add peer_id itself as token (for peer discovery)
         // Every peer knows their own ID mapping (with whatever block it maps to)
         if let Some(&block) = self.mappings.get(&peer_id) {
-            storage.set(&peer_id, &block, 0); // time=0 for simplicity
-        }
-
-        // DEBUG
-        let added_self = storage.lookup(&peer_id).is_some();
-        if cfg!(debug_assertions) && !added_self {
+            mappings.push((peer_id, block, 0)); // time=0 for simplicity
+        } else if cfg!(debug_assertions) {
             eprintln!("[TOKEN_DIST] WARNING: Failed to add peer's own ID {:016x}", peer_id);
         }
 
@@ -133,12 +130,13 @@ impl GlobalTokenMapping {
             if self.is_in_range(peer_id, token, view_width) {
                 // Probabilistically include based on coverage fraction
                 if self.rng.gen_bool(coverage_fraction) {
-                    storage.set(&token, &block, 0);
+                    mappings.push((token, block, 0)); // time=0 for simplicity
                 }
             }
         }
 
-        storage
+        // Create SimulatorTokenStorage (will sort internally for fast searches)
+        SimulatorTokenStorage::new(mappings)
     }
 
     /// Get list of peer IDs that should be known by this peer

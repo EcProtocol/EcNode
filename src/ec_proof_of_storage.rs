@@ -57,11 +57,32 @@ pub trait TokenStorageBackend {
     /// Set or update a token's block mapping
     fn set(&mut self, token: &TokenId, block: &BlockId, time: EcTime);
 
-    /// Get an iterator over tokens in ascending order starting after a given token
-    fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_>;
-
-    /// Get an iterator over tokens in descending order starting before a given token
-    fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_>;
+    /// Search for tokens matching signature chunks in ring topology
+    ///
+    /// This method encapsulates the entire signature search algorithm, allowing
+    /// each backend to implement it using the most efficient strategy for that
+    /// backend (e.g., sorted Vec scan, BTreeMap iteration, RocksDB sequential read).
+    ///
+    /// # Algorithm
+    /// - Search above (forward from) lookup_token for first 5 signature chunks
+    /// - Search below (backward from) lookup_token for last 5 signature chunks
+    /// - Wrap around the ring when reaching end/beginning of token space
+    /// - Match 10-bit suffix of TokenId against signature chunks
+    ///
+    /// # Arguments
+    /// - `lookup_token`: Starting point for bidirectional search
+    /// - `signature_chunks`: Array of 10 signature chunks (10-bit values) to match
+    ///
+    /// # Returns
+    /// `SignatureSearchResult` containing:
+    /// - `complete`: true if all 10 tokens were found
+    /// - `tokens`: Vec of matching token IDs (up to 10)
+    /// - `steps`: Number of tokens examined during search
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; SIGNATURE_CHUNKS],
+    ) -> SignatureSearchResult;
 
     /// Get total number of tokens stored
     fn len(&self) -> usize;
@@ -1095,56 +1116,17 @@ impl ProofOfStorage {
 
     /// Perform signature-based token search
     ///
-    /// This implements the bidirectional search algorithm:
-    /// - Search above the lookup token for chunks 0-4 (first 5 signature chunks)
-    /// - Search below the lookup token for chunks 5-9 (last 5 signature chunks)
+    /// This delegates to the backend's `search_signature` implementation,
+    /// allowing each backend to optimize the search strategy.
     ///
     /// Returns tokens matching the signature criteria along with search statistics.
-    pub fn search_by_signature(
+    pub fn search_by_signature<B: TokenStorageBackend + ?Sized>(
         &self,
-        backend: &dyn TokenStorageBackend,
+        backend: &B,
         lookup_token: &TokenId,
         signature_chunks: &[u16; SIGNATURE_CHUNKS],
     ) -> SignatureSearchResult {
-        let mut found_tokens = Vec::with_capacity(SIGNATURE_CHUNKS);
-        let mut steps = 0;
-        let mut chunk_idx = 0;
-
-        // Search above (forward) for first 5 chunks
-        let mut after_iter = backend.range_after(lookup_token);
-        while chunk_idx < 5 {
-            if let Some((token, _)) = after_iter.next() {
-                steps += 1;
-                if Self::matches_signature_chunk(&token, signature_chunks[chunk_idx]) {
-                    found_tokens.push(token);
-                    chunk_idx += 1;
-                }
-            } else {
-                // Reached end of token space
-                break;
-            }
-        }
-
-        // Search below (backward) for last 5 chunks
-        let mut before_iter = backend.range_before(lookup_token);
-        while chunk_idx < SIGNATURE_CHUNKS {
-            if let Some((token, _)) = before_iter.next() {
-                steps += 1;
-                if Self::matches_signature_chunk(&token, signature_chunks[chunk_idx]) {
-                    found_tokens.push(token);
-                    chunk_idx += 1;
-                }
-            } else {
-                // Reached beginning of token space
-                break;
-            }
-        }
-
-        SignatureSearchResult {
-            complete: chunk_idx == SIGNATURE_CHUNKS,
-            tokens: found_tokens,
-            steps,
-        }
+        backend.search_signature(lookup_token, signature_chunks)
     }
 
     /// Generate a complete proof-of-storage signature for a token
@@ -1182,9 +1164,9 @@ impl ProofOfStorage {
     ///     };
     /// }
     /// ```
-    pub fn generate_signature(
+    pub fn generate_signature<B: TokenStorageBackend + ?Sized>(
         &self,
-        backend: &dyn TokenStorageBackend,
+        backend: &B,
         token: &TokenId,
         peer: &PeerId,
     ) -> Option<TokenSignature> {
@@ -1291,14 +1273,80 @@ mod tests {
             self.tokens.insert(*token, BlockTime { block: *block, time });
         }
 
-        fn range_after(&self, start: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
+        fn search_signature(
+            &self,
+            lookup_token: &TokenId,
+            signature_chunks: &[u16; SIGNATURE_CHUNKS],
+        ) -> SignatureSearchResult {
             use std::ops::Bound::{Excluded, Unbounded};
-            Box::new(self.tokens.range((Excluded(start), Unbounded)).map(|(k, v)| (*k, *v)))
-        }
 
-        fn range_before(&self, end: &TokenId) -> Box<dyn Iterator<Item = (TokenId, BlockTime)> + '_> {
-            use std::ops::Bound::{Excluded, Unbounded};
-            Box::new(self.tokens.range((Unbounded, Excluded(end))).rev().map(|(k, v)| (*k, *v)))
+            let mut found_tokens = Vec::with_capacity(SIGNATURE_CHUNKS);
+            let mut steps = 0;
+            let mut chunk_idx = 0;
+
+            // Helper to match signature chunk
+            #[inline]
+            fn matches_chunk(token: &TokenId, chunk_value: u16) -> bool {
+                (token & 0x3FF) as u16 == chunk_value
+            }
+
+            // Search above (forward) for first 5 chunks
+            for (token, _) in self.tokens.range((Excluded(lookup_token), Unbounded)) {
+                steps += 1;
+                if matches_chunk(token, signature_chunks[chunk_idx]) {
+                    found_tokens.push(*token);
+                    chunk_idx += 1;
+                    if chunk_idx >= 5 {
+                        break;
+                    }
+                }
+            }
+
+            // Ring wrap: from beginning to lookup_token
+            if chunk_idx < 5 {
+                for (token, _) in self.tokens.range((Unbounded, Excluded(lookup_token))) {
+                    steps += 1;
+                    if matches_chunk(token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(*token);
+                        chunk_idx += 1;
+                        if chunk_idx >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Search below (backward) for last 5 chunks
+            for (token, _) in self.tokens.range((Unbounded, Excluded(lookup_token))).rev() {
+                steps += 1;
+                if matches_chunk(token, signature_chunks[chunk_idx]) {
+                    found_tokens.push(*token);
+                    chunk_idx += 1;
+                    if chunk_idx >= SIGNATURE_CHUNKS {
+                        break;
+                    }
+                }
+            }
+
+            // Ring wrap: from end backwards to lookup_token
+            if chunk_idx < SIGNATURE_CHUNKS {
+                for (token, _) in self.tokens.range((Excluded(lookup_token), Unbounded)).rev() {
+                    steps += 1;
+                    if matches_chunk(token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(*token);
+                        chunk_idx += 1;
+                        if chunk_idx >= SIGNATURE_CHUNKS {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            SignatureSearchResult {
+                complete: chunk_idx == SIGNATURE_CHUNKS,
+                tokens: found_tokens,
+                steps,
+            }
         }
 
         fn len(&self) -> usize {

@@ -9,7 +9,8 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, RngCore, SeedableRng};
 
-use ec_rust::ec_memory_backend::{MemoryBackend, MemTokens};
+use ec_rust::ec_memory_backend::MemoryBackend;
+use ec_rust::ec_hashmap_backend::HashMapTokens;
 use ec_rust::ec_interface::{
     Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock, TokenId,
     TOKENS_PER_BLOCK,
@@ -27,7 +28,7 @@ pub struct SimRunner {
     config: SimConfig,
     rng: StdRng,
     seed_used: [u8; 32],
-    nodes: BTreeMap<PeerId, EcNode<MemoryBackend, MemTokens>>,
+    nodes: BTreeMap<PeerId, EcNode<MemoryBackend, HashMapTokens>>,
     peers: Vec<PeerId>,
     tokens: Vec<(TokenId, BlockId, PublicKeyReference)>,
     blocks: BTreeMap<BlockId, PeerId>,
@@ -74,10 +75,10 @@ impl SimRunner {
             };
 
         // Create nodes with topology
-        let mut nodes: BTreeMap<PeerId, EcNode<MemoryBackend, MemTokens>> = BTreeMap::new();
+        let mut nodes: BTreeMap<PeerId, EcNode<MemoryBackend, HashMapTokens>> = BTreeMap::new();
         for peer_id in &peers {
             let backend = Rc::new(RefCell::new(MemoryBackend::new()));
-            let token_storage = MemTokens::new();
+            let token_storage = HashMapTokens::new();
 
             // Create event sink based on configuration
             let event_sink: Box<dyn ec_rust::EventSink> =
@@ -124,7 +125,7 @@ impl SimRunner {
     }
 
     fn apply_topology(
-        node: &mut EcNode<MemoryBackend, MemTokens>,
+        node: &mut EcNode<MemoryBackend, HashMapTokens>,
         peer_id: &PeerId,
         peers: &[PeerId],
         topology: &TopologyConfig,
