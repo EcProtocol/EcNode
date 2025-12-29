@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 
 use crate::ec_interface::{
-    BatchedBackend, Block, BlockId, BlockTime, EcBlocks, EcTime, EcTokens, PeerId, StorageBatch,
-    TokenId, TokenSignature,
+    BatchedBackend, Block, BlockId, BlockTime, CommitBlock, CommitBlockId, EcBlocks,
+    EcCommitChainBackend, EcTime, EcTokens, PeerId, StorageBatch, TokenId, TokenSignature,
 };
 use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
 
@@ -532,6 +532,53 @@ impl EcBlocks for MemoryBackend {
 
     fn save(&mut self, block: &Block) {
         self.blocks.save(block)
+    }
+}
+
+// ============================================================================
+// Commit Chain Storage
+// ============================================================================
+
+/// In-memory storage for commit chain blocks
+///
+/// Stores CommitBlocks in a HashMap for fast lookup. Tracks the current head
+/// of the commit chain. For MVP/simulation use only.
+pub struct MemCommitChain {
+    blocks: HashMap<CommitBlockId, CommitBlock>,
+    head: Option<CommitBlockId>,
+}
+
+impl MemCommitChain {
+    /// Create a new empty commit chain storage
+    pub fn new() -> Self {
+        Self {
+            blocks: HashMap::new(),
+            head: None,
+        }
+    }
+}
+
+impl Default for MemCommitChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EcCommitChainBackend for MemCommitChain {
+    fn lookup(&self, id: &CommitBlockId) -> Option<CommitBlock> {
+        self.blocks.get(id).cloned()
+    }
+
+    fn save(&mut self, block: &CommitBlock) {
+        self.blocks.insert(block.id, block.clone());
+    }
+
+    fn get_head(&self) -> Option<CommitBlockId> {
+        self.head
+    }
+
+    fn set_head(&mut self, id: &CommitBlockId) {
+        self.head = Some(*id);
     }
 }
 

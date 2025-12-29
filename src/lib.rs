@@ -50,6 +50,7 @@ pub mod ec_mempool;
 pub mod ec_node;
 pub mod ec_peers;
 pub mod ec_proof_of_storage;
+pub mod ec_commit_chain;
 
 // Storage backends
 pub mod ec_memory_backend;
