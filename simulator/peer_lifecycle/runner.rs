@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct PeerLifecycleRunner {
     config: PeerLifecycleConfig,
     rng: StdRng,
+    seed: [u8; 32],  // Stored for reproducibility reporting
     current_round: usize,
 
     // Network state
@@ -108,6 +109,7 @@ impl PeerLifecycleRunner {
         Self {
             config,
             rng,
+            seed,
             current_round: 0,
             peers: BTreeMap::new(),
             global_mapping: None,
@@ -122,6 +124,13 @@ impl PeerLifecycleRunner {
 
     /// Run the simulation
     pub fn run(mut self) -> SimulationResult {
+        // Report seed for reproducibility
+        println!("╔════════════════════════════════════════════════════════╗");
+        println!("║  Simulation Seed (for reproducibility)                ║");
+        println!("╚════════════════════════════════════════════════════════╝");
+        println!("Seed: {:?}", self.seed);
+        println!("  (Store this seed to reproduce exact same simulation)\n");
+
         // 1. Initialize network
         self.initialize_network();
 
@@ -202,8 +211,9 @@ impl PeerLifecycleRunner {
                 }
             }
 
-            // Create peer manager
-            let peer_manager = EcPeers::with_config(peer_id, self.config.peer_config.clone());
+            // Create peer manager with seeded RNG
+            let peer_rng = StdRng::from_seed(self.rng.gen());
+            let peer_manager = EcPeers::with_config_and_rng(peer_id, self.config.peer_config.clone(), peer_rng);
 
             let peer = SimPeer {
                 peer_id,
@@ -721,8 +731,9 @@ impl PeerLifecycleRunner {
                 known_tokens.push(token_id);
             }
 
-            // Create peer manager
-            let mut peer_manager = EcPeers::with_config(peer_id, self.config.peer_config.clone());
+            // Create peer manager with seeded RNG
+            let peer_rng = StdRng::from_seed(self.rng.gen());
+            let mut peer_manager = EcPeers::with_config_and_rng(peer_id, self.config.peer_config.clone(), peer_rng);
 
             // Add initial knowledge (bootstrap peers)
             // Note: initial_knowledge is passed from the event but could also use a strategy

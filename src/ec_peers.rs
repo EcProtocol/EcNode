@@ -254,14 +254,13 @@ impl TokenSampleCollection {
 
     /// Pick N random tokens and REMOVE them from the collection
     /// Returns up to N tokens (may be less if collection is small)
-    fn pick_and_remove(&mut self, n: usize) -> Vec<TokenId> {
+    fn pick_and_remove<R: rand::Rng>(&mut self, n: usize, rng: &mut R) -> Vec<TokenId> {
         use rand::seq::IteratorRandom;
-        let mut rng = rand::thread_rng();
 
         let selected: Vec<TokenId> = self.samples
             .iter()
             .copied()
-            .choose_multiple(&mut rng, n);
+            .choose_multiple(rng, n);
 
         // Remove selected tokens from the collection
         for &token in &selected {
@@ -273,19 +272,18 @@ impl TokenSampleCollection {
 
     /// Evict random tokens if over capacity
     /// Returns number of tokens evicted
-    fn evict_excess(&mut self) -> usize {
+    fn evict_excess<R: rand::Rng>(&mut self, rng: &mut R) -> usize {
         if self.samples.len() <= self.max_capacity {
             return 0;
         }
 
         use rand::seq::IteratorRandom;
-        let mut rng = rand::thread_rng();
 
         let excess = self.samples.len() - self.max_capacity;
         let to_evict: Vec<TokenId> = self.samples
             .iter()
             .copied()
-            .choose_multiple(&mut rng, excess);
+            .choose_multiple(rng, excess);
 
         for token in &to_evict {
             self.samples.remove(token);
@@ -328,6 +326,9 @@ pub struct EcPeers {
 
     /// Configuration
     config: PeerManagerConfig,
+
+    /// Random number generator (seeded for reproducibility)
+    rng: rand::rngs::StdRng,
 
     // ===== Election Statistics =====
     /// Total elections started (lifetime counter)
@@ -513,7 +514,7 @@ impl EcPeers {
             let accept_prob = 1.0 - distance_fraction; // Inverse: close = high, far = low
 
             // Decide whether to respond to this Invitation
-            if rand::thread_rng().gen_bool(accept_prob) {
+            if self.rng.gen_bool(accept_prob) {
                 return self.start_election_from_invite(answer, signature, sender_peer_id, time);
             }
 
@@ -926,7 +927,7 @@ impl EcPeers {
         use rand::seq::SliceRandom;
         let excess = identified_peers.len() - self.config.identified_max_capacity;
         let to_evict = identified_peers
-            .choose_multiple(&mut rand::thread_rng(), excess)
+            .choose_multiple(&mut self.rng, excess)
             .copied()
             .collect::<Vec<_>>();
 
@@ -957,7 +958,7 @@ impl EcPeers {
                     let distance_fraction = distance / ring_size;
                     let prune_prob = distance_fraction; // Linear (0.0 near, ~1.0 far)
 
-                    if rand::thread_rng().gen_bool(prune_prob) {
+                    if self.rng.gen_bool(prune_prob) {
                         Some(*peer_id)
                     } else {
                         None
@@ -986,12 +987,12 @@ impl EcPeers {
         let mut actions = Vec::new();
 
         // Pick N challenge tokens and remove them from collection
-        let mut challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick);
+        let mut challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick, &mut self.rng);
 
         // If we don't have enough tokens, add random tokens to bootstrap discovery
         // Random tokens won't exist, so we'll get Referrals that populate Identified
         while challenge_tokens.len() < self.config.elections_per_tick {
-            let random_token: TokenId = rand::thread_rng().gen();
+            let random_token: TokenId = self.rng.gen();
             challenge_tokens.push(random_token);
         }
 
@@ -1037,13 +1038,26 @@ impl EcPeers {
     // Construction and Accessors
     // ========================================================================
 
-    /// Create a new peer manager with default configuration
+    /// Create a new peer manager with default configuration and random seed
     pub fn new(peer_id: PeerId) -> Self {
-        Self::with_config(peer_id, PeerManagerConfig::default())
+        use rand::{RngCore, SeedableRng};
+        let mut seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut seed);
+        let rng = rand::rngs::StdRng::from_seed(seed);
+        Self::with_config_and_rng(peer_id, PeerManagerConfig::default(), rng)
     }
 
-    /// Create a new peer manager with custom configuration
+    /// Create a new peer manager with custom configuration and random seed
     pub fn with_config(peer_id: PeerId, config: PeerManagerConfig) -> Self {
+        use rand::{RngCore, SeedableRng};
+        let mut seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut seed);
+        let rng = rand::rngs::StdRng::from_seed(seed);
+        Self::with_config_and_rng(peer_id, config, rng)
+    }
+
+    /// Create a new peer manager with custom configuration and specific RNG
+    pub fn with_config_and_rng(peer_id: PeerId, config: PeerManagerConfig, rng: rand::rngs::StdRng) -> Self {
         let proof_system = ProofOfStorage::new();
         let token_samples = TokenSampleCollection::new(config.token_sample_max_capacity);
 
@@ -1055,6 +1069,7 @@ impl EcPeers {
             proof_system,
             token_samples,
             config,
+            rng,
             elections_started_total: 0,
             elections_completed_total: 0,
             elections_timeout_total: 0,
@@ -1370,7 +1385,7 @@ impl EcPeers {
         self.evict_excess_identified();
 
         // Phase 4: Evict excess TokenSamples (uniform random)
-        self.token_samples.evict_excess();
+        self.token_samples.evict_excess(&mut self.rng);
 
         // Phase 5: Prune Connected peers by distance (distance-based probability)
         self.prune_connected_by_distance(time);
@@ -1490,6 +1505,8 @@ mod tests {
 
     #[test]
     fn test_token_sample_collection_capacity() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut collection = TokenSampleCollection::new(5); // Small capacity
 
         // Fill to capacity
@@ -1503,13 +1520,15 @@ mod tests {
         assert_eq!(collection.samples.len(), 5);
 
         // Evict excess (should do nothing, not over capacity)
-        let evicted = collection.evict_excess();
+        let evicted = collection.evict_excess(&mut rng);
         assert_eq!(evicted, 0);
         assert_eq!(collection.samples.len(), 5);
     }
 
     #[test]
     fn test_token_sample_collection_pick_and_remove() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut collection = TokenSampleCollection::new(100);
 
         // Add tokens
@@ -1519,7 +1538,7 @@ mod tests {
         assert_eq!(collection.samples.len(), 10);
 
         // Pick and remove 3 tokens
-        let picked = collection.pick_and_remove(3);
+        let picked = collection.pick_and_remove(3, &mut rng);
         assert_eq!(picked.len(), 3);
         assert_eq!(collection.samples.len(), 7);
 
@@ -1529,13 +1548,15 @@ mod tests {
         }
 
         // Pick more than available
-        let picked_all = collection.pick_and_remove(100);
+        let picked_all = collection.pick_and_remove(100, &mut rng);
         assert_eq!(picked_all.len(), 7); // Only 7 remaining
         assert!(collection.samples.is_empty());
     }
 
     #[test]
     fn test_token_sample_collection_evict_excess() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut collection = TokenSampleCollection::new(5);
 
         // Add more than capacity (via direct manipulation for testing)
@@ -1545,12 +1566,12 @@ mod tests {
         assert_eq!(collection.samples.len(), 10);
 
         // Evict excess
-        let evicted = collection.evict_excess();
+        let evicted = collection.evict_excess(&mut rng);
         assert_eq!(evicted, 5); // 10 - 5 = 5 evicted
         assert_eq!(collection.samples.len(), 5); // Now at capacity
 
         // Evict again (should do nothing)
-        let evicted_again = collection.evict_excess();
+        let evicted_again = collection.evict_excess(&mut rng);
         assert_eq!(evicted_again, 0);
         assert_eq!(collection.samples.len(), 5);
     }
