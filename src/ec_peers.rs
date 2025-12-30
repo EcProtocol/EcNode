@@ -1195,6 +1195,16 @@ impl EcPeers {
         self.peers.get(peer_id).and_then(|peer| peer.commit_chain_head)
     }
 
+    /// Check if a peer is in Connected or Pending state
+    ///
+    /// Returns true if the peer exists and is either Connected or Pending.
+    /// Used by commit chain to filter peers worth tracking.
+    pub fn is_peer_connected_or_pending(&self, peer_id: &PeerId) -> bool {
+        self.peers.get(peer_id)
+            .map(|peer| peer.state.is_connected() || peer.state.is_pending())
+            .unwrap_or(false)
+    }
+
     /// Update the commit chain head for a peer
     ///
     /// Called when we receive an Answer message with head_of_chain field.

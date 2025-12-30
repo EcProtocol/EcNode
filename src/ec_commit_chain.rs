@@ -45,6 +45,67 @@ impl Default for CommitChainConfig {
 
 use std::collections::{HashMap, HashSet};
 
+// ============================================================================
+// Actions / Intents
+// ============================================================================
+
+/// Actions that commit chain requests the node layer to perform
+///
+/// Similar to PeerAction, these represent message intents that will be
+/// converted to MessageEnvelope by the node layer (ec_node.rs).
+#[derive(Debug, Clone)]
+pub enum CommitChainAction {
+    /// Request a regular transaction block from a peer
+    QueryBlock {
+        receiver: PeerId,
+        block_id: BlockId,
+        ticket: MessageTicket,
+    },
+
+    /// Request a commit block from a peer
+    QueryCommitBlock {
+        receiver: PeerId,
+        block_id: CommitBlockId,
+        ticket: MessageTicket,
+    },
+}
+
+impl CommitChainAction {
+    /// Convert CommitChainAction to MessageEnvelope
+    ///
+    /// # Arguments
+    /// * `sender` - The peer ID of this node
+    /// * `time` - Current time for the message
+    ///
+    /// # Returns
+    /// A complete MessageEnvelope ready to send
+    pub fn into_envelope(self, sender: PeerId, time: EcTime) -> MessageEnvelope {
+        match self {
+            CommitChainAction::QueryBlock { receiver, block_id, ticket } => MessageEnvelope {
+                sender,
+                receiver,
+                ticket,
+                time,
+                message: Message::QueryBlock {
+                    block_id,
+                    target: sender, // We're the target for the response
+                    ticket,
+                },
+            },
+            CommitChainAction::QueryCommitBlock { receiver, block_id, ticket } => MessageEnvelope {
+                sender,
+                receiver,
+                ticket,
+                time,
+                message: Message::QueryCommitBlock {
+                    block_id,
+                    ticket,
+                },
+            },
+        }
+    }
+}
+
 /// Shadow token mapping - temporarily holds token state changes
 /// before committing to our backend. Allows us to wait for consensus
 /// across multiple peer chains and detect conflicts.
@@ -110,10 +171,26 @@ impl PeerChainLog {
     fn try_add_block(&mut self, block: CommitBlock) -> bool {
         let chain_tip = self.get_chain_tip();
 
+        // First block logic: accept Genesis OR old timestamp
+        if chain_tip.is_none() {
+            if block.previous == GENESIS_BLOCK_ID {
+                self.blocks.push(block.clone());
+                self.last_known_head = block.id;
+                return true;
+            } else if block.time < self.sync_from_time {
+                // Historical bootstrap - accept as first block
+                self.blocks.push(block.clone());
+                self.last_known_head = block.id;
+                return true;
+            }
+            // Else fall through to store as orphan
+        }
+
         // Check if this block connects to our current tip
-        if chain_tip == Some(block.previous) || (chain_tip.is_none() && block.previous == GENESIS_BLOCK_ID) {
+        if chain_tip == Some(block.previous) {
             // Block connects! Add it to the chain
             self.blocks.push(block.clone());
+            self.last_known_head = block.id;
 
             // Check if any orphaned blocks can now connect
             let mut connected_something = true;
@@ -123,7 +200,8 @@ impl PeerChainLog {
 
                 // Look for an orphan that points to current tip
                 if let Some(orphan) = self.orphaned_blocks.remove(&current_tip) {
-                    self.blocks.push(orphan);
+                    self.blocks.push(orphan.clone());
+                    self.last_known_head = orphan.id;
                     connected_something = true;
                 }
             }
@@ -331,13 +409,22 @@ impl EcCommitChain {
 
     /// Add or update a token mapping in the shadow
     ///
-    /// Creates a new shadow mapping if it doesn't exist, or updates it if this
-    /// is a sequential update (newer block). The shadow can track multiple sequential
-    /// updates (A -> B -> C), but we only keep the latest. Confirmation count is
-    /// used as confidence measure for commit decisions.
+    /// Creates a new shadow mapping if it doesn't exist, or updates based on parent-relationship
+    /// logic. Extensions are determined by whether the new block's parent matches the current
+    /// shadow block, not by time alone. Confirmation count is used as confidence measure for
+    /// commit decisions.
     ///
-    /// Conflict resolution: If we have competing BlockIds at the same time, we pick
-    /// the highest lexical BlockId (our consensus rule).
+    /// If db_state is provided and there's no shadow, validates the mapping against the database
+    /// state before creating a new shadow.
+    ///
+    /// Parent-relationship logic:
+    /// - If parent == shadow.block: Extension (B2 extends B1), replace shadow
+    /// - If parent == shadow.parent && block != shadow.block: Conflict, pick max(block, shadow.block)
+    /// - If block == shadow.block: Same block, increment confirmation count
+    /// - If block_time < shadow.time: Older mapping, ignore (potential fraud)
+    /// - Otherwise: Doesn't connect, ignore
+    ///
+    /// Returns true if the mapping was added/updated, false if it was rejected.
     fn add_to_shadow(
         &mut self,
         token: TokenId,
@@ -346,45 +433,96 @@ impl EcCommitChain {
         block_time: EcTime,
         current_time: EcTime,
         _confirmed_by_block: BlockId,
-    ) {
-        self.shadow_token_mappings
-            .entry(token)
-            .and_modify(|shadow| {
-                // Shadow exists - check if this is a sequential update, confirmation, or conflict
-                if block_time > shadow.time {
-                    // This is a newer sequential update (e.g., A->B->C)
-                    // Update to the latest mapping and reset first_seen and count
+        db_state: Option<(BlockId, EcTime)>,
+    ) -> bool {
+        // Check if shadow exists
+        if let Some(shadow) = self.shadow_token_mappings.get_mut(&token) {
+            // Shadow exists - check parent-relationship to determine how to handle this update
+            if parent == shadow.block {
+                // EXTENSION: This block extends the current shadow (A -> B)
+                // Replace shadow with this newer mapping
+                shadow.block = block;
+                shadow.parent = parent;
+                shadow.time = block_time;
+                shadow.first_seen = current_time;
+                shadow.confirmation_count = 1;
+                true
+            } else if parent == shadow.parent && block != shadow.block {
+                // CONFLICT: Both blocks extend the same parent but are different
+                // Pick the higher lexical BlockId (our consensus rule)
+                if block > shadow.block {
                     shadow.block = block;
                     shadow.parent = parent;
                     shadow.time = block_time;
-                    shadow.first_seen = current_time; // Reset age for new update
-                    shadow.confirmation_count = 1; // Reset count for new mapping
-                } else if block_time == shadow.time {
-                    if block == shadow.block {
-                        // Same mapping - increment confirmation count
-                        shadow.confirmation_count += 1;
-                    } else if block > shadow.block {
-                        // CONFLICT: Different block at same time - pick highest lexical BlockId
-                        shadow.block = block;
-                        shadow.parent = parent;
-                        // Keep same time and first_seen, reset count
-                        shadow.confirmation_count = 1;
-                    }
-                    // If block < shadow.block, ignore it (we already have higher BlockId)
+                    shadow.first_seen = current_time;
+                    shadow.confirmation_count = 1;
+                    true
+                } else {
+                    // Keep current shadow
+                    false
                 }
-                // If block_time < shadow.time, ignore it (we're already ahead)
-            })
-            .or_insert_with(|| {
-                // Create new shadow mapping
-                ShadowTokenMapping {
-                    token,
-                    block,
-                    parent,
-                    time: block_time,
-                    first_seen: current_time,
-                    confirmation_count: 1,
+            } else if block == shadow.block {
+                // CONFIRMATION: Same block seen again
+                shadow.confirmation_count += 1;
+                true
+            } else if block_time < shadow.time {
+                // OLDER: This mapping is older than what we have
+                // Could be potential fraud or late arrival, ignore it
+                // TODO: Consider fraud detection/logging
+                false
+            } else {
+                // DISCONNECTED: This block doesn't connect to our shadow
+                // Ignore it - it's not part of this token's history chain
+                false
+            }
+        } else {
+            // No shadow - validate against db_state if provided
+            if let Some((db_block, db_time)) = db_state {
+                // We have database state - validate chain extension
+                if block_time > db_time && parent == db_block {
+                    // Valid extension of database state
+                    self.shadow_token_mappings.insert(token, ShadowTokenMapping {
+                        token,
+                        block,
+                        parent,
+                        time: block_time,
+                        first_seen: current_time,
+                        confirmation_count: 1,
+                    });
+                    true
+                } else if block_time == db_time && block == db_block {
+                    // Confirmation of database state
+                    self.shadow_token_mappings.insert(token, ShadowTokenMapping {
+                        token,
+                        block,
+                        parent,
+                        time: block_time,
+                        first_seen: current_time,
+                        confirmation_count: 1,
+                    });
+                    true
+                } else {
+                    // Invalid - doesn't extend database state correctly
+                    false
                 }
-            });
+            } else {
+                // No database state - must be new token with genesis parent
+                if parent == GENESIS_BLOCK_ID {
+                    self.shadow_token_mappings.insert(token, ShadowTokenMapping {
+                        token,
+                        block,
+                        parent,
+                        time: block_time,
+                        first_seen: current_time,
+                        confirmation_count: 1,
+                    });
+                    true
+                } else {
+                    // Invalid - new token must have genesis parent
+                    false
+                }
+            }
+        }
     }
 
     /// Get the current head of our commit chain
@@ -413,10 +551,8 @@ impl EcCommitChain {
                 let mut found_pending = false;
 
                 for block_id in &commit_block.committed_blocks {
-                    if block_backend.lookup(block_id).is_some() {
-                        // Already committed - good
-                        continue;
-                    } else if self.validated_blocks.contains(block_id) {
+                    // Check validated_blocks first (small HashSet, fast)
+                    if self.validated_blocks.contains(block_id) {
                         // Already validated - good
                         continue;
                     } else if self.pending_blocks.contains_key(block_id) {
@@ -425,6 +561,9 @@ impl EcCommitChain {
                         blocks_to_validate.push(*block_id);
                         all_blocks_ready = false;
                         break;
+                    } else if block_backend.lookup(block_id).is_some() {
+                        // Already committed - good
+                        continue;
                     } else {
                         // Missing - need to request
                         blocks_to_request.push((*peer_id, *block_id));
@@ -453,7 +592,7 @@ impl EcCommitChain {
     /// Validate a single block's token mappings against our token store
     ///
     /// Returns true if all token mappings are valid, false otherwise.
-    /// Adds valid mappings to shadow_token_mappings.
+    /// Adds valid mappings to shadow_token_mappings via add_to_shadow.
     fn validate_block_token_mappings(
         &mut self,
         block: &crate::ec_interface::Block,
@@ -465,37 +604,22 @@ impl EcCommitChain {
             let token_block = &block.parts[i];
             let token_id = token_block.token;
 
-            // Look up current state: shadow FIRST (most current), then backend
-            let current_state = self.shadow_token_mappings.get(&token_id)
-                .map(|shadow| (shadow.block, shadow.time))
-                .or_else(|| {
-                    token_backend.lookup(&token_id)
-                        .map(|bt| (bt.block, bt.time))
-                });
+            // Look up database state (not shadow - add_to_shadow will check shadow first)
+            let db_state = token_backend.lookup(&token_id)
+                .map(|bt| (bt.block, bt.time));
 
-            if let Some((current_block, current_time)) = current_state {
-                // We have this token (either committed or in shadow)
-                if block.time > current_time {
-                    // Newer block - validate chain extension
-                    if token_block.last == current_block {
-                        self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
-                    } else {
-                        // Invalid chain
-                        return false;
-                    }
-                } else if block.time == current_time {
-                    // Duplicate - add confirmation
-                    self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
-                }
-                // else: we're ahead - ignore this token mapping
-            } else {
-                // First time seeing this token
-                if token_block.last == GENESIS_BLOCK_ID {
-                    self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
-                } else {
-                    // Invalid - new token must have genesis parent
-                    return false;
-                }
+            // Delegate validation and shadow update to add_to_shadow
+            if !self.add_to_shadow(
+                token_id,
+                block.id,
+                token_block.last,
+                block.time,
+                time,
+                block_id,
+                db_state,
+            ) {
+                // Invalid mapping - block fails validation
+                return false;
             }
         }
 
@@ -522,25 +646,18 @@ impl EcCommitChain {
         }
     }
 
-    /// Generate QueryBlock messages for missing blocks
+    /// Generate QueryBlock actions for missing blocks
     fn request_missing_blocks(
         &self,
         blocks_to_request: Vec<(PeerId, BlockId)>,
-        time: EcTime,
-    ) -> Vec<MessageEnvelope> {
+    ) -> Vec<CommitChainAction> {
         blocks_to_request.into_iter()
             .map(|(peer_id, block_id)| {
                 let ticket = self.generate_ticket(block_id);
-                MessageEnvelope {
-                    sender: self.peer_id,
+                CommitChainAction::QueryBlock {
                     receiver: peer_id,
+                    block_id,
                     ticket,
-                    time,
-                    message: Message::QueryBlock {
-                        block_id,
-                        target: self.peer_id,
-                        ticket,
-                    },
                 }
             })
             .collect()
@@ -563,6 +680,11 @@ impl EcCommitChain {
                 continue; // Already tracking
             }
 
+            // Only track Connected or Pending peers
+            if !peers.is_peer_connected_or_pending(&candidate_peer) {
+                continue;
+            }
+
             if let Some(head) = peers.get_peer_commit_chain_head(&candidate_peer) {
                 let sync_from_time = time.saturating_sub(self.config.max_sync_age);
                 self.tracked_peers.insert(candidate_peer, PeerChainLog::new(head, sync_from_time));
@@ -574,8 +696,8 @@ impl EcCommitChain {
         }
     }
 
-    /// Check for peer head changes and generate QueryCommitBlock messages
-    fn request_peer_head_updates(&mut self, peers: &EcPeers, time: EcTime) -> Vec<MessageEnvelope> {
+    /// Check for peer head changes and generate QueryCommitBlock actions
+    fn request_peer_head_updates(&mut self, peers: &EcPeers) -> Vec<CommitChainAction> {
         // Collect peer head changes
         let peer_head_changes: Vec<(PeerId, CommitBlockId)> = self.tracked_peers.iter()
             .filter_map(|(peer_id, log)| {
@@ -585,7 +707,7 @@ impl EcCommitChain {
             })
             .collect();
 
-        // Update logs and generate messages
+        // Update logs and generate actions
         peer_head_changes.into_iter()
             .filter_map(|(peer_id, current_head)| {
                 if let Some(log) = self.tracked_peers.get_mut(&peer_id) {
@@ -593,15 +715,10 @@ impl EcCommitChain {
                 }
 
                 let ticket = self.generate_ticket(current_head);
-                Some(MessageEnvelope {
-                    sender: self.peer_id,
+                Some(CommitChainAction::QueryCommitBlock {
                     receiver: peer_id,
+                    block_id: current_head,
                     ticket,
-                    time,
-                    message: Message::QueryCommitBlock {
-                        block_id: current_head,
-                        ticket,
-                    },
                 })
             })
             .collect()
@@ -615,13 +732,44 @@ impl EcCommitChain {
         self.shadow_token_mappings.iter()
             .filter_map(|(token_id, shadow)| {
                 let age = time.saturating_sub(shadow.first_seen);
-                if age >= self.config.shadow_commit_age {
+                // Shadow must be both old enough AND have sufficient confirmations
+                if age >= self.config.shadow_commit_age
+                    && shadow.confirmation_count >= self.config.confirmation_threshold {
                     Some(*token_id)
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    /// Batch commit mature shadow mappings and clean up validated_blocks
+    ///
+    /// Removes committed shadows from shadow_token_mappings and removes their
+    /// associated BlockIds from validated_blocks to prevent unbounded growth.
+    ///
+    /// # Arguments
+    /// * `tokens_to_commit` - List of TokenIds that have mature shadow mappings
+    ///
+    /// TODO: Implement actual commit logic to persist to backend
+    fn batch_commit_shadows(&mut self, tokens_to_commit: Vec<TokenId>) {
+        // Collect BlockIds to remove from validated_blocks
+        let mut blocks_to_cleanup: HashSet<BlockId> = HashSet::new();
+
+        for token_id in &tokens_to_commit {
+            if let Some(shadow) = self.shadow_token_mappings.remove(token_id) {
+                // TODO: Actually commit this shadow to backend
+                // commit_chain_backend.commit_token_mapping(token_id, shadow.block, shadow.time);
+
+                // Track the block for cleanup
+                blocks_to_cleanup.insert(shadow.block);
+            }
+        }
+
+        // Clean up validated_blocks - remove BlockIds that were committed
+        for block_id in blocks_to_cleanup {
+            self.validated_blocks.remove(&block_id);
+        }
     }
 
     // ============================================================================
@@ -650,7 +798,7 @@ impl EcCommitChain {
             return Vec::new();
         }
 
-        let mut messages = Vec::new();
+        let mut actions = Vec::new();
 
         // Step 1: Consume peer logs and collect missing/pending blocks
         let (blocks_to_request, blocks_to_validate) = self.consume_peer_logs(block_backend);
@@ -659,22 +807,24 @@ impl EcCommitChain {
         self.validate_pending_blocks(blocks_to_validate, token_backend, time);
 
         // Step 3: Request missing blocks
-        messages.extend(self.request_missing_blocks(blocks_to_request, time));
+        actions.extend(self.request_missing_blocks(blocks_to_request));
 
         // Step 4: Fill tracking slots with new peers
         self.fill_tracking_slots(peers, time);
 
         // Step 5: Request peer head updates
-        messages.extend(self.request_peer_head_updates(peers, time));
+        actions.extend(self.request_peer_head_updates(peers));
 
         // Step 6: Collect mature shadows for batch commit
-        // TODO: Implement actual commit logic
-        let _shadows_to_commit = self.collect_mature_shadows(time);
-        // if !shadows_to_commit.is_empty() {
-        //     self.batch_commit_shadows(shadows_to_commit, block_backend, token_backend);
-        // }
+        let shadows_to_commit = self.collect_mature_shadows(time);
+        if !shadows_to_commit.is_empty() {
+            self.batch_commit_shadows(shadows_to_commit);
+        }
 
-        messages
+        // Convert actions to message envelopes
+        actions.into_iter()
+            .map(|action| action.into_envelope(self.peer_id, time))
+            .collect()
     }
 }
 
