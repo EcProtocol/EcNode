@@ -305,6 +305,15 @@ pub struct MessageEnvelope {
     pub message: Message,
 }
 
+/// Request for a parent commit block
+/// Returned by backend when a commit block can't be connected to the chain
+#[derive(Debug, Clone)]
+pub struct ParentBlockRequest {
+    pub receiver: PeerId,
+    pub block_id: BlockId,
+    pub ticket: MessageTicket,
+}
+
 ///
 /// Database type
 ///
@@ -410,8 +419,8 @@ pub trait EcCommitChainAccess {
     /// Handle an incoming commit block from a peer
     ///
     /// Verifies ticket and stores block in peer log if from tracked peer.
-    /// Returns optional message to request parent block if needed (respecting max_sync_age).
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: MessageTicket, current_time: EcTime) -> Option<MessageEnvelope>;
+    /// Returns optional request data for parent block if needed (respecting max_sync_age).
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: MessageTicket, current_time: EcTime) -> Option<ParentBlockRequest>;
 
     /// Handle an incoming transaction block from a peer
     ///

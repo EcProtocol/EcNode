@@ -862,7 +862,7 @@ impl PeerElection {
         ticket: MessageTicket,
         token_challenge: TokenId,
         suggested_peers: [PeerId; 2],
-        responder_peer: PeerId,
+        _responder_peer: PeerId,
     ) -> Result<PeerId, ElectionError> {
         // Verify correct token for this election
         if token_challenge != self.challenge_token {
@@ -1085,12 +1085,14 @@ impl ProofOfStorage {
     ///
     /// Works for both u64 (current testing) and future 256-bit types (production).
     #[inline]
+    #[allow(dead_code)] // Utility function for future use
     fn token_last_bits(token: &TokenId, bits: usize) -> u64 {
         (token & ((1u64 << bits) - 1)) as u64
     }
 
     /// Check if a token's last 10 bits match a signature chunk
     #[inline]
+    #[allow(dead_code)] // Utility function for future use
     fn matches_signature_chunk(token: &TokenId, chunk_value: u16) -> bool {
         Self::token_last_bits(token, CHUNK_BITS) == chunk_value as u64
     }

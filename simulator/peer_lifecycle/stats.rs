@@ -286,9 +286,6 @@ pub struct ConvergenceAnalysis {
     /// Recovery times after churn events (round → recovery_time)
     pub post_churn_recovery_times: Vec<(usize, usize)>,
 
-    /// Target peer count per node
-    pub target_peer_count: usize,
-
     /// Achieved peer count (average across nodes)
     pub achieved_peer_count: usize,
 
@@ -434,7 +431,6 @@ impl SimulationResult {
             if let Some(bootstrap_time) = self.convergence.bootstrap_convergence_time {
                 println!("  Bootstrap Time: {} rounds", bootstrap_time);
             }
-            println!("  Target Peers: {}", self.convergence.target_peer_count);
             println!("  Achieved Peers: {}", self.convergence.achieved_peer_count);
             println!();
         }

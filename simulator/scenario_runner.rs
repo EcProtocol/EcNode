@@ -15,10 +15,8 @@ use peer_lifecycle::{
     EventSchedule,
 };
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::env;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
 
 /// Simplified scenario file format
 #[derive(Debug, serde::Deserialize)]

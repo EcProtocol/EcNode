@@ -23,14 +23,18 @@
 //! use ec_rust::{EcNode, ec_memory_backend::MemoryBackend};
 //! use std::rc::Rc;
 //! use std::cell::RefCell;
+//! use rand::{SeedableRng, rngs::StdRng};
 //!
 //! // Create storage backend
 //! let backend = Rc::new(RefCell::new(MemoryBackend::new()));
 //! let token_storage = MemoryBackend::new();
 //!
+//! // Create RNG for the node (use a seed for deterministic behavior in tests)
+//! let rng = StdRng::from_seed([0u8; 32]);
+//!
 //! // Create a consensus node
 //! let peer_id = 12345u64;
-//! let mut node = EcNode::new(backend, peer_id, 0, token_storage);
+//! let mut node = EcNode::new(backend, peer_id, 0, token_storage, rng);
 //!
 //! // In your network event loop:
 //! // - Call node.tick(&mut outgoing_messages) periodically
@@ -43,6 +47,9 @@
 //! For testing the consensus protocol without a real network, see the separate
 //! `simulator` crate in `src/simulator/`. It provides a configurable simulation
 //! framework for protocol validation and performance analysis.
+
+// Silence warning for rocksdb-backend feature not yet configured in Cargo.toml
+#![allow(unexpected_cfgs)]
 
 // Core consensus modules
 pub mod ec_interface;

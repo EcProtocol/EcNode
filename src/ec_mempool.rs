@@ -1,8 +1,4 @@
 // track the state of transactions
-
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use hashbrown::HashMap;
 
 use crate::ec_interface::{
@@ -322,7 +318,7 @@ impl EcMemPool {
 
                 // TODO same token only once
 
-                // TODO verify that block-id is the SHA of block content (INCL (?) /not(?) signatures)
+                // TODO verify that block-id is the SHA of block content INCL signatures)
 
                 (true, 0, 0)
             })

@@ -261,7 +261,7 @@ impl<'a> TokenStorageBackend for MemTokensRef<'a> {
 // ============================================================================
 
 impl EcTokens for MemTokens {
-    fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
+    fn lookup(&self, _token: &TokenId) -> Option<&BlockTime> {
         // EcTokens trait expects a reference, but Vec storage makes this awkward
         // We'd need to return a reference to a temporary - instead panic
         // This method should not be used with sorted Vec backend
@@ -391,6 +391,7 @@ pub struct MemoryBackend {
     blocks: MemBlocks,
     commit_chain: EcCommitChain,
     commit_chain_backend: MemCommitChain,
+    #[allow(dead_code)] // Stored for potential future use
     peer_id: PeerId,
 }
 
@@ -576,7 +577,7 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
             .handle_query_commit_block(&self.commit_chain_backend, block_id)
     }
 
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket, current_time: EcTime) -> Option<crate::ec_interface::MessageEnvelope> {
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket, current_time: EcTime) -> Option<crate::ec_interface::ParentBlockRequest> {
         self.commit_chain
             .handle_commit_block(block, sender, ticket, current_time)
     }

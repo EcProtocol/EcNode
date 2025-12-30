@@ -24,14 +24,15 @@ pub struct EcNode<
     block_req_ticket: MessageTicket,
     parent_block_req_ticket: MessageTicket,
     event_sink: Box<dyn EventSink>,
+    rng: rand::rngs::StdRng,
 }
 
 impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T: TokenStorageBackend>
     EcNode<B, T>
 {
     /// Create a new node with default NoOpSink (zero overhead)
-    pub fn new(backend: Rc<RefCell<B>>, id: PeerId, time: EcTime, token_storage: T) -> Self {
-        Self::new_with_sink(backend, id, time, token_storage, Box::new(NoOpSink))
+    pub fn new(backend: Rc<RefCell<B>>, id: PeerId, time: EcTime, token_storage: T, rng: rand::rngs::StdRng) -> Self {
+        Self::new_with_sink(backend, id, time, token_storage, Box::new(NoOpSink), rng)
     }
 
     /// Create a new node with a custom event sink for debugging/analysis
@@ -41,6 +42,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
         time: EcTime,
         token_storage: T,
         event_sink: Box<dyn EventSink>,
+        rng: rand::rngs::StdRng,
     ) -> Self {
         Self {
             mem_pool: EcMemPool::new(),
@@ -52,6 +54,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             block_req_ticket: 2, // TODO shuffle
             parent_block_req_ticket: 3,
             event_sink,
+            rng,
         }
     }
 
@@ -295,45 +298,40 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     // this node has this block
                     responses.push(me)
                 } else if let None = self.peers.trusted_peer(&msg.sender) {
-                    // this is not a trusted peer
-                    let peers = self.peers.peers_for(block_id, self.time);
+                    // this is not a trusted peer - send Referral
+                    responses.push(self.send_referral(msg.sender, *block_id, *ticket));
+                } else {
+                    // trusted peer - forward with 2/3 probability, otherwise send Referral
+                    use rand::Rng;
+                    if self.rng.gen_bool(2.0 / 3.0) {
+                        // Forward the query on-behalf-of the original requester
+                        let peer_id = self.peers.peer_for(block_id, self.time);
 
-                    responses.push(MessageEnvelope {
-                        sender: self.peer_id,
-                        receiver: msg.sender,
-                        ticket: *ticket,
-                        time: self.time,
-                        message: Message::Referral {
-                            token: *block_id,
-                            high: peers[1],
-                            low: peers[0],
-                        },
-                    });
-                } else if (block_id ^ self.time) & 0x3 == 0 {
-                    // forwarding for trusted peers
-                    let peer_id = self.peers.peer_for(block_id, self.time);
-
-                    responses.push(MessageEnvelope {
-                        sender: self.peer_id,
-                        receiver: peer_id,
-                        ticket: 0,
-                        time: self.time,
-                        message: Message::QueryBlock {
-                            block_id: *block_id,
-                            target: receiver,
+                        responses.push(MessageEnvelope {
+                            sender: self.peer_id,
+                            receiver: peer_id,
                             ticket: *ticket,
-                        },
-                    });
+                            time: self.time,
+                            message: Message::QueryBlock {
+                                block_id: *block_id,
+                                target: receiver,
+                                ticket: *ticket,
+                            },
+                        });
 
-                    self.event_sink.log(
-                        self.time,
-                        self.peer_id,
-                        Event::BlockNotFound {
-                            block_id: *block_id,
-                            peer: self.peer_id,
-                            from_peer: receiver,
-                        },
-                    );
+                        self.event_sink.log(
+                            self.time,
+                            self.peer_id,
+                            Event::BlockNotFound {
+                                block_id: *block_id,
+                                peer: self.peer_id,
+                                from_peer: receiver,
+                            },
+                        );
+                    } else {
+                        // Send Referral instead of forwarding
+                        responses.push(self.send_referral(msg.sender, *block_id, *ticket));
+                    }
                 }
             }
             Message::QueryToken {
@@ -350,62 +348,50 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                 {
                     // Convert PeerAction to MessageEnvelope
                     match action {
-                        PeerAction::SendAnswer {
-                            answer,
-                            signature,
-                            ticket,
-                        } => {
+                        PeerAction::SendAnswer { .. } => {
+                            // Simple case: use helper to convert action to envelope
                             let head_of_chain = self.backend.borrow().get_commit_chain_head().unwrap_or(0);
-                            responses.push(MessageEnvelope {
-                                sender: self.peer_id,
+                            responses.push(action.into_envelope(
+                                self.peer_id,
                                 receiver,
-                                ticket,
-                                time: self.time,
-                                message: Message::Answer {
-                                    answer,
-                                    signature,
-                                    head_of_chain,
-                                },
-                            });
+                                self.time,
+                                head_of_chain,
+                            ));
                         }
                         PeerAction::SendReferral {
                             token,
                             ticket,
-                            suggested_peers,
+                            suggested_peers: _,
                         } => {
-                            responses.push(MessageEnvelope {
-                                sender: self.peer_id,
-                                receiver,
-                                ticket,
-                                time: self.time,
-                                message: Message::Referral {
-                                    token,
-                                    high: suggested_peers[1],
-                                    low: suggested_peers[0],
-                                },
-                            });
-                        }
-                        PeerAction::SendQuery {
-                            receiver,
-                            token,
-                            ticket,
-                        } => {
-                            // Forward
-                            responses.push(MessageEnvelope {
-                                sender: self.peer_id,
-                                receiver,
-                                ticket,
-                                time: self.time,
-                                message: Message::QueryToken {
-                                    token_id: token,
-                                    target: 0,
+                            // Check if requesting peer is Connected and forward with 2/3 probability
+                            let should_forward = if self.peers.trusted_peer(&msg.sender).is_some() {
+                                use rand::Rng;
+                                self.rng.gen_bool(2.0 / 3.0)
+                            } else {
+                                false
+                            };
+
+                            if should_forward {
+                                // Forward the query on-behalf-of the original requester
+                                let forward_to = self.peers.peer_for(&token, self.time);
+                                responses.push(MessageEnvelope {
+                                    sender: self.peer_id,
+                                    receiver: forward_to,
                                     ticket,
-                                },
-                            });
+                                    time: self.time,
+                                    message: Message::QueryToken {
+                                        token_id: token,
+                                        target: receiver,
+                                        ticket,
+                                    },
+                                });
+                            } else {
+                                // Send Referral (for non-connected peers or 1/3 probability)
+                                responses.push(self.send_referral(receiver, token, ticket));
+                            }
                         }
-                        PeerAction::SendInvitation { .. } => {
-                            // Ignore SendInvitation (not relevant here)
-                        }
+                        // handle_query only returns SendAnswer or SendReferral
+                        _ => unreachable!("handle_query only returns SendAnswer or SendReferral"),
                     }
                 }
             }
@@ -424,54 +410,37 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     *head_of_chain,
                 );
 
-                // Process returned actions (e.g., Invitations)
+                // Process returned actions (e.g., Invitations, Queries)
+                // Use helper to convert each action to envelope
+                let head_of_chain = self.backend.borrow().get_commit_chain_head().unwrap_or(0);
                 for action in actions {
                     match action {
-                        PeerAction::SendInvitation {
-                            receiver,
-                            answer,
-                            signature,
-                        } => {
-                            let head_of_chain = self.backend.borrow().get_commit_chain_head().unwrap_or(0);
-                            responses.push(MessageEnvelope {
+                        PeerAction::SendInvitation { receiver, .. }
+                        | PeerAction::SendQuery { receiver, .. } => {
+                            responses.push(action.into_envelope(
+                                self.peer_id,
                                 receiver,
-                                sender: self.peer_id,
-                                ticket: 0, // Invitation uses ticket=0
-                                time: self.time,
-                                message: Message::Answer {
-                                    answer,
-                                    signature,
-                                    head_of_chain,
-                                },
-                            });
-                        }
-                        PeerAction::SendQuery { receiver, token, ticket } => {
-                            responses.push(MessageEnvelope {
-                                receiver,
-                                sender: self.peer_id,
-                                ticket,
-                                time: self.time,
-                                message: Message::QueryToken {
-                                    token_id: token,
-                                    target: 0,
-                                    ticket,
-                                },
-                            });
+                                self.time,
+                                head_of_chain,
+                            ));
                         }
                         _ => {
-                            // Ignore other action types
+                            // Ignore other action types (shouldn't happen from handle_answer)
                         }
                     }
                 }
             }
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
+                let mut block_was_useful = false;
+
                 if msg.ticket == self.block_req_ticket ^ block.id
                     || msg.ticket == self.parent_block_req_ticket ^ block.id
                 {
                     // Block request from mempool
                     if self.mem_pool.block(block, self.time) {
                         // TODO DOS-protection: Balance creations of entries from peers/clients
+                        block_was_useful = true;
 
                         self.event_sink.log(
                             self.time,
@@ -488,11 +457,18 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     let mut backend = self.backend.borrow_mut();
                     if backend.handle_block(block.clone(), msg.ticket) {
                         // Block was accepted by commit chain - ticket was valid
+                        block_was_useful = true;
                     } else {
                         // Not a commit chain block - try validate_with for other requests
                         drop(backend); // Release borrow before calling mempool
                         self.mem_pool.validate_with(block, &msg.ticket)
                     }
+                }
+
+                // If the peer provided us with a useful block, add them as Identified
+                // This helps with peer discovery - any peer that can help us is worth knowing
+                if block_was_useful {
+                    self.peers.add_identified_peer(msg.sender, self.time);
                 }
             }
             Message::Referral { token, high, low } => {
@@ -514,9 +490,9 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                             ticket: msg.ticket,
                         },
                     });
-                } else if let Some(peer_action) = self.peers
+                } else if let Some(_peer_action) = self.peers
                             .handle_referral(msg.ticket, *token, [*high, *low], msg.sender, self.time) {
-
+                    // Referral handled by peer manager
                 }
             }
             Message::QueryCommitBlock { block_id, ticket } => {
@@ -534,15 +510,23 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                         },
                     });
                 }
-                // If we don't have it, ignore the query (could forward in the future)
+                // If we don't have it, ignore the query
             }
             Message::CommitBlock { block } => {
                 // Handle incoming commit block from peer
                 let mut backend = self.backend.borrow_mut();
-                if let Some(mut parent_request) = backend.handle_commit_block(block.clone(), msg.sender, msg.ticket, self.time) {
+                if let Some(request) = backend.handle_commit_block(block.clone(), msg.sender, msg.ticket, self.time) {
                     // Block didn't connect - need to request parent
-                    parent_request.time = self.time;
-                    responses.push(parent_request);
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: request.receiver,
+                        ticket: request.ticket,
+                        time: self.time,
+                        message: Message::QueryCommitBlock {
+                            block_id: request.block_id,
+                            ticket: request.ticket,
+                        },
+                    });
                 }
             }
         }
@@ -577,6 +561,26 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                 block_id: *block,
                 target: 0,
                 ticket: ticket ^ block, // TODO calc ticket with SHA
+            },
+        }
+    }
+
+    fn send_referral(
+        &self,
+        receiver: PeerId,
+        token: u64,
+        ticket: MessageTicket,
+    ) -> MessageEnvelope {
+        let peers = self.peers.peers_for(&token, self.time);
+        MessageEnvelope {
+            sender: self.peer_id,
+            receiver,
+            ticket,
+            time: self.time,
+            message: Message::Referral {
+                token,
+                high: peers[1],
+                low: peers[0],
             },
         }
     }

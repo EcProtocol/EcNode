@@ -102,7 +102,14 @@ impl SimRunner {
                     Box::new(ConsoleEventSink::new(false))
                 };
 
-            let mut node = EcNode::new_with_sink(backend, *peer_id, 0, token_storage, event_sink);
+            // Create deterministic RNG for this node based on peer_id and seed
+            let mut node_seed = [0u8; 32];
+            // Use peer_id as part of the seed to ensure different nodes have different RNGs
+            node_seed[0..8].copy_from_slice(&peer_id.to_le_bytes());
+            node_seed[8..].copy_from_slice(&seed[8..]);
+            let node_rng = StdRng::from_seed(node_seed);
+
+            let mut node = EcNode::new_with_sink(backend, *peer_id, 0, token_storage, event_sink, node_rng);
 
             // Apply topology configuration
             Self::apply_topology(&mut node, peer_id, &peers, &config.topology, &mut rng);

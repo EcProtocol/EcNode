@@ -6,7 +6,7 @@
 
 use crate::ec_interface::{
     BlockId, CommitBlock, CommitBlockId, EcBlocks, EcCommitChainBackend, EcTime, EcTokens,
-    Message, MessageEnvelope, MessageTicket, PeerId, TokenId, GENESIS_BLOCK_ID,
+    Message, MessageEnvelope, MessageTicket, ParentBlockRequest, PeerId, TokenId, GENESIS_BLOCK_ID,
 };
 use crate::ec_peers::EcPeers;
 
@@ -45,7 +45,8 @@ use std::collections::{HashMap, HashSet};
 /// across multiple peer chains and detect conflicts.
 #[derive(Debug, Clone)]
 struct ShadowTokenMapping {
-    /// Token ID
+    /// Token ID (redundant with HashMap key but kept for debugging/clarity)
+    #[allow(dead_code)]
     token: TokenId,
     /// New block ID for this token
     block: BlockId,
@@ -257,7 +258,7 @@ impl EcCommitChain {
         sender: PeerId,
         ticket: MessageTicket,
         _current_time: EcTime,
-    ) -> Option<MessageEnvelope> {
+    ) -> Option<ParentBlockRequest> {
         // Verify ticket first - this proves the block is a response to our request
         if !self.verify_ticket(block.id, ticket) {
             // Invalid ticket - ignore this block (likely spam or attack)
@@ -284,16 +285,11 @@ impl EcCommitChain {
             // Generate ticket for parent request
             let parent_ticket = self.generate_ticket(block.previous);
 
-            // Request the parent block to try to connect it
-            Some(MessageEnvelope {
-                sender: self.peer_id,
+            // Return request data - caller will construct the MessageEnvelope
+            Some(ParentBlockRequest {
                 receiver: sender,
+                block_id: block.previous,
                 ticket: parent_ticket,
-                time: 0, // Will be filled by caller
-                message: Message::QueryCommitBlock {
-                    block_id: block.previous,
-                    ticket: parent_ticket,
-                },
             })
         }
     }

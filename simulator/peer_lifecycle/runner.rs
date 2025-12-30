@@ -259,9 +259,9 @@ impl PeerLifecycleRunner {
                     for (idx, &other_id) in known_peers.iter().enumerate() {
                         if idx < num_connected {
                             // Add as seed peer (will be promoted to Connected)
-                            peer.peer_manager.add_seed_peer(other_id, 0);
+                            peer.peer_manager.add_identified_peer(other_id, 0);
                         } else {
-                            // Add as Identified only
+                            // Add as Connected
                             peer.peer_manager.update_peer(&other_id, 0);
                         }
                     }
@@ -292,9 +292,9 @@ impl PeerLifecycleRunner {
                     for (idx, &other_id) in known_peers.iter().enumerate() {
                         if idx < num_connected {
                             // Add as seed peer (will be promoted to Connected)
-                            peer.peer_manager.add_seed_peer(other_id, 0);
+                            peer.peer_manager.add_identified_peer(other_id, 0);
                         } else {
-                            // Add as Identified only
+                            // Add as Connected
                             peer.peer_manager.update_peer(&other_id, 0);
                         }
                     }
@@ -311,11 +311,11 @@ impl PeerLifecycleRunner {
                         for offset in 1..=*neighbors {
                             // Forward neighbor
                             let forward_idx = (i + offset) % sorted_peers.len();
-                            peer.peer_manager.add_seed_peer(sorted_peers[forward_idx], 0);
+                            peer.peer_manager.add_identified_peer(sorted_peers[forward_idx], 0);
 
                             // Backward neighbor
                             let backward_idx = (i + sorted_peers.len() - offset) % sorted_peers.len();
-                            peer.peer_manager.add_seed_peer(sorted_peers[backward_idx], 0);
+                            peer.peer_manager.add_identified_peer(sorted_peers[backward_idx], 0);
                         }
                     }
                 }
@@ -341,7 +341,7 @@ impl PeerLifecycleRunner {
 
                     // Add selected peers as Identified (using add_seed_peer which adds to Identified)
                     for &other_id in &selected_peers {
-                        peer.peer_manager.add_seed_peer(other_id, 0);
+                        peer.peer_manager.add_identified_peer(other_id, 0);
                     }
                 }
             }
@@ -447,9 +447,9 @@ impl PeerLifecycleRunner {
                         current_time,
                     );
 
-                    // Process the returned actions (send new Query messages)
+                    // Process the returned action (send new Query message if needed)
                     let peer_id = envelope.to;
-                    for action in actions {
+                    if let Some(action) = actions {
                         match action {
                             PeerAction::SendQuery { receiver, token, ticket } => {
                                 self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
@@ -739,7 +739,7 @@ impl PeerLifecycleRunner {
             // Note: initial_knowledge is passed from the event but could also use a strategy
             for &known_peer_id in &initial_knowledge {
                 if known_peer_id != peer_id && self.peers.contains_key(&known_peer_id) {
-                    peer_manager.add_seed_peer(known_peer_id, self.current_round as EcTime);
+                    peer_manager.add_identified_peer(known_peer_id, self.current_round as EcTime);
                 }
             }
 
@@ -780,7 +780,7 @@ impl PeerLifecycleRunner {
 
     /// Report current statistics (for ReportStats event)
     fn report_current_stats(&mut self, label: Option<String>) {
-        use super::stats::{RoundMetrics, calculate_gradient_steepness, calculate_gradient_distribution, calculate_connected_peer_distribution};
+        use super::stats::{RoundMetrics, calculate_gradient_steepness, calculate_gradient_distribution};
         use std::collections::BTreeMap;
 
         let checkpoint_label = label.unwrap_or_else(|| format!("Round {}", self.current_round));
@@ -943,7 +943,6 @@ impl PeerLifecycleRunner {
             convergence: ConvergenceAnalysis {
                 bootstrap_convergence_time: None,
                 post_churn_recovery_times: Vec::new(),
-                target_peer_count: self.config.peer_config.total_budget,
                 achieved_peer_count: 0, // TODO: Calculate
                 converged: false,
             },

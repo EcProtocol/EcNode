@@ -6,7 +6,8 @@ pub mod token_allocation;
 pub mod runner;
 pub mod scenarios;
 
-// Re-export commonly used types
+// Re-export commonly used types for public API
+#[allow(unused_imports)] // Re-exports for external consumers
 pub use config::{
     PeerLifecycleConfig,
     InitialNetworkState,
@@ -19,6 +20,7 @@ pub use config::{
     BootstrapMethod,
 };
 
+#[allow(unused_imports)] // Re-exports for external consumers
 pub use stats::{
     SimulationResult,
     RoundMetrics,
@@ -26,6 +28,7 @@ pub use stats::{
     NetworkHealth,
 };
 
+#[allow(unused_imports)] // Re-exports for external consumers
 pub use token_allocation::GlobalTokenMapping;
 pub use runner::PeerLifecycleRunner;
 pub use scenarios::ScenarioBuilder;

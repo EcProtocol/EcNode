@@ -5,7 +5,6 @@
 use super::config::{
     EventSchedule, ScheduledEvent, NetworkEvent, PeerSelection, BootstrapMethod,
 };
-use ec_rust::ec_interface::PeerId;
 
 // ============================================================================
 // ScenarioBuilder

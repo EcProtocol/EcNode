@@ -1,5 +1,6 @@
 use crate::ec_interface::{
-    CommitBlockId, EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
+    CommitBlockId, EcTime, Message, MessageEnvelope, MessageTicket, PeerId, TokenId, TokenMapping,
+    TOKENS_SIGNATURE_SIZE,
 };
 use crate::ec_proof_of_storage::{ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend};
 use serde::{Serialize, Deserialize};
@@ -32,9 +33,6 @@ pub struct PeerManagerConfig {
     /// Maximum time to wait for election before timeout (in ticks, default: 30)
     pub election_timeout: u64,
 
-    /// TTL for election cache (in ticks, default: 300)
-    pub election_cache_ttl: u64,
-
     // ===== Timeout Parameters =====
     /// Timeout for Pending state before demoting to Identified (in ticks, default: 10)
     pub pending_timeout: u64,
@@ -44,10 +42,6 @@ pub struct PeerManagerConfig {
 
     /// Protection time for recently connected peers from pruning (in ticks, default: 600 = 10 min)
     pub prune_protection_time: u64,
-
-    // ===== Legacy (backward compatibility) =====
-    /// Total budget - kept for compatibility (maps to connected_max_capacity)
-    pub total_budget: usize,
 
     // ===== Election Configuration =====
     /// Configuration for PeerElection
@@ -66,15 +60,11 @@ impl Default for PeerManagerConfig {
             elections_per_tick: 3,
             min_collection_time: 10,
             election_timeout: 30,
-            election_cache_ttl: 300,
 
             // Timeout parameters
             pending_timeout: 10,
             connection_timeout: 300,
             prune_protection_time: 600,
-
-            // Legacy compatibility
-            total_budget: 200,  // Maps to connected_max_capacity
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -145,7 +135,6 @@ struct MemPeer {
 /// Actions that EcPeers requests EcNode to perform
 #[derive(Debug, Clone)]
 pub enum PeerAction {
-    // TDOO handle forward / on-behalf-of
     /// Send a Query message to a peer (for elections)
     SendQuery {
         receiver: PeerId,
@@ -173,6 +162,80 @@ pub enum PeerAction {
         answer: TokenMapping,
         signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
     },
+}
+
+impl PeerAction {
+    /// Convert PeerAction to MessageEnvelope
+    ///
+    /// This helper reduces boilerplate when translating peer manager actions
+    /// into network messages. The node layer provides the envelope context
+    /// (sender, time, commit chain head).
+    ///
+    /// # Arguments
+    /// * `sender` - The peer ID of this node (self.peer_id)
+    /// * `receiver` - The destination peer (from target field or original sender)
+    /// * `time` - Current time for the message
+    /// * `head_of_chain` - Current head of our commit chain
+    ///
+    /// # Returns
+    /// A complete MessageEnvelope ready to send
+    pub fn into_envelope(
+        self,
+        sender: PeerId,
+        receiver: PeerId,
+        time: EcTime,
+        head_of_chain: CommitBlockId,
+    ) -> MessageEnvelope {
+        match self {
+            PeerAction::SendQuery { receiver, token, ticket } => MessageEnvelope {
+                sender,
+                receiver,
+                ticket,
+                time,
+                message: Message::QueryToken {
+                    token_id: token,
+                    target: 0,
+                    ticket,
+                },
+            },
+
+            PeerAction::SendAnswer { answer, signature, ticket } => MessageEnvelope {
+                sender,
+                receiver,
+                ticket,
+                time,
+                message: Message::Answer {
+                    answer,
+                    signature,
+                    head_of_chain,
+                },
+            },
+
+            PeerAction::SendReferral { token, ticket, suggested_peers } => MessageEnvelope {
+                sender,
+                receiver,
+                ticket,
+                time,
+                message: Message::Referral {
+                    token,
+                    high: suggested_peers[1],
+                    low: suggested_peers[0],
+                },
+            },
+
+            PeerAction::SendInvitation { receiver, answer, signature } => MessageEnvelope {
+                sender,
+                receiver,
+                ticket: 0, // Invitations always use ticket=0
+                time,
+                message: Message::Answer {
+                    answer,
+                    signature,
+                    head_of_chain,
+                },
+            },
+        }
+    }
 }
 
 // ============================================================================
@@ -245,13 +308,6 @@ impl TokenSampleCollection {
         // Sample from signature tokens
         for sig_token in signature {
             self.add_token(sig_token.id);
-        }
-    }
-
-    /// Sample peer IDs from a Referral message
-    fn sample_from_referral(&mut self, suggested_peers: &[PeerId; 2]) {
-        for &peer_id in suggested_peers {
-            self.add_token(peer_id);
         }
     }
 
@@ -333,6 +389,7 @@ pub struct EcPeers {
     /// Random number generator (seeded for reproducibility)
     rng: rand::rngs::StdRng,
 
+    // TODO stats could be collected from Events
     // ===== Election Statistics =====
     /// Total elections started (lifetime counter)
     elections_started_total: usize,
@@ -379,8 +436,6 @@ impl EcPeers {
     /// Walks BTreeMap in both directions from target
     pub fn find_closest_peers(&self, target: TokenId, count: usize) -> Vec<PeerId> {
         let mut candidates = Vec::new();
-
-        // TODO just next/next_back into vec. No sort etc.
 
         // Walk forward from target (including target)
         let forward: Vec<_> = self.peers.range(target..)
@@ -450,6 +505,7 @@ impl EcPeers {
             self.update_peer_commit_chain_head(&peer_id, head_of_chain);
         }
 
+        // TODO move split to ec_node? Avoid return on handle_answer
         // handle Invitation (ticket == 0)
         if ticket == 0 {
             return self.handle_invitation(answer, signature, peer_id, time, token_storage);
@@ -463,6 +519,8 @@ impl EcPeers {
             match ongoing.election.handle_answer(ticket, answer, signature, peer_id, time) {
                 Ok(()) => {
                     // Answer successfully recorded
+                    self.update_keepalive(peer_id, time);
+
                     // Winner will be detected in process_elections()
                     // Sample tokens from Answer for future discovery
                     // Answer contains: 1 answer token + 10 signature tokens + sender peer ID
@@ -527,8 +585,8 @@ impl EcPeers {
                 return self.start_election_from_invite(answer, signature, sender_peer_id, time);
             }
 
-            // Declined - just add sender to Identified for future consideration
-            self.add_identified_peer(sender_peer_id, time);
+            // Declined. Peer must retry at a later time
+            // Lets NOT add it to Identified. This would allow user driven injection.
         }
         
         return Vec::new();
@@ -729,17 +787,11 @@ impl EcPeers {
 
     // ========================================================================
     // State Transitions
+    // TODO coming from fn's that have already looked up the peer - we could just do state trans on that (no re-lookup)
     // ========================================================================
 
-    /// Add newly discovered peer to Identified state (from Referral)
-    /// Add a seed peer for bootstrap (public API)
-    /// Adds the peer to the Identified state for initial discovery
-    pub fn add_seed_peer(&mut self, peer_id: PeerId, time: EcTime) -> bool {
-        self.add_identified_peer(peer_id, time)
-    }
-
     /// Add a peer to Identified state (internal)
-    fn add_identified_peer(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    pub fn add_identified_peer(&mut self, peer_id: PeerId, time: EcTime) -> bool {
         if peer_id == self.peer_id {
             return false; // Never add self
         }
@@ -861,22 +913,20 @@ impl EcPeers {
     }
 
     /// Update last_keepalive for Connected peer
-    fn update_keepalive(&mut self, peer_id: PeerId, time: EcTime) -> bool {
+    fn update_keepalive(&mut self, peer_id: PeerId, time: EcTime) {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
-            None => return false, // Peer not found
+            None => return, // Peer not found
         };
 
         if let PeerState::Connected { last_keepalive, .. } = &mut peer.state {
             *last_keepalive = time;
-            true
-        } else {
-            false
         }
     }
 
     // ========================================================================
     // Timeout Detection
+    // TODO looping over peers multiple time during tick - maybe combine 
     // ========================================================================
 
     /// Detect and handle Pending peer timeouts
@@ -1402,6 +1452,7 @@ impl EcPeers {
         let mut actions = Vec::new();
 
         // Phase 1: Timeout detection
+        // TODO before evicting Pending - maybe re-send invite 
         self.detect_pending_timeouts(time);
         self.detect_connection_timeouts(time);
 
@@ -1640,26 +1691,6 @@ mod tests {
         assert!(collection.samples.contains(&2));
         assert!(collection.samples.contains(&3));
         assert!(collection.samples.contains(&0));   // zero token
-    }
-
-    #[test]
-    fn test_token_sample_from_referral() {
-        let mut collection = TokenSampleCollection::new(100);
-
-        let suggested_peers = [1000, 2000];
-        collection.sample_from_referral(&suggested_peers);
-
-        assert_eq!(collection.samples.len(), 2);
-        assert!(collection.samples.contains(&1000));
-        assert!(collection.samples.contains(&2000));
-
-        // Test with zero peer ID (zero is added to collection)
-        let with_zero = [3000, 0];
-        collection.sample_from_referral(&with_zero);
-
-        assert_eq!(collection.samples.len(), 4); // Both 3000 and 0 added
-        assert!(collection.samples.contains(&3000));
-        assert!(collection.samples.contains(&0));
     }
 
     #[test]

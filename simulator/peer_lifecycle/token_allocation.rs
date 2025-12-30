@@ -8,7 +8,7 @@
 
 use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
 use ec_rust::ec_memory_backend::MemTokens;
-use ec_rust::ec_proof_of_storage::{ring_distance, TokenStorageBackend};
+use ec_rust::ec_proof_of_storage::ring_distance;
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
