@@ -381,6 +381,240 @@ impl EcCommitChain {
         backend.get_head()
     }
 
+    // ============================================================================
+    // Tick Helper Functions
+    // ============================================================================
+
+    /// Consume peer logs and collect missing blocks to request
+    ///
+    /// Processes CommitBlocks from oldest to newest, checking if we have
+    /// all transaction BlockIds. Returns list of blocks to request.
+    fn consume_peer_logs(
+        &mut self,
+        block_backend: &dyn EcBlocks,
+    ) -> (Vec<(PeerId, BlockId)>, Vec<BlockId>) {
+        let mut blocks_to_request = Vec::new();
+        let mut blocks_to_validate = Vec::new();
+
+        for (peer_id, log) in &mut self.tracked_peers {
+            while let Some(commit_block) = log.blocks.first() {
+                let mut all_blocks_ready = true;
+                let mut found_pending = false;
+
+                for block_id in &commit_block.committed_blocks {
+                    if block_backend.lookup(block_id).is_some() {
+                        // Already committed - good
+                        continue;
+                    } else if self.validated_blocks.contains_key(block_id) {
+                        // Already validated - good
+                        continue;
+                    } else if self.pending_blocks.contains_key(block_id) {
+                        // In pending - need to validate
+                        found_pending = true;
+                        blocks_to_validate.push(*block_id);
+                        all_blocks_ready = false;
+                        break;
+                    } else {
+                        // Missing - need to request
+                        blocks_to_request.push((*peer_id, *block_id));
+                        all_blocks_ready = false;
+                        break;
+                    }
+                }
+
+                if found_pending {
+                    // Have pending blocks - will validate them
+                    break;
+                } else if all_blocks_ready {
+                    // Have all blocks - consume this CommitBlock
+                    let removed_block = log.blocks.remove(0);
+                    log.sync_from_time = log.sync_from_time.max(removed_block.time);
+                } else {
+                    // Missing blocks - stop processing this log
+                    break;
+                }
+            }
+        }
+
+        (blocks_to_request, blocks_to_validate)
+    }
+
+    /// Validate a single block's token mappings against our token store
+    ///
+    /// Returns true if all token mappings are valid, false otherwise.
+    /// Adds valid mappings to shadow_token_mappings.
+    fn validate_block_token_mappings(
+        &mut self,
+        block: &crate::ec_interface::Block,
+        block_id: BlockId,
+        token_backend: &dyn EcTokens,
+        time: EcTime,
+    ) -> bool {
+        for i in 0..block.used as usize {
+            let token_block = &block.parts[i];
+            let token_id = token_block.token;
+
+            // Look up current state: shadow FIRST (most current), then backend
+            let current_state = self.shadow_token_mappings.get(&token_id)
+                .map(|shadow| (shadow.block, shadow.time))
+                .or_else(|| {
+                    token_backend.lookup(&token_id)
+                        .map(|bt| (bt.block, bt.time))
+                });
+
+            if let Some((current_block, current_time)) = current_state {
+                // We have this token (either committed or in shadow)
+                if block.time > current_time {
+                    // Newer block - validate chain extension
+                    if token_block.last == current_block {
+                        self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
+                    } else {
+                        // Invalid chain
+                        return false;
+                    }
+                } else if block.time == current_time {
+                    // Duplicate - add confirmation
+                    self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
+                }
+                // else: we're ahead - ignore this token mapping
+            } else {
+                // First time seeing this token
+                if token_block.last == GENESIS_BLOCK_ID {
+                    self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
+                } else {
+                    // Invalid - new token must have genesis parent
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Validate pending blocks and move valid ones to validated_blocks
+    fn validate_pending_blocks(
+        &mut self,
+        blocks_to_validate: Vec<BlockId>,
+        token_backend: &dyn EcTokens,
+        time: EcTime,
+    ) {
+        for block_id in blocks_to_validate {
+            if let Some(block) = self.pending_blocks.remove(&block_id) {
+                if self.validate_block_token_mappings(&block, block_id, token_backend, time) {
+                    // Valid - move to validated_blocks
+                    self.validated_blocks.insert(block_id, block);
+                }
+                // else: invalid - discard (will be re-requested if needed)
+            }
+        }
+    }
+
+    /// Generate QueryBlock messages for missing blocks
+    fn request_missing_blocks(
+        &self,
+        blocks_to_request: Vec<(PeerId, BlockId)>,
+        time: EcTime,
+    ) -> Vec<MessageEnvelope> {
+        blocks_to_request.into_iter()
+            .map(|(peer_id, block_id)| {
+                let ticket = self.generate_ticket(block_id);
+                MessageEnvelope {
+                    sender: self.peer_id,
+                    receiver: peer_id,
+                    ticket,
+                    time,
+                    message: Message::QueryBlock {
+                        block_id,
+                        target: self.peer_id,
+                        ticket,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Fill tracking slots with new peers (up to MAX_TRACKED_PEERS)
+    fn fill_tracking_slots(&mut self, peers: &EcPeers, time: EcTime) {
+        if self.tracked_peers.len() >= MAX_TRACKED_PEERS {
+            return;
+        }
+
+        let closest = peers.find_closest_peers(self.peer_id, 10);
+
+        for candidate_peer in closest {
+            if candidate_peer == self.peer_id {
+                continue; // Skip ourselves
+            }
+
+            if self.tracked_peers.contains_key(&candidate_peer) {
+                continue; // Already tracking
+            }
+
+            if let Some(head) = peers.get_peer_commit_chain_head(&candidate_peer) {
+                let sync_from_time = time.saturating_sub(self.config.max_sync_age);
+                self.tracked_peers.insert(candidate_peer, PeerChainLog::new(head, sync_from_time));
+
+                if self.tracked_peers.len() >= MAX_TRACKED_PEERS {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Check for peer head changes and generate QueryCommitBlock messages
+    fn request_peer_head_updates(&mut self, peers: &EcPeers, time: EcTime) -> Vec<MessageEnvelope> {
+        // Collect peer head changes
+        let peer_head_changes: Vec<(PeerId, CommitBlockId)> = self.tracked_peers.iter()
+            .filter_map(|(peer_id, log)| {
+                peers.get_peer_commit_chain_head(peer_id)
+                    .filter(|&current_head| current_head != log.last_known_head)
+                    .map(|current_head| (*peer_id, current_head))
+            })
+            .collect();
+
+        // Update logs and generate messages
+        peer_head_changes.into_iter()
+            .filter_map(|(peer_id, current_head)| {
+                if let Some(log) = self.tracked_peers.get_mut(&peer_id) {
+                    log.last_known_head = current_head;
+                }
+
+                let ticket = self.generate_ticket(current_head);
+                Some(MessageEnvelope {
+                    sender: self.peer_id,
+                    receiver: peer_id,
+                    ticket,
+                    time,
+                    message: Message::QueryCommitBlock {
+                        block_id: current_head,
+                        ticket,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Collect shadows that are mature enough for batch commit
+    ///
+    /// Returns list of TokenIds ready for commit.
+    /// TODO: Implement actual commit logic.
+    fn collect_mature_shadows(&self, time: EcTime) -> Vec<TokenId> {
+        self.shadow_token_mappings.iter()
+            .filter_map(|(token_id, shadow)| {
+                let age = time.saturating_sub(shadow.first_seen);
+                if age >= self.config.shadow_commit_age {
+                    Some(*token_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // ============================================================================
+    // Main Tick Function
+    // ============================================================================
+
     /// Main tick function for commit chain operations
     ///
     /// Manages peer chain tracking and requests missing blocks.
@@ -398,255 +632,34 @@ impl EcCommitChain {
         peers: &EcPeers,
         time: EcTime,
     ) -> Vec<MessageEnvelope> {
-        let mut messages = Vec::new();
-
         // Only run sync logic periodically (every 100 ticks)
         if time % 100 != 0 {
-            return messages;
+            return Vec::new();
         }
 
-        // Step 0: Consume peer logs from the oldest end
-        // Process blocks from beginning of logs (oldest first)
-        // Validate pending blocks and check if we have all transaction blocks
+        let mut messages = Vec::new();
 
-        // First collect any missing blocks to request (to avoid borrow conflicts)
-        let mut blocks_to_request: Vec<(PeerId, BlockId)> = Vec::new();
+        // Step 1: Consume peer logs and collect missing/pending blocks
+        let (blocks_to_request, blocks_to_validate) = self.consume_peer_logs(block_backend);
 
-        for (peer_id, log) in &mut self.tracked_peers {
-            // Process blocks from oldest to newest (from front of Vec)
-            while let Some(commit_block) = log.blocks.first() {
-                // Check each BlockId in this CommitBlock
-                let mut all_blocks_ready = true;
-                let mut found_pending = false;
+        // Step 2: Validate pending blocks against token store
+        self.validate_pending_blocks(blocks_to_validate, token_backend, time);
 
-                for block_id in &commit_block.committed_blocks {
-                    if block_backend.lookup(block_id).is_some() {
-                        // Already committed - good
-                        continue;
-                    } else if self.validated_blocks.contains_key(block_id) {
-                        // Already validated - good
-                        continue;
-                    } else if self.pending_blocks.contains_key(block_id) {
-                        // In pending - need to validate
-                        found_pending = true;
-                        all_blocks_ready = false;
-                        break;
-                    } else {
-                        // Missing - need to request
-                        blocks_to_request.push((*peer_id, *block_id));
-                        all_blocks_ready = false;
-                        break;
-                    }
-                }
+        // Step 3: Request missing blocks
+        messages.extend(self.request_missing_blocks(blocks_to_request, time));
 
-                if found_pending {
-                    // We have a pending block - validate it now
-                    // We'll handle validation after this loop to avoid borrow conflicts
-                    break;
-                } else if all_blocks_ready {
-                    // We have all transaction blocks - remove commit block from peer log
-                    let removed_block = log.blocks.remove(0);
+        // Step 4: Fill tracking slots with new peers
+        self.fill_tracking_slots(peers, time);
 
-                    // Advance sync_from_time to at least this block's time
-                    // This gradually moves our sync window forward as we consume blocks
-                    log.sync_from_time = log.sync_from_time.max(removed_block.time);
+        // Step 5: Request peer head updates
+        messages.extend(self.request_peer_head_updates(peers, time));
 
-                    // Continue to next commit block in this log
-                } else {
-                    // Missing blocks - already queued for request
-                    break;
-                }
-            }
-        }
-
-        // Step 0.5: Validate pending blocks against our token store
-        // Collect blocks to validate (blocks in pending_blocks that are referenced in commit blocks)
-        let mut blocks_to_validate: Vec<BlockId> = Vec::new();
-
-        for log in self.tracked_peers.values() {
-            if let Some(commit_block) = log.blocks.first() {
-                for block_id in &commit_block.committed_blocks {
-                    if self.pending_blocks.contains_key(block_id) {
-                        blocks_to_validate.push(*block_id);
-                    }
-                }
-            }
-        }
-
-        // Validate each pending block and add token mappings to shadow
-        for block_id in blocks_to_validate {
-            if let Some(block) = self.pending_blocks.remove(&block_id) {
-                let mut is_valid = true;
-
-                // Validate token mappings in this block
-                // Loop over each token mapping (part) in the block
-                for i in 0..block.used as usize {
-                    let token_block = &block.parts[i];
-                    let token_id = token_block.token;
-
-                    // Check if this token is in "our range"
-                    // For now, we'll validate all tokens (TODO: add range check based on peer_id)
-
-                    // Look up current state: shadow FIRST (our most current view), then backend
-                    let current_state = self.shadow_token_mappings.get(&token_id)
-                        .map(|shadow| (shadow.block, shadow.time))
-                        .or_else(|| {
-                            token_backend.lookup(&token_id)
-                                .map(|bt| (bt.block, bt.time))
-                        });
-
-                    if let Some((current_block, current_time)) = current_state {
-                        // We have this token (either committed or in shadow)
-                        if block.time > current_time {
-                            // This block is newer - check that it properly extends the chain
-                            if token_block.last == current_block {
-                                // Valid extension - add to shadow mappings
-                                self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
-                            } else {
-                                // Invalid - token_block.last doesn't match current state
-                                is_valid = false;
-                                break;
-                            }
-                        } else if block.time == current_time {
-                            // Same time - already have this state (duplicate)
-                            // Still add to shadow to track confirmation
-                            self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
-                        } else {
-                            // We're ahead - this block is outdated for this token
-                            // Just ignore this particular token mapping
-                        }
-                    } else {
-                        // First time seeing this token - validate as new token
-                        if token_block.last == GENESIS_BLOCK_ID {
-                            // Valid new token - add to shadow
-                            self.add_to_shadow(token_id, block.id, token_block.last, block.time, time, block_id);
-                        } else {
-                            // Invalid - new token should have GENESIS_BLOCK_ID as parent
-                            is_valid = false;
-                            break;
-                        }
-                    }
-                }
-
-                if is_valid {
-                    // Block validated successfully - move to validated_blocks
-                    self.validated_blocks.insert(block_id, block);
-                } else {
-                    // Block validation failed - discard it
-                    // It won't be in pending_blocks or validated_blocks
-                    // Next tick will request it again (if still needed)
-                }
-            }
-        }
-
-        // Generate messages for missing blocks
-        for (peer_id, block_id) in blocks_to_request {
-            let block_ticket = self.generate_ticket(block_id);
-
-            messages.push(MessageEnvelope {
-                sender: self.peer_id,
-                receiver: peer_id,
-                ticket: block_ticket,
-                time,
-                message: Message::QueryBlock {
-                    block_id,
-                    target: self.peer_id, // We want the result
-                    ticket: block_ticket,
-                },
-            });
-        }
-
-        // Step 1: Fill empty slots with new peers (up to MAX_TRACKED_PEERS)
-        if self.tracked_peers.len() < MAX_TRACKED_PEERS {
-            // Find closest peers
-            let closest = peers.find_closest_peers(self.peer_id, 10);
-
-            // Look for a peer we're not already tracking that has a known head
-            for candidate_peer in closest {
-                if candidate_peer == self.peer_id {
-                    continue; // Skip ourselves
-                }
-
-                // Check if already tracking this peer
-                if self.tracked_peers.contains_key(&candidate_peer) {
-                    continue;
-                }
-
-                // Check if this peer has a known head
-                if let Some(head) = peers.get_peer_commit_chain_head(&candidate_peer) {
-                    // Start tracking this peer
-                    // Set initial sync_from_time to current_time - max_sync_age
-                    let sync_from_time = time.saturating_sub(self.config.max_sync_age);
-                    self.tracked_peers.insert(candidate_peer, PeerChainLog::new(head, sync_from_time));
-
-                    // Stop if we've reached max capacity
-                    if self.tracked_peers.len() >= MAX_TRACKED_PEERS {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Step 2: Check each tracked peer for head changes and request missing blocks
-        // Collect peer IDs and current heads first to avoid borrow conflicts
-        let peer_head_changes: Vec<(PeerId, CommitBlockId)> = self.tracked_peers.iter()
-            .filter_map(|(peer_id, log)| {
-                peers.get_peer_commit_chain_head(peer_id)
-                    .filter(|&current_head| current_head != log.last_known_head)
-                    .map(|current_head| (*peer_id, current_head))
-            })
-            .collect();
-
-        // Now update logs and generate messages
-        for (peer_id, current_head) in peer_head_changes {
-            if let Some(log) = self.tracked_peers.get_mut(&peer_id) {
-                log.last_known_head = current_head;
-            }
-
-            // Generate ticket for this request
-            let ticket = self.generate_ticket(current_head);
-
-            // Request the block at the new head
-            messages.push(MessageEnvelope {
-                sender: self.peer_id,
-                receiver: peer_id,
-                ticket,
-                time,
-                message: Message::QueryCommitBlock {
-                    block_id: current_head,
-                    ticket,
-                },
-            });
-        }
-
-        // Step 3: Batch commit mature shadow mappings
-        // TODO: This needs careful consideration - we need to ensure peer logs are aligned
-        // past the point where we commit shadows. If we commit a shadow but then receive
-        // an older conflicting block from a slow peer, we may have issues.
-        // For now, we collect shadows that haven't been updated for shadow_commit_age.
-
-        let mut shadows_to_commit: Vec<TokenId> = Vec::new();
-
-        for (token_id, shadow) in &self.shadow_token_mappings {
-            let age = time.saturating_sub(shadow.first_seen);
-            if age >= self.config.shadow_commit_age {
-                shadows_to_commit.push(*token_id);
-            }
-        }
-
-        // TODO: Actually commit these shadows to the backend
-        // This would involve:
-        // 1. Committing all BlockIds in shadow.confirmed_by_blocks to block_backend
-        // 2. Committing the token mapping (shadow.token -> shadow.block) to token_backend
-        // 3. Creating our own CommitBlock from these committed blocks
-        // 4. Removing the shadow from shadow_token_mappings
-        // 5. Removing validated blocks that have been committed
-        //
-        // For now, just log that we would commit (placeholder for future implementation)
-        if !shadows_to_commit.is_empty() {
-            // Placeholder - actual commit logic to be implemented
-            // self.batch_commit_shadows(shadows_to_commit, block_backend, token_backend);
-        }
+        // Step 6: Collect mature shadows for batch commit
+        // TODO: Implement actual commit logic
+        let _shadows_to_commit = self.collect_mature_shadows(time);
+        // if !shadows_to_commit.is_empty() {
+        //     self.batch_commit_shadows(shadows_to_commit, block_backend, token_backend);
+        // }
 
         messages
     }

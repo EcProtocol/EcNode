@@ -1737,8 +1737,5 @@ mod tests {
         assert_eq!(config.pending_timeout, 10);
         assert_eq!(config.connection_timeout, 300);
         assert_eq!(config.prune_protection_time, 600);
-
-        // Legacy compatibility
-        assert_eq!(config.total_budget, 200);
     }
 }
