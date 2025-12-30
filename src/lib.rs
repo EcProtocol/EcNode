@@ -58,6 +58,7 @@ pub mod ec_node;
 pub mod ec_peers;
 pub mod ec_proof_of_storage;
 pub mod ec_commit_chain;
+pub mod ec_identity;
 
 // Storage backends
 pub mod ec_memory_backend;
@@ -75,3 +76,8 @@ pub use ec_node::EcNode;
 pub use ec_proof_of_storage::{
     ring_distance, ConsensusCluster, ElectionConfig, ElectionError, PeerElection, WinnerResult,
 };
+// Public API for peer identity generation and validation
+pub use ec_identity::{AddressConfig, PeerIdentity, Salt, SharedSecret};
+
+// Re-export X25519 types for external use (needed for message structures)
+pub use x25519_dalek::PublicKey as X25519PublicKey;

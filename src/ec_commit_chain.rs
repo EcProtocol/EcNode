@@ -887,16 +887,8 @@ mod tests {
             self.blocks.get(id).cloned()
         }
 
-        fn save(&mut self, block: &CommitBlock) {
-            self.blocks.insert(block.id, block.clone());
-        }
-
         fn get_head(&self) -> Option<CommitBlockId> {
             self.head
-        }
-
-        fn set_head(&mut self, id: &CommitBlockId) {
-            self.head = Some(*id);
         }
     }
 
