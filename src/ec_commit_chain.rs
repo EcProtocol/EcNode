@@ -407,15 +407,10 @@ impl EcCommitChain {
         true
     }
 
-    /// Add or update a token mapping in the shadow
+    /// Update an existing shadow mapping based on parent-relationship logic
     ///
-    /// Creates a new shadow mapping if it doesn't exist, or updates based on parent-relationship
-    /// logic. Extensions are determined by whether the new block's parent matches the current
-    /// shadow block, not by time alone. Confirmation count is used as confidence measure for
-    /// commit decisions.
-    ///
-    /// If db_state is provided and there's no shadow, validates the mapping against the database
-    /// state before creating a new shadow.
+    /// IMPORTANT: This function assumes a shadow already exists for the token.
+    /// Caller should check shadow existence before calling.
     ///
     /// Parent-relationship logic:
     /// - If parent == shadow.block: Extension (B2 extends B1), replace shadow
@@ -424,7 +419,7 @@ impl EcCommitChain {
     /// - If block_time < shadow.time: Older mapping, ignore (potential fraud)
     /// - Otherwise: Doesn't connect, ignore
     ///
-    /// Returns true if the mapping was added/updated, false if it was rejected.
+    /// Returns true if the mapping was updated, false if it was rejected.
     fn add_to_shadow(
         &mut self,
         token: TokenId,
@@ -432,95 +427,113 @@ impl EcCommitChain {
         parent: BlockId,
         block_time: EcTime,
         current_time: EcTime,
-        _confirmed_by_block: BlockId,
-        db_state: Option<(BlockId, EcTime)>,
     ) -> bool {
-        // Check if shadow exists
-        if let Some(shadow) = self.shadow_token_mappings.get_mut(&token) {
-            // Shadow exists - check parent-relationship to determine how to handle this update
-            if parent == shadow.block {
-                // EXTENSION: This block extends the current shadow (A -> B)
-                // Replace shadow with this newer mapping
+        // Shadow must exist - caller's responsibility to check
+        let shadow = self.shadow_token_mappings.get_mut(&token)
+            .expect("add_to_shadow called without existing shadow");
+
+        // Check parent-relationship to determine how to handle this update
+        if parent == shadow.block {
+            // EXTENSION: This block extends the current shadow (A -> B)
+            // Replace shadow with this newer mapping
+            shadow.block = block;
+            shadow.parent = parent;
+            shadow.time = block_time;
+            shadow.first_seen = current_time;
+            shadow.confirmation_count = 1;
+            true
+        } else if parent == shadow.parent && block != shadow.block {
+            // CONFLICT: Both blocks extend the same parent but are different
+            // Pick the higher lexical BlockId (our consensus rule)
+            if block > shadow.block {
                 shadow.block = block;
                 shadow.parent = parent;
                 shadow.time = block_time;
                 shadow.first_seen = current_time;
                 shadow.confirmation_count = 1;
                 true
-            } else if parent == shadow.parent && block != shadow.block {
-                // CONFLICT: Both blocks extend the same parent but are different
-                // Pick the higher lexical BlockId (our consensus rule)
-                if block > shadow.block {
-                    shadow.block = block;
-                    shadow.parent = parent;
-                    shadow.time = block_time;
-                    shadow.first_seen = current_time;
-                    shadow.confirmation_count = 1;
-                    true
-                } else {
-                    // Keep current shadow
-                    false
-                }
-            } else if block == shadow.block {
-                // CONFIRMATION: Same block seen again
-                shadow.confirmation_count += 1;
-                true
-            } else if block_time < shadow.time {
-                // OLDER: This mapping is older than what we have
-                // Could be potential fraud or late arrival, ignore it
-                // TODO: Consider fraud detection/logging
-                false
             } else {
-                // DISCONNECTED: This block doesn't connect to our shadow
-                // Ignore it - it's not part of this token's history chain
+                // Keep current shadow
+                false
+            }
+        } else if block == shadow.block {
+            // CONFIRMATION: Same block seen again
+            shadow.confirmation_count += 1;
+            true
+        } else if block_time < shadow.time {
+            // OLDER: This mapping is older than what we have
+            // Could be potential fraud or late arrival, ignore it
+            // TODO: Consider fraud detection/logging
+            false
+        } else {
+            // DISCONNECTED: This block doesn't connect to our shadow
+            // Ignore it - it's not part of this token's history chain
+            false
+        }
+    }
+
+    /// Create a new shadow mapping, validating against database state
+    ///
+    /// IMPORTANT: This function assumes NO shadow exists for the token.
+    /// Caller should check shadow existence before calling.
+    ///
+    /// Validation logic:
+    /// - If db_state exists: Must extend or confirm database state
+    /// - If no db_state: Must be new token with genesis parent
+    ///
+    /// Returns true if shadow was created, false if validation failed.
+    fn create_shadow(
+        &mut self,
+        token: TokenId,
+        block: BlockId,
+        parent: BlockId,
+        block_time: EcTime,
+        current_time: EcTime,
+        db_state: Option<(BlockId, EcTime)>,
+    ) -> bool {
+        if let Some((db_block, db_time)) = db_state {
+            // We have database state - validate chain extension
+            if block_time > db_time && parent == db_block {
+                // Valid extension of database state
+                self.shadow_token_mappings.insert(token, ShadowTokenMapping {
+                    token,
+                    block,
+                    parent,
+                    time: block_time,
+                    first_seen: current_time,
+                    confirmation_count: 1,
+                });
+                true
+            } else if block_time == db_time && block == db_block {
+                // Confirmation of database state
+                self.shadow_token_mappings.insert(token, ShadowTokenMapping {
+                    token,
+                    block,
+                    parent,
+                    time: block_time,
+                    first_seen: current_time,
+                    confirmation_count: 1,
+                });
+                true
+            } else {
+                // Invalid - doesn't extend database state correctly
                 false
             }
         } else {
-            // No shadow - validate against db_state if provided
-            if let Some((db_block, db_time)) = db_state {
-                // We have database state - validate chain extension
-                if block_time > db_time && parent == db_block {
-                    // Valid extension of database state
-                    self.shadow_token_mappings.insert(token, ShadowTokenMapping {
-                        token,
-                        block,
-                        parent,
-                        time: block_time,
-                        first_seen: current_time,
-                        confirmation_count: 1,
-                    });
-                    true
-                } else if block_time == db_time && block == db_block {
-                    // Confirmation of database state
-                    self.shadow_token_mappings.insert(token, ShadowTokenMapping {
-                        token,
-                        block,
-                        parent,
-                        time: block_time,
-                        first_seen: current_time,
-                        confirmation_count: 1,
-                    });
-                    true
-                } else {
-                    // Invalid - doesn't extend database state correctly
-                    false
-                }
+            // No database state - must be new token with genesis parent
+            if parent == GENESIS_BLOCK_ID {
+                self.shadow_token_mappings.insert(token, ShadowTokenMapping {
+                    token,
+                    block,
+                    parent,
+                    time: block_time,
+                    first_seen: current_time,
+                    confirmation_count: 1,
+                });
+                true
             } else {
-                // No database state - must be new token with genesis parent
-                if parent == GENESIS_BLOCK_ID {
-                    self.shadow_token_mappings.insert(token, ShadowTokenMapping {
-                        token,
-                        block,
-                        parent,
-                        time: block_time,
-                        first_seen: current_time,
-                        confirmation_count: 1,
-                    });
-                    true
-                } else {
-                    // Invalid - new token must have genesis parent
-                    false
-                }
+                // Invalid - new token must have genesis parent
+                false
             }
         }
     }
@@ -592,11 +605,16 @@ impl EcCommitChain {
     /// Validate a single block's token mappings against our token store
     ///
     /// Returns true if all token mappings are valid, false otherwise.
-    /// Adds valid mappings to shadow_token_mappings via add_to_shadow.
+    /// Adds valid mappings to shadow_token_mappings.
+    ///
+    /// Strategy:
+    /// 1. Check if shadow exists for token
+    /// 2. If yes: Update shadow (no db lookup needed)
+    /// 3. If no: Fetch from db and create shadow with validation
     fn validate_block_token_mappings(
         &mut self,
         block: &crate::ec_interface::Block,
-        block_id: BlockId,
+        _block_id: BlockId,
         token_backend: &dyn EcTokens,
         time: EcTime,
     ) -> bool {
@@ -604,20 +622,34 @@ impl EcCommitChain {
             let token_block = &block.parts[i];
             let token_id = token_block.token;
 
-            // Look up database state (not shadow - add_to_shadow will check shadow first)
-            let db_state = token_backend.lookup(&token_id)
-                .map(|bt| (bt.block, bt.time));
+            // Check if we already have a shadow for this token
+            let has_shadow = self.shadow_token_mappings.contains_key(&token_id);
 
-            // Delegate validation and shadow update to add_to_shadow
-            if !self.add_to_shadow(
-                token_id,
-                block.id,
-                token_block.last,
-                block.time,
-                time,
-                block_id,
-                db_state,
-            ) {
+            let valid = if has_shadow {
+                // Shadow exists - update it (no db lookup needed)
+                self.add_to_shadow(
+                    token_id,
+                    block.id,
+                    token_block.last,
+                    block.time,
+                    time,
+                )
+            } else {
+                // No shadow - fetch from db and create shadow with validation
+                let db_state = token_backend.lookup(&token_id)
+                    .map(|bt| (bt.block, bt.time));
+
+                self.create_shadow(
+                    token_id,
+                    block.id,
+                    token_block.last,
+                    block.time,
+                    time,
+                    db_state,
+                )
+            };
+
+            if !valid {
                 // Invalid mapping - block fails validation
                 return false;
             }
@@ -655,7 +687,7 @@ impl EcCommitChain {
             .map(|(peer_id, block_id)| {
                 let ticket = self.generate_ticket(block_id);
                 CommitChainAction::QueryBlock {
-                    receiver: peer_id,
+                    receiver: peer_id,          // TODO let node decide - spread over network. Help discover
                     block_id,
                     ticket,
                 }
@@ -820,6 +852,9 @@ impl EcCommitChain {
         if !shadows_to_commit.is_empty() {
             self.batch_commit_shadows(shadows_to_commit);
         }
+
+
+        // TODO move into node
 
         // Convert actions to message envelopes
         actions.into_iter()
