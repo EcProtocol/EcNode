@@ -483,12 +483,14 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
             // Collect block IDs
             let block_ids: Vec<BlockId> = self.blocks.iter().map(|b| b.id).collect();
 
-            // Create commit block
-            self.backend.commit_chain.create_commit_block(
-                &mut self.backend.commit_chain_backend,
+            // Create and save commit block
+            let commit_block = self.backend.commit_chain.create_commit_block(
+                &self.backend.commit_chain_backend,
                 block_ids,
                 commit_time,
             );
+            self.backend.commit_chain_backend.save(&commit_block);
+            self.backend.commit_chain_backend.set_head(&commit_block.id);
         }
 
         Ok(())
@@ -592,8 +594,34 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
         peers: &crate::ec_peers::EcPeers,
         time: EcTime,
     ) -> Vec<crate::ec_commit_chain::CommitChainAction> {
-        self.commit_chain
-            .tick(&mut self.commit_chain_backend, &self.blocks, &self.tokens, peers, time)
+        // Temporarily take ownership to avoid borrow conflicts
+        let mut commit_chain = std::mem::replace(
+            &mut self.commit_chain,
+            EcCommitChain::new(0, Default::default()), // Placeholder
+        );
+        let mut commit_chain_backend = std::mem::replace(
+            &mut self.commit_chain_backend,
+            Default::default(), // Placeholder
+        );
+
+        let (actions, maybe_commit_block) = commit_chain.tick(
+            &commit_chain_backend,
+            self,
+            peers,
+            time,
+        );
+
+        // If a commit block was created, save it
+        if let Some(commit_block) = maybe_commit_block {
+            commit_chain_backend.save(&commit_block);
+            commit_chain_backend.set_head(&commit_block.id);
+        }
+
+        // Restore ownership
+        self.commit_chain = commit_chain;
+        self.commit_chain_backend = commit_chain_backend;
+
+        actions
     }
 }
 
@@ -631,15 +659,20 @@ impl EcCommitChainBackend for MemCommitChain {
         self.blocks.get(id).cloned()
     }
 
-    fn save(&mut self, block: &CommitBlock) {
-        self.blocks.insert(block.id, block.clone());
-    }
-
     fn get_head(&self) -> Option<CommitBlockId> {
         self.head
     }
+}
 
-    fn set_head(&mut self, id: &CommitBlockId) {
+// Internal methods for MemCommitChain (not part of trait)
+impl MemCommitChain {
+    /// Save a commit block (internal use only)
+    pub fn save(&mut self, block: &CommitBlock) {
+        self.blocks.insert(block.id, block.clone());
+    }
+
+    /// Set the head of the commit chain (internal use only)
+    pub fn set_head(&mut self, id: &CommitBlockId) {
         self.head = Some(*id);
     }
 }

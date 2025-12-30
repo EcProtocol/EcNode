@@ -6,7 +6,7 @@
 
 use crate::ec_interface::{
     BlockId, CommitBlock, CommitBlockId, EcBlocks, EcCommitChainBackend, EcTime, EcTokens,
-    Message, MessageEnvelope, MessageTicket, ParentBlockRequest, PeerId, TokenId, GENESIS_BLOCK_ID,
+    MessageTicket, ParentBlockRequest, PeerId, TokenId, GENESIS_BLOCK_ID,
 };
 use crate::ec_peers::EcPeers;
 
@@ -57,7 +57,6 @@ use std::collections::{HashMap, HashSet};
 pub enum CommitChainAction {
     /// Request a regular transaction block from a peer
     QueryBlock {
-        receiver: PeerId,
         block_id: BlockId,
         ticket: MessageTicket,
     },
@@ -68,42 +67,6 @@ pub enum CommitChainAction {
         block_id: CommitBlockId,
         ticket: MessageTicket,
     },
-}
-
-impl CommitChainAction {
-    /// Convert CommitChainAction to MessageEnvelope
-    ///
-    /// # Arguments
-    /// * `sender` - The peer ID of this node
-    /// * `time` - Current time for the message
-    ///
-    /// # Returns
-    /// A complete MessageEnvelope ready to send
-    pub fn into_envelope(self, sender: PeerId, time: EcTime) -> MessageEnvelope {
-        match self {
-            CommitChainAction::QueryBlock { receiver, block_id, ticket } => MessageEnvelope {
-                sender,
-                receiver,
-                ticket,
-                time,
-                message: Message::QueryBlock {
-                    block_id,
-                    target: sender, // We're the target for the response
-                    ticket,
-                },
-            },
-            CommitChainAction::QueryCommitBlock { receiver, block_id, ticket } => MessageEnvelope {
-                sender,
-                receiver,
-                ticket,
-                time,
-                message: Message::QueryCommitBlock {
-                    block_id,
-                    ticket,
-                },
-            },
-        }
-    }
 }
 
 /// Shadow token mapping - temporarily holds token state changes
@@ -292,7 +255,7 @@ impl EcCommitChain {
     /// Returns the created CommitBlock.
     pub fn create_commit_block(
         &mut self,
-        backend: &mut dyn EcCommitChainBackend,
+        backend: &dyn EcCommitChainBackend,
         committed_blocks: Vec<BlockId>,
         time: EcTime,
     ) -> CommitBlock {
@@ -311,19 +274,13 @@ impl EcCommitChain {
         previous.hash(&mut hasher);
         let commit_block_id = hasher.finish();
 
-        // Create new commit block
-        let commit_block = CommitBlock::new(
+        // Create new commit block (caller handles saving)
+        CommitBlock::new(
             commit_block_id,
             previous,
             time,
             committed_blocks,
-        );
-
-        // Save to backend
-        backend.save(&commit_block);
-        backend.set_head(&commit_block.id);
-
-        commit_block
+        )
     }
 
     /// Handle a query for a commit block
@@ -684,10 +641,9 @@ impl EcCommitChain {
         blocks_to_request: Vec<(PeerId, BlockId)>,
     ) -> Vec<CommitChainAction> {
         blocks_to_request.into_iter()
-            .map(|(peer_id, block_id)| {
+            .map(|(block_id, ..)| {
                 let ticket = self.generate_ticket(block_id);
                 CommitChainAction::QueryBlock {
-                    receiver: peer_id,          // TODO let node decide - spread over network. Help discover
                     block_id,
                     ticket,
                 }
@@ -759,7 +715,6 @@ impl EcCommitChain {
     /// Collect shadows that are mature enough for batch commit
     ///
     /// Returns list of TokenIds ready for commit.
-    /// TODO: Implement actual commit logic.
     fn collect_mature_shadows(&self, time: EcTime) -> Vec<TokenId> {
         self.shadow_token_mappings.iter()
             .filter_map(|(token_id, shadow)| {
@@ -775,33 +730,49 @@ impl EcCommitChain {
             .collect()
     }
 
-    /// Batch commit mature shadow mappings and clean up validated_blocks
+    /// Prepare shadow commit by collecting blocks and token mappings
     ///
-    /// Removes committed shadows from shadow_token_mappings and removes their
-    /// associated BlockIds from validated_blocks to prevent unbounded growth.
+    /// Removes shadows from shadow_token_mappings and collects the data needed for batch commit.
+    /// Cleans up validated_blocks to prevent unbounded growth.
     ///
     /// # Arguments
     /// * `tokens_to_commit` - List of TokenIds that have mature shadow mappings
+    /// * `block_backend` - Block backend to look up transaction blocks
     ///
-    /// TODO: Implement actual commit logic to persist to backend
-    fn batch_commit_shadows(&mut self, tokens_to_commit: Vec<TokenId>) {
-        // Collect BlockIds to remove from validated_blocks
-        let mut blocks_to_cleanup: HashSet<BlockId> = HashSet::new();
+    /// # Returns
+    /// Tuple of (blocks, token_mappings, block_ids) ready for batch commit
+    fn prepare_shadow_commit(
+        &mut self,
+        tokens_to_commit: &[TokenId],
+        block_backend: &dyn EcBlocks,
+    ) -> (Vec<crate::ec_interface::Block>, Vec<(TokenId, BlockId, BlockId, EcTime)>, Vec<BlockId>) {
+        let mut blocks_to_save: HashSet<BlockId> = HashSet::new();
+        let mut token_mappings = Vec::new();
 
-        for token_id in &tokens_to_commit {
+        // Collect token mappings and blocks to save
+        for token_id in tokens_to_commit {
             if let Some(shadow) = self.shadow_token_mappings.remove(token_id) {
-                // TODO: Actually commit this shadow to backend
-                // commit_chain_backend.commit_token_mapping(token_id, shadow.block, shadow.time);
+                token_mappings.push((*token_id, shadow.block, shadow.parent, shadow.time));
+                blocks_to_save.insert(shadow.block);
+            }
+        }
 
-                // Track the block for cleanup
-                blocks_to_cleanup.insert(shadow.block);
+        // Collect blocks
+        let mut blocks = Vec::new();
+        let mut block_ids = Vec::new();
+        for block_id in &blocks_to_save {
+            if let Some(block) = block_backend.lookup(block_id) {
+                blocks.push(block.clone());
+                block_ids.push(*block_id);
             }
         }
 
         // Clean up validated_blocks - remove BlockIds that were committed
-        for block_id in blocks_to_cleanup {
+        for block_id in blocks_to_save {
             self.validated_blocks.remove(&block_id);
         }
+
+        (blocks, token_mappings, block_ids)
     }
 
     // ============================================================================
@@ -811,6 +782,7 @@ impl EcCommitChain {
     /// Main tick function for commit chain operations
     ///
     /// Manages peer chain tracking and requests missing blocks.
+    /// Orchestrates batch commits for mature shadows using the provided batched backend.
     ///
     /// Returns a list of actions for ec_node to convert to messages.
     ///
@@ -819,26 +791,30 @@ impl EcCommitChain {
     /// - Maintain up to 4 peer chain logs (HashMap)
     /// - Fill slots with closest peers that have heads
     /// - Detect when peer heads change and request missing blocks
-    pub fn tick(
+    /// - Batch commit mature shadows atomically
+    pub fn tick<B>(
         &mut self,
-        _commit_chain_backend: &mut dyn EcCommitChainBackend,
-        block_backend: &dyn EcBlocks,
-        token_backend: &dyn EcTokens,
+        commit_chain_backend: &dyn EcCommitChainBackend,
+        batched_backend: &mut B,
         peers: &EcPeers,
         time: EcTime,
-    ) -> Vec<CommitChainAction> {
+    ) -> (Vec<CommitChainAction>, Option<CommitBlock>)
+    where
+        B: crate::ec_interface::BatchedBackend + EcBlocks + EcTokens,
+    {
         // Only run sync logic periodically (every 100 ticks)
         if time % 100 != 0 {
-            return Vec::new();
+            return (Vec::new(), None);
         }
 
         let mut actions = Vec::new();
+        let mut commit_block_to_save = None;
 
         // Step 1: Consume peer logs and collect missing/pending blocks
-        let (blocks_to_request, blocks_to_validate) = self.consume_peer_logs(block_backend);
+        let (blocks_to_request, blocks_to_validate) = self.consume_peer_logs(batched_backend);
 
         // Step 2: Validate pending blocks against token store
-        self.validate_pending_blocks(blocks_to_validate, token_backend, time);
+        self.validate_pending_blocks(blocks_to_validate, batched_backend, time);
 
         // Step 3: Request missing blocks
         actions.extend(self.request_missing_blocks(blocks_to_request));
@@ -849,14 +825,40 @@ impl EcCommitChain {
         // Step 5: Request peer head updates
         actions.extend(self.request_peer_head_updates(peers));
 
-        // Step 6: Collect mature shadows for batch commit
+        // Step 6: Collect and commit mature shadows
         let shadows_to_commit = self.collect_mature_shadows(time);
         if !shadows_to_commit.is_empty() {
-            self.batch_commit_shadows(shadows_to_commit);
+            // Collect blocks and token mappings before creating batch
+            let (blocks_to_save, token_mappings, block_ids) =
+                self.prepare_shadow_commit(&shadows_to_commit, batched_backend);
+
+            // Begin batch for shadow commits (like mempool does for block commits)
+            let mut batch = batched_backend.begin_batch();
+
+            // Add blocks and tokens to batch
+            for block in blocks_to_save {
+                batch.save_block(&block);
+            }
+            for (token, block_id, parent, shadow_time) in token_mappings {
+                batch.update_token(&token, &block_id, &parent, shadow_time);
+            }
+
+            // Commit the batch atomically first
+            match batch.commit() {
+                Ok(()) => {
+                    // Batch succeeded - create commit block for caller to save
+                    if !block_ids.is_empty() {
+                        commit_block_to_save = Some(self.create_commit_block(commit_chain_backend, block_ids, time));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to commit shadow batch at time {}: {}", time, e);
+                }
+            }
         }
 
-        // Return actions - ec_node will translate to MessageEnvelope
-        actions
+        // Return actions and optional commit block to save
+        (actions, commit_block_to_save)
     }
 }
 

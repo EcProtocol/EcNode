@@ -395,14 +395,8 @@ pub trait EcCommitChainBackend {
     /// Lookup a commit block by its ID
     fn lookup(&self, id: &CommitBlockId) -> Option<CommitBlock>;
 
-    /// Save a commit block
-    fn save(&mut self, block: &CommitBlock);
-
     /// Get the current head of our commit chain
     fn get_head(&self) -> Option<CommitBlockId>;
-
-    /// Set the current head of our commit chain
-    fn set_head(&mut self, id: &CommitBlockId);
 }
 
 /// Trait for backends that support commit chain operations
@@ -430,8 +424,15 @@ pub trait EcCommitChainAccess {
 
     /// Tick function for commit chain sync operations
     ///
-    /// Returns actions for ec_node to convert to messages.
+    /// Orchestrates batch commits for mature shadows and returns actions for messaging.
     /// Requires peers reference to find neighbors for sync.
+    ///
+    /// # Arguments
+    /// * `peers` - Peer manager for finding sync targets
+    /// * `time` - Current time
+    ///
+    /// # Returns
+    /// List of actions for ec_node to convert to messages
     fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<crate::ec_commit_chain::CommitChainAction>;
 }
 

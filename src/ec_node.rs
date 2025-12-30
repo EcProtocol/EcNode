@@ -203,7 +203,6 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             use crate::ec_commit_chain::CommitChainAction;
             match action {
                 CommitChainAction::QueryBlock {
-                    receiver: _,
                     block_id,
                     ticket,
                 } => {
