@@ -591,7 +591,7 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
         &mut self,
         peers: &crate::ec_peers::EcPeers,
         time: EcTime,
-    ) -> Vec<crate::ec_interface::MessageEnvelope> {
+    ) -> Vec<crate::ec_commit_chain::CommitChainAction> {
         self.commit_chain
             .tick(&mut self.commit_chain_backend, &self.blocks, &self.tokens, peers, time)
     }

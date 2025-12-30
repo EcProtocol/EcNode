@@ -193,11 +193,51 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
 
         // Phase 4: Commit chain sync
         // Periodically query nearby peers to keep our commit chain up to date
-        let sync_messages = {
+        let sync_actions = {
             let mut backend = self.backend.borrow_mut();
             backend.commit_chain_tick(&self.peers, self.time)
         };
-        responses.extend(sync_messages);
+
+        // Convert commit chain actions to message envelopes
+        for action in sync_actions {
+            use crate::ec_commit_chain::CommitChainAction;
+            match action {
+                CommitChainAction::QueryBlock {
+                    receiver: _,
+                    block_id,
+                    ticket,
+                } => {
+                    // Use ec_peers to find a host for the block instead of the receiver
+                    // This spreads load across the network and helps with discovery
+                    let target = self.peers.peer_for(&block_id, self.time);
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver: target,
+                        ticket,
+                        time: self.time,
+                        message: Message::QueryBlock {
+                            block_id,
+                            target: self.peer_id, // We're the target for the response
+                            ticket,
+                        },
+                    });
+                }
+                CommitChainAction::QueryCommitBlock {
+                    receiver,
+                    block_id,
+                    ticket,
+                } => {
+                    // For commit blocks, use the specified receiver (peer from tracked_peers)
+                    responses.push(MessageEnvelope {
+                        sender: self.peer_id,
+                        receiver,
+                        ticket,
+                        time: self.time,
+                        message: Message::QueryCommitBlock { block_id, ticket },
+                    });
+                }
+            }
+        }
     }
 
     /*

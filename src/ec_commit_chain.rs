@@ -812,6 +812,8 @@ impl EcCommitChain {
     ///
     /// Manages peer chain tracking and requests missing blocks.
     ///
+    /// Returns a list of actions for ec_node to convert to messages.
+    ///
     /// Strategy:
     /// - Consume peer logs from oldest end
     /// - Maintain up to 4 peer chain logs (HashMap)
@@ -824,7 +826,7 @@ impl EcCommitChain {
         token_backend: &dyn EcTokens,
         peers: &EcPeers,
         time: EcTime,
-    ) -> Vec<MessageEnvelope> {
+    ) -> Vec<CommitChainAction> {
         // Only run sync logic periodically (every 100 ticks)
         if time % 100 != 0 {
             return Vec::new();
@@ -853,13 +855,8 @@ impl EcCommitChain {
             self.batch_commit_shadows(shadows_to_commit);
         }
 
-
-        // TODO move into node
-
-        // Convert actions to message envelopes
-        actions.into_iter()
-            .map(|action| action.into_envelope(self.peer_id, time))
-            .collect()
+        // Return actions - ec_node will translate to MessageEnvelope
+        actions
     }
 }
 

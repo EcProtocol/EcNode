@@ -430,9 +430,9 @@ pub trait EcCommitChainAccess {
 
     /// Tick function for commit chain sync operations
     ///
-    /// Returns messages to send (e.g., QueryCommitBlock messages).
+    /// Returns actions for ec_node to convert to messages.
     /// Requires peers reference to find neighbors for sync.
-    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<MessageEnvelope>;
+    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<crate::ec_commit_chain::CommitChainAction>;
 }
 
 // ============================================================================
