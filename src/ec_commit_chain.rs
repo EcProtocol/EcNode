@@ -26,6 +26,10 @@ pub struct CommitChainConfig {
     /// How long to hold shadow mappings before batch commit (e.g., 1000 ticks)
     /// This allows time for multiple peer chains to confirm or reveal conflicts
     pub shadow_commit_age: EcTime,
+
+    /// Minimum number of confirmations required to commit a shadow mapping
+    /// Higher values = more confidence but slower commits
+    pub confirmation_threshold: usize,
 }
 
 impl Default for CommitChainConfig {
@@ -34,6 +38,7 @@ impl Default for CommitChainConfig {
             max_sync_age: 30 * 24 * 3600,       // 30 days
             fraud_log_retention: 7 * 24 * 3600, // 7 days
             shadow_commit_age: 1000,            // ~1000 ticks to allow peer convergence
+            confirmation_threshold: 2,          // Need at least 2 confirmations
         }
     }
 }
@@ -56,8 +61,9 @@ struct ShadowTokenMapping {
     time: EcTime,
     /// When we first saw this mapping
     first_seen: EcTime,
-    /// Which validated blocks contain this mapping (to detect consensus)
-    confirmed_by_blocks: HashSet<BlockId>,
+    /// Number of confirmations this mapping has received
+    /// Used as confidence measure for commit decisions
+    confirmation_count: usize,
 }
 
 /// Tracks a single peer's commit chain for sync purposes
@@ -75,6 +81,9 @@ struct PeerChainLog {
     /// Starts at current_time - max_sync_age when we start tracking
     /// Gradually moves forward as we consume blocks
     sync_from_time: EcTime,
+    /// Number of times this log has successfully contributed to shadow mappings
+    /// Used to assess peer quality and drop poor sources
+    shadow_contributions: usize,
 }
 
 impl PeerChainLog {
@@ -84,6 +93,7 @@ impl PeerChainLog {
             blocks: Vec::new(),
             orphaned_blocks: HashMap::new(),
             sync_from_time,
+            shadow_contributions: 0,
         }
     }
 
@@ -137,9 +147,6 @@ pub struct EcCommitChain {
     peer_id: PeerId,
     config: CommitChainConfig,
 
-    /// Next commit block ID to assign (sequential in simulation)
-    next_commit_block_id: CommitBlockId,
-
     /// Tracks peer chains we're following for sync (up to 4)
     /// Maps PeerId -> PeerChainLog
     tracked_peers: HashMap<PeerId, PeerChainLog>,
@@ -150,9 +157,9 @@ pub struct EcCommitChain {
     pending_blocks: HashMap<BlockId, crate::ec_interface::Block>,
 
     /// Validated blocks that have been checked against our token store
-    /// Maps BlockId -> Block
+    /// Set of BlockIds we've already validated (to avoid redundant work)
     /// These blocks have valid token mappings and can be considered "known"
-    validated_blocks: HashMap<BlockId, crate::ec_interface::Block>,
+    validated_blocks: HashSet<BlockId>,
 
     /// Shadow token mappings - temporarily holds token state changes
     /// Maps TokenId -> ShadowTokenMapping
@@ -169,16 +176,15 @@ impl EcCommitChain {
     pub fn new(peer_id: PeerId, config: CommitChainConfig) -> Self {
         // Generate a random secret for ticket generation
         // In simulation: use peer_id as seed for determinism
-        // In production: use cryptographically secure random
+        // TODO In production: use cryptographically secure random
         let ticket_secret = peer_id.wrapping_mul(0x9e3779b97f4a7c15); // Simple hash
 
         Self {
             peer_id,
             config,
-            next_commit_block_id: 1, // Start from 1 (0 is reserved for genesis)
             tracked_peers: HashMap::new(),
             pending_blocks: HashMap::new(),
-            validated_blocks: HashMap::new(),
+            validated_blocks: HashSet::new(),
             shadow_token_mappings: HashMap::new(),
             ticket_secret,
         }
@@ -190,7 +196,7 @@ impl EcCommitChain {
     /// This allows us to verify that incoming blocks are responses to our requests.
     fn generate_ticket(&self, block_id: CommitBlockId) -> MessageTicket {
         // Simple hash function for simulation
-        // In production, use proper cryptographic hash
+        // TODO In production, use proper cryptographic hash
         let combined = block_id.wrapping_add(self.ticket_secret);
         combined.wrapping_mul(0x9e3779b97f4a7c15)
     }
@@ -215,16 +221,25 @@ impl EcCommitChain {
         // Get previous commit block (head of chain)
         let previous = backend.get_head().unwrap_or(GENESIS_BLOCK_ID);
 
+        // Generate random commit block ID
+        // In production this would be Blake3 hash of commit block contents
+        // For simulation we use random u64
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let random_state = RandomState::new();
+        let mut hasher = random_state.build_hasher();
+        self.peer_id.hash(&mut hasher);
+        time.hash(&mut hasher);
+        previous.hash(&mut hasher);
+        let commit_block_id = hasher.finish();
+
         // Create new commit block
         let commit_block = CommitBlock::new(
-            self.next_commit_block_id,
+            commit_block_id,
             previous,
             time,
             committed_blocks,
         );
-
-        // Increment ID for next time
-        self.next_commit_block_id += 1;
 
         // Save to backend
         backend.save(&commit_block);
@@ -318,8 +333,8 @@ impl EcCommitChain {
     ///
     /// Creates a new shadow mapping if it doesn't exist, or updates it if this
     /// is a sequential update (newer block). The shadow can track multiple sequential
-    /// updates (A -> B -> C), but we only keep the latest. All blocks are tracked
-    /// in confirmed_by_blocks for later batch commit.
+    /// updates (A -> B -> C), but we only keep the latest. Confirmation count is
+    /// used as confidence measure for commit decisions.
     ///
     /// Conflict resolution: If we have competing BlockIds at the same time, we pick
     /// the highest lexical BlockId (our consensus rule).
@@ -330,7 +345,7 @@ impl EcCommitChain {
         parent: BlockId,
         block_time: EcTime,
         current_time: EcTime,
-        confirmed_by_block: BlockId,
+        _confirmed_by_block: BlockId,
     ) {
         self.shadow_token_mappings
             .entry(token)
@@ -338,23 +353,22 @@ impl EcCommitChain {
                 // Shadow exists - check if this is a sequential update, confirmation, or conflict
                 if block_time > shadow.time {
                     // This is a newer sequential update (e.g., A->B->C)
-                    // Update to the latest mapping and reset first_seen
+                    // Update to the latest mapping and reset first_seen and count
                     shadow.block = block;
                     shadow.parent = parent;
                     shadow.time = block_time;
                     shadow.first_seen = current_time; // Reset age for new update
-                    shadow.confirmed_by_blocks.clear();
-                    shadow.confirmed_by_blocks.insert(confirmed_by_block);
+                    shadow.confirmation_count = 1; // Reset count for new mapping
                 } else if block_time == shadow.time {
                     if block == shadow.block {
-                        // Same mapping - just add confirmation
-                        shadow.confirmed_by_blocks.insert(confirmed_by_block);
+                        // Same mapping - increment confirmation count
+                        shadow.confirmation_count += 1;
                     } else if block > shadow.block {
                         // CONFLICT: Different block at same time - pick highest lexical BlockId
                         shadow.block = block;
                         shadow.parent = parent;
-                        // Keep same time and first_seen
-                        shadow.confirmed_by_blocks.insert(confirmed_by_block);
+                        // Keep same time and first_seen, reset count
+                        shadow.confirmation_count = 1;
                     }
                     // If block < shadow.block, ignore it (we already have higher BlockId)
                 }
@@ -362,16 +376,13 @@ impl EcCommitChain {
             })
             .or_insert_with(|| {
                 // Create new shadow mapping
-                let mut confirmed_by_blocks = HashSet::new();
-                confirmed_by_blocks.insert(confirmed_by_block);
-
                 ShadowTokenMapping {
                     token,
                     block,
                     parent,
                     time: block_time,
                     first_seen: current_time,
-                    confirmed_by_blocks,
+                    confirmation_count: 1,
                 }
             });
     }
@@ -405,7 +416,7 @@ impl EcCommitChain {
                     if block_backend.lookup(block_id).is_some() {
                         // Already committed - good
                         continue;
-                    } else if self.validated_blocks.contains_key(block_id) {
+                    } else if self.validated_blocks.contains(block_id) {
                         // Already validated - good
                         continue;
                     } else if self.pending_blocks.contains_key(block_id) {
@@ -491,7 +502,7 @@ impl EcCommitChain {
         true
     }
 
-    /// Validate pending blocks and move valid ones to validated_blocks
+    /// Validate pending blocks and add valid ones to validated_blocks set
     fn validate_pending_blocks(
         &mut self,
         blocks_to_validate: Vec<BlockId>,
@@ -501,8 +512,10 @@ impl EcCommitChain {
         for block_id in blocks_to_validate {
             if let Some(block) = self.pending_blocks.remove(&block_id) {
                 if self.validate_block_token_mappings(&block, block_id, token_backend, time) {
-                    // Valid - move to validated_blocks
-                    self.validated_blocks.insert(block_id, block);
+                    // Valid - add to validated_blocks set
+                    self.validated_blocks.insert(block_id);
+                    // Note: We don't need to keep the block itself anymore
+                    // The shadow already has the token mappings
                 }
                 // else: invalid - discard (will be re-requested if needed)
             }
@@ -714,14 +727,15 @@ mod tests {
 
         let commit_block = chain.create_commit_block(&mut backend, committed.clone(), time);
 
-        assert_eq!(commit_block.id, 1);
+        // ID is now random, just check it's non-zero
+        assert_ne!(commit_block.id, 0);
         assert_eq!(commit_block.previous, GENESIS_BLOCK_ID);
         assert_eq!(commit_block.time, time);
         assert_eq!(commit_block.committed_blocks, committed);
 
         // Verify it was saved
-        assert!(backend.lookup(&1).is_some());
-        assert_eq!(backend.get_head(), Some(1));
+        assert!(backend.lookup(&commit_block.id).is_some());
+        assert_eq!(backend.get_head(), Some(commit_block.id));
     }
 
     #[test]
@@ -732,24 +746,24 @@ mod tests {
 
         // Create first commit block
         let block1 = chain.create_commit_block(&mut backend, vec![1, 2], 1000);
-        assert_eq!(block1.id, 1);
+        assert_ne!(block1.id, 0);
         assert_eq!(block1.previous, GENESIS_BLOCK_ID);
 
         // Create second commit block
         let block2 = chain.create_commit_block(&mut backend, vec![3, 4], 2000);
-        assert_eq!(block2.id, 2);
-        assert_eq!(block2.previous, 1); // Points to previous
+        assert_ne!(block2.id, 0);
+        assert_eq!(block2.previous, block1.id); // Points to previous
 
         // Create third commit block
         let block3 = chain.create_commit_block(&mut backend, vec![5], 3000);
-        assert_eq!(block3.id, 3);
-        assert_eq!(block3.previous, 2); // Points to previous
+        assert_ne!(block3.id, 0);
+        assert_eq!(block3.previous, block2.id); // Points to previous
 
         // Verify chain linkage
-        assert_eq!(backend.get_head(), Some(3));
-        assert!(backend.lookup(&1).is_some());
-        assert!(backend.lookup(&2).is_some());
-        assert!(backend.lookup(&3).is_some());
+        assert_eq!(backend.get_head(), Some(block3.id));
+        assert!(backend.lookup(&block1.id).is_some());
+        assert!(backend.lookup(&block2.id).is_some());
+        assert!(backend.lookup(&block3.id).is_some());
     }
 
     #[test]
@@ -759,12 +773,12 @@ mod tests {
         let mut backend = TestBackend::new();
 
         // Create a commit block
-        chain.create_commit_block(&mut backend, vec![1, 2], 1000);
+        let block = chain.create_commit_block(&mut backend, vec![1, 2], 1000);
 
         // Query for it
-        let result = chain.handle_query_commit_block(&backend, 1);
+        let result = chain.handle_query_commit_block(&backend, block.id);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().id, 1);
+        assert_eq!(result.unwrap().id, block.id);
 
         // Query for non-existent block
         let result = chain.handle_query_commit_block(&backend, 999);
