@@ -64,6 +64,10 @@ path = "benches/argon2_validation_bench.rs"
 name = "argon2_single_hash_bench"
 path = "benches/argon2_single_hash_bench.rs"
 
+[[example]]
+name = "genesis_demo"
+path = "examples/genesis_demo.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"

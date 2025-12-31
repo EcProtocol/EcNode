@@ -59,6 +59,7 @@ pub mod ec_peers;
 pub mod ec_proof_of_storage;
 pub mod ec_commit_chain;
 pub mod ec_identity;
+pub mod ec_genesis;
 
 // Storage backends
 pub mod ec_memory_backend;
@@ -78,6 +79,8 @@ pub use ec_proof_of_storage::{
 };
 // Public API for peer identity generation and validation
 pub use ec_identity::{AddressConfig, PeerIdentity, Salt, SharedSecret};
+// Public API for genesis block generation
+pub use ec_genesis::{generate_genesis, GenesisConfig};
 
 // Re-export X25519 types for external use (needed for message structures)
 pub use x25519_dalek::PublicKey as X25519PublicKey;
