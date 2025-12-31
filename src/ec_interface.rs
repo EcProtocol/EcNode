@@ -564,6 +564,11 @@ pub enum Event {
         block_id: BlockId,
         from_peer: PeerId,
     },
+    /// Identity-block received from a peer
+    IdentityBlockReceived {
+        peer_id: TokenId,
+        sender: PeerId,
+    },
 }
 
 /// Trait for consuming events from the consensus system

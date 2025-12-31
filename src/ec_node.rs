@@ -79,6 +79,8 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
     }
 
     /**
+     * TODO move all this into an ec_orchestrator. A module to control "ticks" and to collect and schedule messages
+     * 
      * TODO
      * Here we need to see all at least vote-for tokens - such that conflicts can be detected.
      * In case of competing (possitive) updates to a token we vote for "higest" block_id.
@@ -251,6 +253,31 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             IF trusted peer - start voting AND request block
             ELSE IF subscribed peer -> request block
     */
+
+    /// Validate an identity-block (test mode)
+    ///
+    /// In test mode, validation is minimal:
+    /// - Must have at least 2 tokens (peer-id + salt)
+    /// - First token should be the peer-id
+    /// - First token must be genesis (last == 0)
+    fn validate_identity_block_test(&self, block: &Block, _sender: PeerId) -> bool {
+        // 1. Must have at least 2 tokens (peer-id + salt)
+        if block.used < 2 {
+            log::warn!("Identity-block rejected: insufficient tokens (need at least 2, got {})", block.used);
+            return false;
+        }
+
+        // 2. GENESIS REQUIREMENT: Must be new peer-id
+        if block.parts[0].last != 0 {
+            log::warn!("Identity-block rejected: not genesis (last = {})", block.parts[0].last);
+            return false;
+        }
+
+        // 3. In test mode, we just accept it if it has the right structure
+        // Production mode will add PoW validation here
+        true
+    }
+
     pub fn handle_message(&mut self, msg: &MessageEnvelope, responses: &mut Vec<MessageEnvelope>) {
         match &msg.message {
             Message::Vote {
@@ -472,8 +499,29 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             Message::Block { block } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
                 let mut block_was_useful = false;
+                let mut is_identity_block = false;
 
-                if msg.ticket == self.block_req_ticket ^ block.id
+                // Special case: Identity-block (zero-ticket)
+                if msg.ticket == 0 {
+                    if self.validate_identity_block_test(&block, msg.sender) {
+                        // Submit to mempool like normal blocks
+                        if self.mem_pool.block(block, self.time) {
+                            block_was_useful = true;
+                            is_identity_block = true;
+
+                            self.event_sink.log(
+                                self.time,
+                                self.peer_id,
+                                Event::IdentityBlockReceived {
+                                    peer_id: block.parts[0].token,
+                                    sender: msg.sender,
+                                },
+                            );
+                        }
+                    } else {
+                        log::warn!("Invalid identity-block received from peer {}", msg.sender);
+                    }
+                } else if msg.ticket == self.block_req_ticket ^ block.id
                     || msg.ticket == self.parent_block_req_ticket ^ block.id
                 {
                     // Block request from mempool
@@ -505,8 +553,9 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                 }
 
                 // If the peer provided us with a useful block, add them as Identified
-                // This helps with peer discovery - any peer that can help us is worth knowing
-                if block_was_useful {
+                // EXCEPT for identity-blocks (ticket=0), which should not grant trust
+                // This prevents abuse where nodes spam identity-blocks to gain Identified status
+                if block_was_useful && !is_identity_block {
                     self.peers.add_identified_peer(msg.sender, self.time);
                 }
             }
