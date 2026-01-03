@@ -201,19 +201,16 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
         };
 
         // Convert commit chain actions to message envelopes
-        for action in sync_actions {
-            use crate::ec_commit_chain::CommitChainAction;
-            match action {
-                CommitChainAction::QueryBlock {
+        for (receiver, tick_message) in sync_actions {
+            use crate::ec_commit_chain::TickMessage;
+            match tick_message {
+                TickMessage::QueryBlock {
                     block_id,
                     ticket,
                 } => {
-                    // Use ec_peers to find a host for the block instead of the receiver
-                    // This spreads load across the network and helps with discovery
-                    let target = self.peers.peer_for(&block_id, self.time);
                     responses.push(MessageEnvelope {
                         sender: self.peer_id,
-                        receiver: target,
+                        receiver,
                         ticket,
                         time: self.time,
                         message: Message::QueryBlock {
@@ -223,8 +220,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                         },
                     });
                 }
-                CommitChainAction::QueryCommitBlock {
-                    receiver,
+                TickMessage::QueryCommitBlock {
                     block_id,
                     ticket,
                 } => {

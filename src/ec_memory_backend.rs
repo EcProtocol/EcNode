@@ -405,10 +405,12 @@ impl MemoryBackend {
 
     /// Create a new memory backend for a specific peer
     pub fn new_with_peer_id(peer_id: PeerId) -> Self {
+        // Full range initially (will be updated by ec_peers as network evolves)
+        let my_range = crate::ec_peers::PeerRange::new(0, u64::MAX);
         Self {
             tokens: MemTokens::new(),
             blocks: MemBlocks::new(),
-            commit_chain: EcCommitChain::new(peer_id, CommitChainConfig::default()),
+            commit_chain: EcCommitChain::new(peer_id, my_range, CommitChainConfig::default()),
             commit_chain_backend: MemCommitChain::new(),
             peer_id,
         }
@@ -571,17 +573,23 @@ impl EcBlocks for MemoryBackend {
 // Implement EcCommitChainAccess for MemoryBackend
 impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
     fn get_commit_chain_head(&self) -> Option<CommitBlockId> {
-        self.commit_chain.get_head(&self.commit_chain_backend)
+        self.commit_chain_backend.get_head()
     }
 
     fn query_commit_block(&self, block_id: CommitBlockId) -> Option<CommitBlock> {
-        self.commit_chain
-            .handle_query_commit_block(&self.commit_chain_backend, block_id)
+        self.commit_chain_backend.lookup(&block_id)
     }
 
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket, current_time: EcTime) -> Option<crate::ec_interface::ParentBlockRequest> {
-        self.commit_chain
-            .handle_commit_block(block, sender, ticket, current_time)
+    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket, _current_time: EcTime) -> Option<crate::ec_interface::ParentBlockRequest> {
+        // handle_commit_block expects &dyn EcBlocks as the last parameter
+        let accepted = self.commit_chain
+            .handle_commit_block(block, sender, ticket, &self.blocks);
+        // Return None since we don't implement parent block requests yet
+        if accepted {
+            None
+        } else {
+            None
+        }
     }
 
     fn handle_block(&mut self, block: crate::ec_interface::Block, ticket: crate::ec_interface::MessageTicket) -> bool {
@@ -593,35 +601,22 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
         &mut self,
         peers: &crate::ec_peers::EcPeers,
         time: EcTime,
-    ) -> Vec<crate::ec_commit_chain::CommitChainAction> {
-        // Temporarily take ownership to avoid borrow conflicts
+    ) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)> {
+        // Temporarily move commit_chain out to avoid borrow conflicts
+        // (tick needs mutable access to both commit_chain and storage)
+        let my_range = crate::ec_peers::PeerRange::new(0, u64::MAX);
         let mut commit_chain = std::mem::replace(
             &mut self.commit_chain,
-            EcCommitChain::new(0, Default::default()), // Placeholder
-        );
-        let mut commit_chain_backend = std::mem::replace(
-            &mut self.commit_chain_backend,
-            Default::default(), // Placeholder
+            EcCommitChain::new(0, my_range, CommitChainConfig::default()),
         );
 
-        let (actions, maybe_commit_block) = commit_chain.tick(
-            &commit_chain_backend,
-            self,
-            peers,
-            time,
-        );
+        // Call tick with self as storage
+        let messages = commit_chain.tick(peers, self, time);
 
-        // If a commit block was created, save it
-        if let Some(commit_block) = maybe_commit_block {
-            commit_chain_backend.save(&commit_block);
-            commit_chain_backend.set_head(&commit_block.id);
-        }
-
-        // Restore ownership
+        // Restore commit_chain
         self.commit_chain = commit_chain;
-        self.commit_chain_backend = commit_chain_backend;
 
-        actions
+        messages
     }
 }
 

@@ -432,8 +432,8 @@ pub trait EcCommitChainAccess {
     /// * `time` - Current time
     ///
     /// # Returns
-    /// List of actions for ec_node to convert to messages
-    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<crate::ec_commit_chain::CommitChainAction>;
+    /// List of (peer_id, message) tuples for ec_node to convert to messages
+    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)>;
 }
 
 // ============================================================================
