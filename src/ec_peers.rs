@@ -410,6 +410,11 @@ pub struct PeerRange {
 }
 
 impl PeerRange {
+    /// Create a new PeerRange
+    pub fn new(low: PeerId, high: PeerId) -> Self {
+        Self { low, high }
+    }
+
     pub fn in_range(&self, key: &TokenId) -> bool {
         if self.low < self.high {
             *key >= self.low && *key <= self.high
@@ -461,6 +466,48 @@ impl EcPeers {
         candidates.into_iter().take(count).collect()
     }
 
+    /// Check if a peer is active (Pending or Connected)
+    pub fn is_active(&self, peer_id: &PeerId) -> bool {
+        self.peers.get(peer_id)
+            .map(|peer| peer.state.is_pending() || peer.state.is_connected())
+            .unwrap_or(false)
+    }
+
+    /// Find closest active peers (Pending or Connected) to a target
+    pub fn find_closest_active_peers(&self, target: TokenId, count: usize) -> Vec<PeerId> {
+        let mut candidates = Vec::new();
+
+        // Walk forward from target (including target)
+        let forward: Vec<_> = self.peers.range(target..)
+            .filter(|(_, peer)| peer.state.is_pending() || peer.state.is_connected())
+            .take(count)
+            .map(|(id, _)| *id)
+            .collect();
+
+        // Walk backward from target (excluding target)
+        let backward: Vec<_> = self.peers.range(..target)
+            .rev()
+            .filter(|(_, peer)| peer.state.is_pending() || peer.state.is_connected())
+            .take(count)
+            .map(|(id, _)| *id)
+            .collect();
+
+        // Collect all candidates
+        candidates.extend(forward);
+        candidates.extend(backward);
+
+        // Sort by distance from target
+        candidates.sort_by_key(|&p| Self::ring_distance(p, target));
+
+        // Return closest N
+        candidates.into_iter().take(count).collect()
+    }
+
+    /// Get commit chain head for a peer
+    pub fn get_commit_chain_head(&self, peer_id: &PeerId) -> Option<crate::ec_interface::CommitBlockId> {
+        self.peers.get(peer_id)
+            .and_then(|peer| peer.commit_chain_head)
+    }
 
     // ========================================================================
     // Legacy Helper Methods (backward compatibility)
