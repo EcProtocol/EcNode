@@ -11,6 +11,23 @@ pub type EcTime = u64;
 pub type MessageTicket = u64;
 
 // ============================================================================
+// Ticket System - Block Use Cases
+// ============================================================================
+
+/// Use cases for block requests - each gets a unique secret for routing isolation
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
+pub enum BlockUseCase {
+    /// Regular block requests from mempool
+    MempoolBlock,
+    /// Parent block lookups for chain validation
+    ParentBlock,
+    /// Commit chain sync blocks
+    CommitChain,
+    /// Generic validation requests
+    ValidateWith,
+}
+
+// ============================================================================
 // FUTURE REFACTOR: TokenId vs TokenHash Indirection
 // ============================================================================
 //

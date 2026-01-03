@@ -2,12 +2,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ec_interface::{
-    BatchedBackend, Block, BlockId, EcBlocks, EcCommitChainAccess, EcTime, EcTokens, Event,
+    BatchedBackend, Block, BlockId, BlockUseCase, EcBlocks, EcCommitChainAccess, EcTime, EcTokens, Event,
     EventSink, Message, MessageEnvelope, MessageTicket, NoOpSink, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
 use crate::ec_peers::{EcPeers, PeerAction};
 use crate::ec_proof_of_storage::TokenStorageBackend;
+use crate::ec_ticket_manager::TicketManager;
 
 use crate::ec_mempool::MessageRequest;
 
@@ -21,8 +22,7 @@ pub struct EcNode<
     mem_pool: EcMemPool,
     peer_id: PeerId,
     time: EcTime,
-    block_req_ticket: MessageTicket,
-    parent_block_req_ticket: MessageTicket,
+    ticket_manager: TicketManager,
     event_sink: Box<dyn EventSink>,
     rng: rand::rngs::StdRng,
 }
@@ -51,8 +51,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             peers: EcPeers::new(id),
             peer_id: id,
             time,
-            block_req_ticket: 2, // TODO shuffle
-            parent_block_req_ticket: 3,
+            ticket_manager: TicketManager::new(100), // 100 tick rotation period for simulation
             event_sink,
             rng,
         }
@@ -96,6 +95,9 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
      */
     pub fn tick(&mut self, responses: &mut Vec<MessageEnvelope>) {
         self.time += 1;
+
+        // Rotate ticket secrets if needed
+        self.ticket_manager.tick(self.time);
 
         // Process mempool in phases
         let mut messages = {
@@ -178,7 +180,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     } else {
                         let peer_id = self.peers.peer_for(&parent_id, self.time);
 
-                        responses.push(self.request_block(&peer_id, &block_id, 0))
+                        responses.push(self.request_block(&peer_id, &block_id, BlockUseCase::ValidateWith))
                     }
                 }
                 MessageRequest::MissingParent(block_id) => {
@@ -187,7 +189,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     responses.push(self.request_block(
                         &peer_id,
                         &block_id,
-                        self.parent_block_req_ticket,
+                        BlockUseCase::ParentBlock,
                     ))
                 }
             }
@@ -318,7 +320,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                         responses.push(self.request_block(
                             &msg.sender,
                             block,
-                            self.block_req_ticket,
+                            BlockUseCase::MempoolBlock,
                         ))
                     }
                     (None, None) => {
@@ -327,7 +329,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                             responses.push(self.request_block(
                                 &msg.sender,
                                 block,
-                                self.block_req_ticket,
+                                BlockUseCase::MempoolBlock,
                             ))
                         }
 
@@ -517,35 +519,45 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
                     } else {
                         log::warn!("Invalid identity-block received from peer {}", msg.sender);
                     }
-                } else if msg.ticket == self.block_req_ticket ^ block.id
-                    || msg.ticket == self.parent_block_req_ticket ^ block.id
-                {
-                    // Block request from mempool
-                    if self.mem_pool.block(block, self.time) {
-                        // TODO DOS-protection: Balance creations of entries from peers/clients
-                        block_was_useful = true;
+                } else if let Some(use_case) = self.ticket_manager.validate_ticket(msg.ticket, block.id) {
+                    // Ticket is valid - route based on use case
+                    match use_case {
+                        BlockUseCase::MempoolBlock | BlockUseCase::ParentBlock => {
+                            // Block request from mempool
+                            if self.mem_pool.block(block, self.time) {
+                                // TODO DOS-protection: Balance creations of entries from peers/clients
+                                block_was_useful = true;
 
-                        self.event_sink.log(
-                            self.time,
-                            self.peer_id,
-                            Event::BlockReceived {
-                                block_id: block.id,
-                                peer: msg.sender,
-                                size: block.used,
-                            },
-                        );
+                                self.event_sink.log(
+                                    self.time,
+                                    self.peer_id,
+                                    Event::BlockReceived {
+                                        block_id: block.id,
+                                        peer: msg.sender,
+                                        size: block.used,
+                                    },
+                                );
+                            }
+                        }
+                        BlockUseCase::CommitChain => {
+                            // Commit chain block - delegate to backend
+                            let mut backend = self.backend.borrow_mut();
+                            if backend.handle_block(block.clone(), msg.ticket) {
+                                block_was_useful = true;
+                            }
+                        }
+                        BlockUseCase::ValidateWith => {
+                            // Validation request - delegate to mempool
+                            self.mem_pool.validate_with(block, &msg.ticket)
+                        }
                     }
                 } else {
-                    // Try commit chain first (it verifies ticket internally)
-                    let mut backend = self.backend.borrow_mut();
-                    if backend.handle_block(block.clone(), msg.ticket) {
-                        // Block was accepted by commit chain - ticket was valid
-                        block_was_useful = true;
-                    } else {
-                        // Not a commit chain block - try validate_with for other requests
-                        drop(backend); // Release borrow before calling mempool
-                        self.mem_pool.validate_with(block, &msg.ticket)
-                    }
+                    // Invalid ticket - reject the block
+                    log::debug!(
+                        "Rejected block {} from peer {} - invalid ticket",
+                        block.id,
+                        msg.sender
+                    );
                 }
 
                 // If the peer provided us with a useful block, add them as Identified
@@ -557,23 +569,24 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             }
             Message::Referral { token, high, low } => {
                 // TODO basic common block-validation (like SHA of content match block.id)
-                if msg.ticket == self.block_req_ticket ^ token
-                    || msg.ticket == self.parent_block_req_ticket ^ token
-                {
-                    // TODO psudo random - inject common random
-                    let receiver = if (msg.ticket ^ msg.time) & 1 == 0 {low} else {high};
+                if let Some(use_case) = self.ticket_manager.validate_ticket(msg.ticket, *token) {
+                    // Valid ticket for MempoolBlock or ParentBlock requests
+                    if matches!(use_case, BlockUseCase::MempoolBlock | BlockUseCase::ParentBlock) {
+                        // TODO psudo random - inject common random
+                        let receiver = if (msg.ticket ^ msg.time) & 1 == 0 {low} else {high};
 
-                    responses.push(MessageEnvelope {
-                        sender: self.peer_id,
-                        receiver: *receiver,
-                        ticket: 0,
-                        time: self.time,
-                        message: Message::QueryBlock {
-                            block_id: *token,
-                            target: 0,
-                            ticket: msg.ticket,
-                        },
-                    });
+                        responses.push(MessageEnvelope {
+                            sender: self.peer_id,
+                            receiver: *receiver,
+                            ticket: 0,
+                            time: self.time,
+                            message: Message::QueryBlock {
+                                block_id: *token,
+                                target: 0,
+                                ticket: msg.ticket,
+                            },
+                        });
+                    }
                 } else if let Some(_peer_action) = self.peers
                             .handle_referral(msg.ticket, *token, [*high, *low], msg.sender, self.time) {
                     // Referral handled by peer manager
@@ -634,8 +647,10 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
         &self,
         receiver: &PeerId,
         block: &BlockId,
-        ticket: MessageTicket,
+        use_case: BlockUseCase,
     ) -> MessageEnvelope {
+        let ticket = self.ticket_manager.generate_ticket(*block, use_case);
+
         MessageEnvelope {
             sender: self.peer_id,
             receiver: *receiver,
@@ -644,7 +659,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             message: Message::QueryBlock {
                 block_id: *block,
                 target: 0,
-                ticket: ticket ^ block, // TODO calc ticket with SHA
+                ticket,
             },
         }
     }

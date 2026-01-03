@@ -60,6 +60,7 @@ pub mod ec_proof_of_storage;
 pub mod ec_commit_chain;
 pub mod ec_identity;
 pub mod ec_genesis;
+pub mod ec_ticket_manager;
 
 // Storage backends
 pub mod ec_memory_backend;

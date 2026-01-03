@@ -155,6 +155,9 @@ impl EcCommitChain {
     // ========================================================================
     // Ticket Generation & Verification
     // ========================================================================
+    //
+    // Note: These tickets are for QueryCommitBlock/CommitBlock messages only.
+    // Regular Block messages use the unified TicketManager in ec_node.rs.
 
     fn generate_ticket(&self, id: u64) -> MessageTicket {
         let combined = id.wrapping_add(self.ticket_secret);
@@ -456,11 +459,9 @@ impl EcCommitChain {
     ///
     /// Note: apply_block_to_shadow happens in process_peer_logs, not here.
     /// This allows the peer-chain to be counted as a confirmation.
-    pub fn handle_block(&mut self, block: Block, ticket: MessageTicket) -> bool {
-        // Verify ticket
-        if !self.verify_ticket(block.id, ticket) {
-            return false;
-        }
+    pub fn handle_block(&mut self, block: Block, _ticket: MessageTicket) -> bool {
+        // Note: Ticket validation is now handled by TicketManager in ec_node.rs
+        // This method is only called after ticket has been validated
 
         // Just store in shared pool
         // Will be applied to shadow in process_peer_logs
