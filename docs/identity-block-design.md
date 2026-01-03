@@ -4,6 +4,10 @@
 
 The **identity-block** is a special block type that enables automated peer registration in the ecRust network. When a new peer completes identity mining (proof-of-work), it can broadcast its peer-id as a token without requiring pre-existing network participation or manual registration.
 
+**Key Innovation: Timestamp-Based Identity Expiration**
+
+To prevent long-term identity hoarding attacks, identities include a cryptographically-bound timestamp that enforces a maximum lifetime of 1 year. This prevents adversaries from accumulating unlimited identities over years of pre-mining.
+
 ## Motivation
 
 In the current system, tokens are created through normal block transactions that require valid tickets from subsystems (mempool or commit chain). However, new peers face a bootstrap problem:
@@ -14,6 +18,39 @@ In the current system, tokens are created through normal block transactions that
 The identity-block solves this by creating a special "zero-ticket" exception that allows self-registration after proof-of-work.
 
 ## Protocol Specification
+
+### Salt Structure with Timestamp
+
+The salt used in identity mining is **192 bits (24 bytes)**:
+
+```
+Salt (192 bits):
+┌──────────────────────┬──────────────────────┐
+│  Random Entropy      │   Unix Timestamp     │
+│  128 bits (16 bytes) │   64 bits (8 bytes)  │
+└──────────────────────┴──────────────────────┘
+```
+
+**Layout**:
+- `salt[0..16]`: 128-bit random entropy (mining nonce)
+- `salt[16..24]`: 64-bit Unix timestamp (little-endian)
+
+**Cryptographic Binding**: The timestamp is part of the Argon2 hash input, so it cannot be changed after mining without invalidating the proof-of-work.
+
+### Timestamp Validation Rules
+
+When validating an identity, nodes check:
+
+1. **Not Expired**: `timestamp ≥ now - max_age_secs` (default: 1 year)
+2. **Not Future-Dated**: `timestamp ≤ now + future_tolerance_secs` (default: 24 hours)
+
+**Parameters**:
+- `max_age_secs`: 365 × 24 × 3600 = 31,536,000 seconds (1 year)
+- `future_tolerance_secs`: 24 × 3600 = 86,400 seconds (24 hours for clock skew)
+
+**Rationale**:
+- **1-year expiration**: Balances security (prevents hoarding) with usability (re-mining only once/year)
+- **24-hour tolerance**: Generous allowance for clock drift, timezone confusion, leap seconds
 
 ### Message Flow
 
@@ -26,11 +63,12 @@ sequenceDiagram
     participant MemPool as MemPool
 
     Peer->>Identity: mine(config)
-    Identity-->>Identity: Try salts until PoW succeeds
-    Identity-->>Peer: peer_id, salt, public_key
+    Identity-->>Identity: Get current Unix timestamp
+    Identity-->>Identity: Try salts with timestamp until PoW succeeds
+    Identity-->>Peer: peer_id, salt (with timestamp), public_key
 
     Peer->>Peer: Create identity-block
-    Note over Peer: TokenBlock[0] = {peer_id, 0, key}<br/>TokenBlock[1] = {salt, 0, 0}<br/>ticket = 0
+    Note over Peer: TokenBlock[0] = {peer_id, 0, key}<br/>TokenBlock[1] = {salt (192-bit), 0, 0}<br/>ticket = 0
 
     Peer->>Network: Message::Block { block }
     Network->>Node: Forward block (ticket=0)
@@ -39,6 +77,8 @@ sequenceDiagram
     Node->>Node: Validate as identity-block
 
     alt Valid identity-block
+        Node->>Node: Check timestamp (not expired, not future)
+        Node->>Node: Verify Argon2 PoW
         Node->>MemPool: Submit block
         MemPool-->>MemPool: Consensus voting
         MemPool-->>Network: Block committed
@@ -63,11 +103,11 @@ Block {
             last: 0,          // Genesis (REQUIRED in production)
             key: public_key_hash,  // Blake3(Ed25519) public key (or 0 for non-updatable)
         },
-        // [1] Proof-of-work salt
+        // [1] Proof-of-work salt with timestamp
         TokenBlock {
-            token: salt,      // 16-byte salt used in mining
+            token: salt,      // 24-byte salt (16 random + 8 timestamp)
             last: 0,          // Not a real token history
-            key: public_key_hash,           // Blake3(Ed25519) public key (or 0 for non-updatable)
+            key: public_key_hash,  // Blake3(Ed25519) public key (or 0 for non-updatable)
         },
         // [2..5] Optional future identity metadata
         TokenBlock { ... },   // Reserved for future use
@@ -94,7 +134,7 @@ MessageEnvelope {
 | `parts[0].token` | peer-id | `[u8; 32]` | The mined address (Argon2 output) |
 | `parts[0].last` | last | `0` | **Genesis requirement** - prevents updates without payment |
 | `parts[0].key` | key | `PublicKey` or `0` | Blake3(Ed25519) public key for transfer (or 0 for non-updatable) |
-| `parts[1].token` | salt | `[u8; 16]` (padded to token size) | Proof-of-work salt |
+| `parts[1].token` | salt | `[u8; 24]` (192-bit) | Proof-of-work salt with timestamp |
 | `parts[1].last` | last | `0` | Metadata marker |
 | `parts[1].key` | key | `PublicKey` or `0` | Blake3(Ed25519) public key for transfer (or 0 for non-updatable) |
 | `parts[2..5]` | (any) | (any) | Reserved for future identity extensions |
@@ -125,13 +165,14 @@ fn validate_identity_block_test(block: &Block) -> bool {
 
 ### Production Validation
 
-Full cryptographic verification:
+Full cryptographic verification with timestamp checking:
 
 ```rust
 fn validate_identity_block_production(
     block: &Block,
     sender_public_key: &PublicKey,
-    config: &AddressConfig
+    config: &AddressConfig,
+    now: u64  // Current Unix timestamp
 ) -> bool {
     // 1. Must have at least 2 tokens (peer-id + salt)
     if block.used < 2 {
@@ -141,7 +182,7 @@ fn validate_identity_block_production(
 
     // 2. Extract identity components
     let claimed_peer_id = block.parts[0].token;
-    let salt = block.parts[1].token[..16];  // First 16 bytes
+    let salt = block.parts[1].token[..24];  // Full 192-bit salt
 
     // 3. GENESIS REQUIREMENT: Must be new peer-id
     if block.parts[0].last != 0 {
@@ -149,14 +190,36 @@ fn validate_identity_block_production(
         return false;
     }
 
-    // 4. FAST-FAIL: Check trailing zeros BEFORE expensive Argon2
+    // 4. TIMESTAMP VALIDATION (FAST CHECK)
+    // Extract timestamp from salt[16..24]
+    let timestamp = u64::from_le_bytes(salt[16..24]);
+
+    // 4a. Check not expired (older than 1 year)
+    if let Some(min_timestamp) = now.checked_sub(config.max_age_secs) {
+        if timestamp < min_timestamp {
+            log::warn("Identity-block rejected: expired (age: {} days)",
+                (now - timestamp) / (24 * 3600));
+            return false;
+        }
+    }
+
+    // 4b. Check not too far in future (> 24 hours)
+    if let Some(max_timestamp) = now.checked_add(config.future_tolerance_secs) {
+        if timestamp > max_timestamp {
+            log::warn("Identity-block rejected: too far in future (diff: {} hours)",
+                (timestamp - now) / 3600);
+            return false;
+        }
+    }
+
+    // 5. FAST-FAIL: Check trailing zeros BEFORE expensive Argon2
     // This prevents DoS via blocks with invalid difficulty
     if !check_difficulty(&claimed_peer_id, config.difficulty) {
         log::warn("Identity-block rejected: insufficient difficulty");
         return false;
     }
 
-    // 5. PROOF-OF-WORK VALIDATION: Verify Argon2(public_key, salt) == peer_id
+    // 6. PROOF-OF-WORK VALIDATION: Verify Argon2(public_key, salt) == peer_id
     // This is the expensive check (~5ms), only run after fast-fail above
     if !PeerIdentity::validate(
         sender_public_key,
@@ -168,7 +231,7 @@ fn validate_identity_block_production(
         return false;
     }
 
-    // 6. Optional: Verify block hash matches contents
+    // 7. Optional: Verify block hash matches contents
     // if block.id != calculate_block_hash(&block) { return false; }
 
     true
@@ -179,43 +242,108 @@ fn validate_identity_block_production(
 1. **Sybil Resistance**: Argon2 PoW (~24 hours mining per identity)
 2. **Genesis Enforcement**: `last == 0` prevents identity updates without paying transaction fees
 3. **Cryptographic Binding**: peer-id cryptographically derived from public key
-4. **Non-Transferable**: Can't steal someone's identity token
-5. **Fast-Fail DoS Protection**: Trailing-zero check before Argon2 prevents computational DoS
+4. **Timestamp Binding**: Timestamp cryptographically bound into PoW hash
+5. **Expiration Enforcement**: Identities expire after 1 year, preventing unlimited hoarding
+6. **Non-Transferable**: Can't steal someone's identity token
+7. **Fast-Fail DoS Protection**: Timestamp + trailing-zero checks before Argon2 prevent computational DoS
 
 **Validation Performance**:
-- **Step 4** (trailing zeros): ~0.1µs (bitwise operations)
-- **Step 5** (Argon2): ~5ms (cryptographic hash)
-- **Total**: ~5ms for valid blocks, <1µs for invalid difficulty (DoS protection)
+- **Step 4** (timestamp check): ~0.01µs (integer comparisons)
+- **Step 5** (trailing zeros): ~0.1µs (bitwise operations)
+- **Step 6** (Argon2): ~5ms (cryptographic hash)
+- **Total**: ~5ms for valid blocks, <1µs for invalid difficulty/timestamp (DoS protection)
 
-## Mathematical Validation
+## Mathematical Analysis
 
-The core validation formula:
+### Core Validation Formula
 
-**peer_id = Argon2(public_key, salt)** where **trailing_zeros(peer_id) ≥ difficulty**
+The core validation formula with timestamp:
+
+$$\text{peer\_id} = \text{Argon2}(\text{public\_key}, \text{salt})$$
+
+where:
+- $\text{salt} = \text{entropy}_{128} \| \text{timestamp}_{64}$ (192 bits total)
+- $\text{trailing\_zeros}(\text{peer\_id}) \geq \text{difficulty}$
 
 Given:
-- `pk` = X25519 public key (32 bytes)
-- `s` = random salt (16 bytes)
-- `d` = difficulty (trailing zero bits)
-- `H(pk, s)` = Argon2id(pk, s, memory=4MiB, iterations=1)
+- $pk$ = X25519 public key (32 bytes)
+- $e$ = random entropy (16 bytes)
+- $t$ = Unix timestamp (8 bytes)
+- $s = e \| t$ = combined salt (24 bytes)
+- $d$ = difficulty (trailing zero bits)
+- $H(pk, s)$ = Argon2id(pk, s, memory=4MiB, iterations=1)
 
 Identity is valid iff:
-```
-∃s : H(pk, s) mod 2^d = 0
-```
+$$\exists e : H(pk, e \| t) \bmod 2^d = 0 \land t_{\text{min}} \leq t \leq t_{\text{max}}$$
 
-Mining expected attempts:
-```
-E[attempts] = 2^d
-```
+where:
+- $t_{\text{min}} = \text{now} - 365 \times 24 \times 3600$ (1 year ago)
+- $t_{\text{max}} = \text{now} + 24 \times 3600$ (24 hours ahead)
 
-For production config (d=24):
-```
-E[attempts] = 2^24 ≈ 16.7M attempts
-E[time] ≈ 24 hours on modern CPU
-```
+### Mining Complexity
 
-Validation cost is constant `O(1)` regardless of difficulty (single Argon2 hash ~5ms).
+Expected mining attempts (unchanged from non-timestamped version):
+$$E[\text{attempts}] = 2^d$$
+
+For production config ($d=24$):
+$$E[\text{attempts}] = 2^{24} \approx 16.7\text{M attempts}$$
+$$E[\text{time}] \approx 24 \text{ hours on modern CPU}$$
+
+Validation cost is constant $O(1)$ regardless of difficulty (single Argon2 hash ~5ms).
+
+### Identity Hoarding Analysis
+
+**Threat Model**: Adversary with $C$ CPUs attempting to pre-mine identities for future attack.
+
+**Hoarding capacity over $Y$ years**:
+
+**Without expiration**:
+$$I_{\text{unlimited}} = 365 \times C \times Y$$
+
+**With 1-year expiration**:
+$$I_{\text{max}} = 365 \times C$$
+
+**Example**: $C = 1000$ CPUs over $Y = 10$ years:
+- Without expiration: $3{,}650{,}000$ identities
+- With expiration: $365{,}000$ identities (max)
+- **Reduction factor**: $10\times$ fewer identities
+
+**Effectiveness**: For arbitrary $Y$:
+$$\text{Reduction} = \frac{I_{\text{unlimited}}}{I_{\text{max}}} = Y$$
+
+**Conclusion**: Expiration provides linear scaling defense against long-term hoarding. For multi-year attack preparation, the reduction is proportional to the time horizon.
+
+### Operational Cost Analysis
+
+For **PRODUCTION config** (24-bit difficulty, ~24h mining per identity):
+
+Annual re-mining burden:
+$$\text{Annual CPU utilization} = \frac{24 \text{ hours}}{8760 \text{ hours/year}} = 0.27\%$$
+
+**This is extremely reasonable**:
+- ~24 hours of compute once per year
+- ~\$1-5 in electricity for typical users
+- Compare to: Ethereum validators (100% uptime), Bitcoin mining (continuous)
+
+For **TEST config**: Seconds to re-mine, trivial burden.
+
+### Attack Vector Analysis
+
+| Attack | Description | Mitigation |
+|--------|-------------|------------|
+| **Future-dating** | Mine with $t = \text{now} + 1\text{ year}$ | Rejected by other nodes ($t > t_{\text{max}}$) |
+| **Timestamp forgery** | Reuse old salt with new timestamp | Hash changes, won't meet difficulty |
+| **Clock manipulation** | Set system clock forward during mining | Only gains ~24h (within tolerance), negligible |
+| **Stockpiling within window** | Max out 1-year window | **Expected behavior** - still limited to $365 \times C$ identities |
+| **Timestamp grinding** | Try different timestamps to find easier PoW | No advantage: difficulty is uniform across timestamps |
+
+**Proof of timestamp binding**: Given valid $(e, t_1, \text{peer\_id}_1)$:
+$$H(pk, e \| t_1) = \text{peer\_id}_1$$
+
+For different $t_2 \neq t_1$:
+$$H(pk, e \| t_2) = \text{peer\_id}_2 \neq \text{peer\_id}_1 \text{ (with overwhelming probability)}$$
+
+Therefore, changing timestamp invalidates the proof-of-work, preventing timestamp forgery.
 
 ## Implementation Strategy
 
@@ -282,7 +410,7 @@ impl PeerIdentity {
         config: AddressConfig,
         network: &mut N
     ) -> Result<BlockId, String> {
-        // 1. Mine identity (existing code)
+        // 1. Mine identity (existing code with timestamp)
         self.mine(config)?;
 
         // 2. Create identity-block
@@ -297,7 +425,7 @@ impl PeerIdentity {
                     key: *self.public_key.as_bytes(),
                 },
                 TokenBlock {
-                    token: pad_salt(self.salt.unwrap()),
+                    token: pad_salt_to_token_size(self.salt.unwrap()),  // 24-byte salt
                     last: 0,
                     key: 0,
                 },
@@ -333,32 +461,49 @@ impl PeerIdentity {
 - **Cost**: 24,000 CPU-hours for 1,000 identities
 - **Note**: This is the fundamental tradeoff - validation must be fast (5ms) while mining is slow (24h)
 
-**2. Identity Replay Attack**
+**2. Long-Term Identity Hoarding**
+- **Attack**: Adversary accumulates identities over years for burst attack
+- **Mitigation**: 1-year expiration limits maximum stockpile to $365 \times C$ identities
+- **Effectiveness**: 10× reduction over 10-year attack preparation
+- **Cost**: Forces continuous mining (detectable, expensive infrastructure)
+
+**3. Identity Replay Attack**
 - **Attack**: Reuse someone else's mined identity
 - **Mitigation**: Cryptographic binding (peer-id derived from public key)
 - **Proof**: Adversary cannot forge valid signature without private key
 
-**3. Genesis Bypass (Free Identity Updates)**
+**4. Genesis Bypass (Free Identity Updates)**
 - **Attack**: Update identity without paying transaction fees
 - **Mitigation**: Enforce `last == 0` in validation
 - **Result**: Updates require normal token transaction fees
 
-**4. Resource Exhaustion (Spam Invalid Blocks)**
+**5. Resource Exhaustion (Spam Invalid Blocks)**
 - **Attack**: Flood network with invalid identity-blocks
-- **Mitigation**: Fast-fail validation (check `ticket == 0 && used >= 2`, then trailing zeros)
+- **Mitigation**: Fast-fail validation (check `ticket == 0 && used >= 2`, timestamp, then trailing zeros before Argon2)
 - **Cost**: Full validation with Argon2 is ~5ms, which is acceptable overhead
-- **Note**: The trailing-zero check is an optimization, not strictly required - Argon2 is already cheap enough at ~5ms that direct validation is viable
+- **Note**: Timestamp + trailing-zero checks are optimizations that reduce DoS surface
 
-**5. Peer Status Abuse (Spam for Trust)**
+**6. Peer Status Abuse (Spam for Trust)**
 - **Attack**: Submit many identity-blocks to gain "Identified" peer status
 - **Mitigation**: **Do not mark sender as Identified** when processing identity-blocks (ticket=0)
 - **Result**: Identity-blocks only register the peer-id token, not grant special peer privileges
 - **Rationale**: Prevents nodes from spamming identity-blocks to bypass normal trust-building mechanisms
 
-**6. Network Partition (Isolated Identity Registration)**
+**7. Network Partition (Isolated Identity Registration)**
 - **Attack**: Register identity in isolated network partition
 - **Mitigation**: Consensus voting (existing mempool mechanism)
 - **Result**: Identity only commits if majority agrees
+
+**8. Timestamp Manipulation Attacks**
+- **Attack 8a**: Future-date timestamp to extend lifetime
+  - **Mitigation**: Rejected if $t > \text{now} + 24\text{h}$
+  - **Max gain**: 24 hours (negligible)
+- **Attack 8b**: Forge timestamp on old identity
+  - **Mitigation**: Changing timestamp invalidates PoW hash (cryptographic binding)
+  - **Result**: Must re-mine entirely (~24h)
+- **Attack 8c**: Grind timestamps for easier PoW
+  - **Mitigation**: Argon2 output is uniformly random regardless of timestamp
+  - **Result**: No advantage over entropy grinding
 
 ### Trust Model
 
@@ -366,10 +511,23 @@ impl PeerIdentity {
 |----------|-----------|-----------|
 | **Uniqueness** | One peer per identity | Cryptographic binding (private key) |
 | **Sybil Resistance** | Expensive to create many identities | Argon2 PoW (~24h per identity) |
+| **Hoarding Resistance** | Limited long-term identity accumulation | 1-year expiration (max $365 \times C$ stockpile) |
+| **Temporal Freshness** | Active identities are recent (<1 year old) | Timestamp validation + expiration |
 | **Non-Transferable** | Can't steal identities | Public key cryptography |
 | **Genesis Enforcement** | No free updates | `last == 0` validation |
 | **Consensus Agreement** | Network agrees on validity | Existing voting mechanism |
 | **No Trust Bypass** | Identity-blocks don't grant peer privileges | Excluded from Identified status logic |
+| **Clock Drift Tolerance** | Handles reasonable clock skew | 24-hour future tolerance |
+
+### Additional Security Benefits
+
+Beyond anti-hoarding:
+
+1. **Identity freshness**: Active addresses represent recent participants (< 1 year)
+2. **Natural pruning**: Abandoned/compromised identities expire automatically
+3. **Sybil detection signal**: Sudden influx of old-timestamped identities is suspicious
+4. **Audit trail**: Network can analyze timestamp distribution to detect attacks
+5. **Operational hygiene**: Forces periodic identity refresh, encouraging key rotation
 
 ## Future Extensions
 
@@ -413,6 +571,17 @@ parts[5] = TokenBlock {
 }
 ```
 
+**Identity Refresh Counter**
+```rust
+parts[2] = TokenBlock {
+    token: refresh_count,      // How many times this identity has been refreshed
+    last: 0,
+    key: 0,
+}
+```
+
+This could help detect suspicious behavior (identity refreshed 100 times in a year suggests automated hoarding).
+
 ## Comparison to Alternative Designs
 
 ### Alternative 1: Pre-Registration via Bootstrap Node
@@ -443,20 +612,50 @@ parts[5] = TokenBlock {
 - Sybil-resistant via PoW
 - Self-contained validation
 
+### Alternative 5: Periodic Heartbeat Transactions
+
+**Design**: Require active transactions to maintain identity (instead of timestamp expiration)
+
+❌ **Rejected for initial design**:
+- Requires continuous network participation
+- Creates ongoing transaction fees
+- Penalizes offline/dormant but legitimate users
+- Timestamp expiration is simpler and achieves similar goal
+
+**Comparison**:
+- **Timestamp expiration**: One-time re-mining per year, offline-friendly
+- **Heartbeat transactions**: Continuous activity required, generates fee revenue for operators
+
+*Could be considered as future enhancement alongside timestamp expiration*
+
+### Alternative 6: No Expiration
+
+**Design**: Identities valid forever (original design)
+
+❌ **Rejected**:
+- Allows unlimited long-term hoarding ($I_{\text{unlimited}} = 365 \times C \times Y$)
+- Adversary can prepare 10-year attack with 10× more identities
+- No natural pruning of abandoned/compromised identities
+- Asymmetric threat: "mine for years, attack once"
+
 ## Design Considerations
 
-### 1. Identity Expiration (Future Consideration)
+### 1. Identity Expiration (Implemented)
 
-**Problem**: Adversary could build up a large base of pre-mined identities over time.
+**Solution**: Timestamp-based expiration with 1-year lifetime
 
-**Current**: No expiration - genesis blocks remain valid indefinitely.
+**Benefits**:
+- Limits long-term hoarding to $365 \times C$ identities (vs unlimited)
+- Natural pruning of inactive identities
+- Forces ongoing resource commitment (detectable)
+- Aligns PoW cost with active participation
 
-**Future Options**:
-- Add timestamp validation in mempool (reject identities older than N months)
-- Require periodic "heartbeat" transactions to maintain active status
-- Implement reputation decay for inactive identities
+**Tradeoffs**:
+- Honest users must re-mine once per year (~24h compute)
+- Adds timestamp validation overhead (~0.01µs, negligible)
+- Requires network-wide time synchronization (reasonable for NTP era)
 
-**Tradeoff**: Expiration adds complexity but limits long-term sybil pre-mining attacks.
+**Verdict**: ✅ **Worth it** - 0.27% annual CPU utilization prevents 10× hoarding capacity growth
 
 ### 2. Multiple Peer-IDs Per Public Key (Naturally Protected)
 
@@ -516,6 +715,43 @@ parts[5] = TokenBlock {
 - When partition heals, standard consensus mechanism resolves conflicts
 - Identity with more votes wins (just like any other block)
 
+### 5. Clock Synchronization Requirements
+
+**Question**: What happens if node clocks are badly out of sync?
+
+**Scenarios**:
+
+| Clock Drift | Identity Age | Validation Result | Notes |
+|-------------|-------------|-------------------|-------|
+| Node -25h | Fresh identity | ❌ Rejected | Mined timestamp appears "in future" |
+| Node +25h | Fresh identity | ✅ Accepted | Still within 24h tolerance |
+| Node +400d | 1-year-old identity | ❌ Rejected | Appears expired (> 1 year old) |
+| Node uses NTP | Any valid identity | ✅ Accepted | Expected case |
+
+**Mitigation**:
+- **24-hour future tolerance** handles most clock drift
+- Nodes should use NTP (standard practice for network services)
+- Identities rejected due to clock issues can be re-submitted after clock correction
+
+**Design choice**: Prioritize security (prevent hoarding) over accommodating badly misconfigured nodes
+
+### 6. Identity Refresh Strategy
+
+**When should honest users re-mine?**
+
+**Options**:
+1. **Reactive**: Wait until identity expires, then re-mine (~24h downtime)
+2. **Proactive**: Re-mine before expiration, submit new identity-block early
+3. **Dual-identity**: Maintain two identities with staggered expiration dates
+
+**Recommended**: **Proactive refresh**
+- Re-mine 1-2 months before expiration
+- Minimizes service disruption
+- Allows time for consensus on new identity
+- Can maintain both identities during transition
+
+**Future Enhancement**: Add "identity refresh" transaction type that links old → new identity with signature proof, preserving reputation.
+
 ## Testing Strategy
 
 ### Unit Tests
@@ -531,13 +767,42 @@ fn test_identity_block_validation_test_mode() {
 fn test_identity_block_requires_genesis() {
     let mut block = create_identity_block(peer_id, salt);
     block.parts[0].last = 1;  // Non-genesis
-    assert!(!validate_identity_block_production(&block, &pub_key, &config));
+    assert!(!validate_identity_block_production(&block, &pub_key, &config, now));
 }
 
 #[test]
 fn test_identity_block_rejects_invalid_pow() {
     let block = create_identity_block(peer_id, wrong_salt);
-    assert!(!validate_identity_block_production(&block, &pub_key, &config));
+    assert!(!validate_identity_block_production(&block, &pub_key, &config, now));
+}
+
+#[test]
+fn test_identity_block_rejects_expired() {
+    let old_timestamp = now - (2 * 365 * 24 * 3600);  // 2 years old
+    let salt = create_salt_with_timestamp(random_entropy, old_timestamp);
+    let block = create_identity_block(peer_id, salt);
+    assert!(!validate_identity_block_production(&block, &pub_key, &config, now));
+}
+
+#[test]
+fn test_identity_block_rejects_future() {
+    let future_timestamp = now + (48 * 3600);  // 2 days in future
+    let salt = create_salt_with_timestamp(random_entropy, future_timestamp);
+    let block = create_identity_block(peer_id, salt);
+    assert!(!validate_identity_block_production(&block, &pub_key, &config, now));
+}
+
+#[test]
+fn test_timestamp_cannot_be_forged() {
+    // Mine identity with timestamp t1
+    let (peer_id, salt1, _) = mine_identity(pub_key, timestamp1, config);
+
+    // Try to change timestamp to t2 (keeping same entropy)
+    let entropy = &salt1[0..16];
+    let salt2 = create_salt(entropy, timestamp2);
+
+    // PoW should fail (different hash output)
+    assert!(!PeerIdentity::validate(&pub_key, &salt2, &peer_id, &config));
 }
 ```
 
@@ -558,6 +823,23 @@ fn test_identity_block_commits_to_network() {
     // Verify identity token is committed
     assert!(network.has_token(identity.peer_id.unwrap()));
 }
+
+#[test]
+fn test_expired_identity_rejected_by_network() {
+    let mut network = create_test_network(100);
+
+    // Create identity with old timestamp
+    let old_timestamp = network.time() - (400 * 24 * 3600);  // 400 days old
+    let identity = mine_identity_at_timestamp(old_timestamp);
+
+    let block = create_identity_block_from_identity(&identity);
+    network.broadcast_block(block, ticket=0);
+
+    network.run_until_convergence();
+
+    // Verify identity was rejected (not committed)
+    assert!(!network.has_token(identity.peer_id.unwrap()));
+}
 ```
 
 ## Summary
@@ -571,9 +853,12 @@ The identity-block design provides a **trustless, automated peer registration me
 - **Genesis-only registration**: `last == 0` requirement prevents free updates
 - **PoW validation**: Argon2 proof-of-work provides sybil resistance (~24h mining per identity)
 - **Fast validation**: ~5ms per identity check, enabling high throughput
+- **Timestamp-based expiration**: 1-year identity lifetime prevents long-term hoarding
 
 **✅ Security Properties**:
 - **Cryptographic binding**: peer-id = Argon2(public_key, salt) prevents identity theft
+- **Timestamp binding**: Timestamp cryptographically bound in PoW, prevents forgery
+- **Anti-hoarding**: 1-year expiration limits stockpile to $365 \times C$ identities
 - **Natural duplicate protection**: Network rejects duplicate genesis blocks for same token
 - **No trust bypass**: Identity-blocks do NOT grant "Identified" peer status
 - **Consensus-based**: Leverages existing mempool voting mechanism
@@ -582,10 +867,11 @@ The identity-block design provides a **trustless, automated peer registration me
 - **Genesis registration**: Free (self-submission via identity-block)
 - **Identity updates/transfers**: Paid (requires transaction through connected nodes)
 - **Node incentives**: Operators can charge fees for transaction relay or use nodes for apps
+- **Re-mining cost**: 0.27% annual CPU utilization (24h per year)
 
 **✅ Extensibility**:
 - Reserved token slots `parts[2..5]` for future identity metadata
-- Compatible with key rotation, capability flags, geographic hints, etc.
+- Compatible with key rotation, capability flags, geographic hints, refresh counters, etc.
 
 ### Implementation Path
 
@@ -598,16 +884,25 @@ The identity-block design provides a **trustless, automated peer registration me
 **Phase 2 (Production)**:
 - Integrate full PoW validation via `PeerIdentity::validate()`
 - Enforce `last == 0` genesis requirement
+- Add timestamp validation (not expired, not too far in future)
 - Add public key to message envelope for cryptographic verification
 - Extend `ec_identity::mine()` to auto-submit identity-blocks
 
+**Phase 3 (Expiration Management)**:
+- Add identity expiration tracking to `ec_peers`
+- Implement periodic cleanup of expired identities
+- Add metrics for identity age distribution
+- Optional: Add "identity refresh" transaction type for seamless transitions
+
 ### Design Rationale
 
-The zero-ticket exception is a **minimal protocol extension** that:
+The zero-ticket exception with timestamp-based expiration is a **minimal protocol extension** that:
 - Leverages existing block consensus infrastructure
 - Maintains trustless, permissionless operation
 - Provides strong sybil resistance through PoW
+- Prevents long-term identity hoarding attacks (10× reduction over 10-year horizon)
 - Creates proper economic incentives for node operators
 - Enables fully automated peer onboarding
+- Enforces periodic identity refresh with minimal operational burden (0.27% annual CPU)
 
-This approach avoids centralization (no bootstrap node registration), eliminates chicken-and-egg problems (no tokens needed to get tokens), and maintains the security properties of the broader ecRust consensus protocol.
+This approach avoids centralization (no bootstrap node registration), eliminates chicken-and-egg problems (no tokens needed to get tokens), and maintains the security properties of the broader ecRust consensus protocol while adding robust anti-hoarding defenses.

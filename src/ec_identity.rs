@@ -55,14 +55,15 @@ use argon2::{
     Argon2, Params, Version,
 };
 use rand::rngs::OsRng;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Peer address (256-bit identifier derived from proof-of-work)
 pub type PeerId = [u8; 32];
 
-/// Salt for Argon2 hashing (128 bits)
-pub type Salt = [u8; 16];
+/// Salt for Argon2 hashing with timestamp (192 bits)
+/// Layout: [0..16] = 128-bit random entropy, [16..24] = 64-bit Unix timestamp (little-endian)
+pub type Salt = [u8; 24];
 
 /// Shared secret from Diffie-Hellman key exchange (256 bits)
 pub type SharedSecret = [u8; 32];
@@ -78,6 +79,10 @@ pub struct AddressConfig {
     pub time_cost: u32,
     /// Argon2 parallelism
     pub parallelism: u32,
+    /// Maximum age of identity in seconds (1 year default)
+    pub max_age_secs: u64,
+    /// Future timestamp tolerance in seconds (24 hours default for clock skew)
+    pub future_tolerance_secs: u64,
 }
 
 impl AddressConfig {
@@ -88,6 +93,8 @@ impl AddressConfig {
         memory_cost: 256,     // 256 KiB
         time_cost: 1,         // 1 iteration
         parallelism: 1,       // Single thread
+        max_age_secs: 365 * 24 * 3600,      // 1 year
+        future_tolerance_secs: 24 * 3600,   // 24 hours
     };
 
     /// Production configuration: ~1 day of computation expected
@@ -116,6 +123,8 @@ impl AddressConfig {
         memory_cost: 4096,    // 4 MiB (balanced: memory-hard but fast validation)
         time_cost: 1,         // 1 iteration (validation happens frequently)
         parallelism: 1,       // Single thread
+        max_age_secs: 365 * 24 * 3600,      // 1 year
+        future_tolerance_secs: 24 * 3600,   // 24 hours
     };
 
     /// Alternative: Maximum ASIC resistance (higher memory)
@@ -127,6 +136,8 @@ impl AddressConfig {
         memory_cost: 16384,   // 16 MiB (strong memory-hardness)
         time_cost: 1,
         parallelism: 1,
+        max_age_secs: 365 * 24 * 3600,      // 1 year
+        future_tolerance_secs: 24 * 3600,   // 24 hours
     };
 
     /// Alternative: Maximum validation speed (low latency)
@@ -138,6 +149,8 @@ impl AddressConfig {
         memory_cost: 1024,    // 1 MiB (faster validation)
         time_cost: 1,
         parallelism: 1,
+        max_age_secs: 365 * 24 * 3600,      // 1 year
+        future_tolerance_secs: 24 * 3600,   // 24 hours
     };
 }
 
@@ -246,13 +259,20 @@ impl PeerIdentity {
             config.difficulty
         );
 
+        // Get current Unix timestamp for salt
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before Unix epoch")
+            .as_secs();
+
         // Try different salts until we find one that meets the difficulty requirement
         loop {
             attempts += 1;
 
-            // Generate random salt (this is what we're mining)
-            let mut salt = [0u8; 16];
-            rand::Rng::fill(&mut OsRng, &mut salt);
+            // Generate random salt (192 bits: 128 random + 64 timestamp)
+            let mut salt = [0u8; 24];
+            rand::Rng::fill(&mut OsRng, &mut salt[0..16]);  // Random entropy
+            salt[16..24].copy_from_slice(&timestamp.to_le_bytes());  // Unix timestamp
 
             // Hash the public key with Argon2 and this salt
             if let Ok(hash) = hash_public_key(&self.public_key, &salt, &config) {
@@ -300,13 +320,75 @@ impl PeerIdentity {
         self.salt.as_ref()
     }
 
+    /// Extract Unix timestamp from salt
+    ///
+    /// The timestamp is stored in the last 8 bytes of the 24-byte salt (little-endian).
+    pub fn extract_timestamp(salt: &Salt) -> u64 {
+        u64::from_le_bytes(salt[16..24].try_into().expect("Salt timestamp extraction"))
+    }
+
+    /// Validate timestamp is within acceptable range
+    ///
+    /// Returns true if:
+    /// - Timestamp is not more than `max_age_secs` in the past
+    /// - Timestamp is not more than `future_tolerance_secs` in the future
+    ///
+    /// This prevents:
+    /// - Identity hoarding (long-term pre-mining of identities)
+    /// - Timestamp forgery (future-dated timestamps)
+    pub fn validate_timestamp(salt: &Salt, config: &AddressConfig, now: u64) -> bool {
+        let timestamp = Self::extract_timestamp(salt);
+
+        // Check if timestamp is too old
+        if let Some(min_timestamp) = now.checked_sub(config.max_age_secs) {
+            if timestamp < min_timestamp {
+                log::warn!(
+                    "Identity timestamp too old: {} (min: {}, age: {} days)",
+                    timestamp,
+                    min_timestamp,
+                    (now - timestamp) / (24 * 3600)
+                );
+                return false;
+            }
+        }
+
+        // Check if timestamp is too far in the future
+        if let Some(max_timestamp) = now.checked_add(config.future_tolerance_secs) {
+            if timestamp > max_timestamp {
+                log::warn!(
+                    "Identity timestamp too far in future: {} (max: {}, diff: {} hours)",
+                    timestamp,
+                    max_timestamp,
+                    (timestamp - now) / 3600
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Validate that a peer-id is correctly derived from the public key and salt
+    ///
+    /// This performs both:
+    /// 1. Timestamp validation (not expired, not too far in future)
+    /// 2. Proof-of-work validation (Argon2 hash meets difficulty)
     pub fn validate(
         public_key: &PublicKey,
         salt: &Salt,
         peer_id: &PeerId,
         config: &AddressConfig,
     ) -> bool {
+        // Get current time for timestamp validation
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before Unix epoch")
+            .as_secs();
+
+        // Validate timestamp first (fast check before expensive Argon2)
+        if !Self::validate_timestamp(salt, config, now) {
+            return false;
+        }
         // Re-compute the hash
         match hash_public_key(public_key, salt, config) {
             Ok(computed_hash) => {
@@ -481,7 +563,7 @@ mod tests {
         identity.mine(AddressConfig::TEST);
 
         // Wrong salt should fail validation
-        let wrong_salt = [0xFF; 16];
+        let wrong_salt = [0xFF; 24];
         assert!(!PeerIdentity::validate(
             &identity.public_key,
             &wrong_salt,
@@ -556,5 +638,106 @@ mod tests {
         assert!(identity.is_mined());
         assert!(identity.peer_id().is_some());
         assert!(identity.salt().is_some());
+    }
+
+    #[test]
+    fn test_timestamp_extraction() {
+        let mut identity = PeerIdentity::new();
+        identity.mine(AddressConfig::TEST);
+
+        let salt = identity.salt().unwrap();
+        let timestamp = PeerIdentity::extract_timestamp(salt);
+
+        // Timestamp should be recent (within last hour)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(timestamp <= now);
+        assert!(now - timestamp < 3600); // Less than 1 hour old
+    }
+
+    #[test]
+    fn test_timestamp_validation_rejects_old() {
+        let mut salt = [0u8; 24];
+        rand::Rng::fill(&mut OsRng, &mut salt[0..16]);
+
+        // Create timestamp from 2 years ago
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old_timestamp = now - (2 * 365 * 24 * 3600);
+        salt[16..24].copy_from_slice(&old_timestamp.to_le_bytes());
+
+        // Should be rejected (max age is 1 year)
+        assert!(!PeerIdentity::validate_timestamp(
+            &salt,
+            &AddressConfig::TEST,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_timestamp_validation_rejects_future() {
+        let mut salt = [0u8; 24];
+        rand::Rng::fill(&mut OsRng, &mut salt[0..16]);
+
+        // Create timestamp 2 days in the future
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let future_timestamp = now + (2 * 24 * 3600);
+        salt[16..24].copy_from_slice(&future_timestamp.to_le_bytes());
+
+        // Should be rejected (tolerance is 24 hours)
+        assert!(!PeerIdentity::validate_timestamp(
+            &salt,
+            &AddressConfig::TEST,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_timestamp_validation_accepts_recent() {
+        let mut salt = [0u8; 24];
+        rand::Rng::fill(&mut OsRng, &mut salt[0..16]);
+
+        // Create timestamp from 1 hour ago
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent_timestamp = now - 3600;
+        salt[16..24].copy_from_slice(&recent_timestamp.to_le_bytes());
+
+        // Should be accepted
+        assert!(PeerIdentity::validate_timestamp(
+            &salt,
+            &AddressConfig::TEST,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_timestamp_validation_accepts_within_tolerance() {
+        let mut salt = [0u8; 24];
+        rand::Rng::fill(&mut OsRng, &mut salt[0..16]);
+
+        // Create timestamp 12 hours in the future (within 24h tolerance)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let future_timestamp = now + (12 * 3600);
+        salt[16..24].copy_from_slice(&future_timestamp.to_le_bytes());
+
+        // Should be accepted
+        assert!(PeerIdentity::validate_timestamp(
+            &salt,
+            &AddressConfig::TEST,
+            now
+        ));
     }
 }

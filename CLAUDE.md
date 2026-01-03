@@ -13,7 +13,7 @@ WHen asked to make design documents DO NOT include any work schedule or rollout 
 
 Diagrams should be in "mermaid".
 
-Formulas should use UNICODE formatting.
+Formulas should use Latex formatting.
 
 ## Core Architecture
 
