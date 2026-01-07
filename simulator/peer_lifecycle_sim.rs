@@ -22,8 +22,8 @@ fn main() {
     let mut config = PeerLifecycleConfig::default();
 
     // Lower consensus thresholds for testing (easier to reach consensus with fewer Answers)
-    config.peer_config.election_config.majority_threshold = 0.1; // 10% instead of 60%
-    config.peer_config.election_config.consensus_threshold = 6; // 6/10 instead of 8/10
+    config.peer_config.election_config.majority_threshold = 0.6; // 10% instead of 60%
+    config.peer_config.election_config.consensus_threshold = 8; // 6/10 instead of 8/10
 
     // Customize for test
     config.rounds = 200;
@@ -51,6 +51,8 @@ fn main() {
         total_tokens: 100_000,    // 100K tokens + peer IDs automatically injected
         neighbor_overlap: 10,      // Overlap with 10 neighbors on each side (gives ~12 nearby)
         coverage_fraction: 0.9,    // Know 90% of nearby tokens (high quality)
+        genesis_config: None,
+        genesis_storage_fraction: 0.0
     };
     config.metrics.sample_interval = 10;
 

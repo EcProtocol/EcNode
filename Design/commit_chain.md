@@ -377,10 +377,6 @@ For a peer with range covering `R` tokens:
 ## Future Enhancements
 
 1. **Adaptive Peer Selection**: Choose peers based on network regions for better fault tolerance
-2. **Parallel Block Fetching**: Request blocks from multiple peers simultaneously
-3. **Checkpoint System**: Periodic signed checkpoints for faster bootstrap
-4. **Pruning**: Archive old CommitBlocks beyond retention period
-5. **Compression**: Delta-encode CommitBlocks for bandwidth efficiency
 
 ## Implementation Status
 

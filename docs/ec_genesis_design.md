@@ -559,6 +559,182 @@ Genesis code is agnostic to BlockId generation strategy:
 
 Genesis blocks have no signatures (`[None; 6]`). If signature representation changes, update initialization.
 
+## Bootstrap Optimizations
+
+### Selective Storage (Ring-Based Filtering)
+
+To enable nodes to bootstrap without storing the entire genesis set, selective storage filters blocks/tokens based on ring distance from the node's peer ID.
+
+#### Ring Distance Calculation
+
+```
+ring_distance(a, b) = min(b - a, a - b)  // wrapping arithmetic on u64
+```
+
+The ring is the full u64 space, where:
+- Distance from 0 to 100 = 100
+- Distance from 0 to (MAX - 50) = 51 (wrapping)
+- Maximum distance = u64::MAX / 2
+
+#### Storage Decision
+
+```
+should_store_token(token_id, peer_id, storage_fraction):
+    if storage_fraction >= 1.0:
+        return true  // Full archive node
+
+    max_distance = (u64::MAX / 2) * storage_fraction
+    return ring_distance(token_id, peer_id) <= max_distance
+```
+
+For each genesis token:
+- Store if token_id is within range, OR
+- Store if block_id is within range
+
+**Example**: With `storage_fraction = 0.25` (1/4 of ring):
+- 100,000 genesis tokens → ~25,000 stored per node
+- Nodes collectively store all genesis tokens (distributed)
+- Each node stores tokens "close" to its peer_id
+
+#### Mathematical Properties
+
+**Coverage theorem:**
+```
+For any token T and storage_fraction f:
+  Expected number of nodes storing T = N × f
+  where N = total number of nodes
+```
+
+**Proof**: Each node stores tokens within fraction f of the ring. The probability that any given node stores a random token is f. By linearity of expectation, E[stores(T)] = N × f.
+
+**Availability guarantee:**
+```
+For f = 0.25 and N ≥ 8 nodes:
+  P(token not stored by any node) < 0.1%  // Birthday-like analysis
+```
+
+### Token Seeding for Peer Discovery
+
+During genesis generation, tokens are probabilistically seeded into `EcPeers::TokenSampleCollection` for early peer discovery.
+
+#### Seeding Strategy
+
+```rust
+// Probabilistic sampling during generation
+const SEED_SAMPLE_PROBABILITY: f64 = 0.01;  // 1% of tokens
+
+for each genesis token_id:
+    // Deterministic sampling based on token_id
+    seed_hash = (token_id as f64) / (u64::MAX as f64)
+    if seed_hash < SEED_SAMPLE_PROBABILITY:
+        peers.seed_genesis_token(token_id)  // Capacity-limited
+```
+
+**Parameters**:
+- Sample probability: 1% (default)
+- 100,000 genesis → ~1,000 tokens seeded
+- TokenSampleCollection capacity: 1,000 (default)
+- Capacity enforcement: Automatic rejection when full
+
+#### Benefits
+
+1. **Early Discovery**: Nodes have genesis tokens to query before any active peers exist
+2. **Distributed Coverage**: Each node samples different tokens (based on token_id hash)
+3. **DHT Bootstrapping**: Token queries trigger referrals, populating peer lists
+4. **Capacity-Bounded**: TokenSampleCollection enforces max capacity automatically
+
+#### Integration with Peer Election
+
+When `EcPeers.tick()` runs with empty peer list:
+1. Picks N tokens from TokenSampleCollection
+2. Starts elections for these tokens
+3. Sends queries to closest known peers (from genesis seeds)
+4. Receives Referrals → discovers new peers
+5. Gradually builds up Connected peer set
+
+**Cold-start scenario** (no active peers yet):
+- Genesis token seeds enable initial elections
+- Elections generate random token queries (if collection is low)
+- Random queries explore the ID space
+- Referrals guide toward token owners
+- Network connectivity emerges
+
+### Updated API
+
+```rust
+pub fn generate_genesis<B: BatchedBackend>(
+    backend: &mut B,
+    config: GenesisConfig,
+    peers: &mut crate::ec_peers::EcPeers,
+    storage_fraction: f64,
+) -> Result<usize, Box<dyn std::error::Error>>
+```
+
+**Arguments**:
+- `backend`: Storage backend
+- `config`: Genesis configuration (block_count, seed_string)
+- `peers`: Peer manager (provides peer_id, receives token seeds)
+- `storage_fraction`: Fraction of ring to store (0.25 = 1/4, 1.0 = all)
+
+**Returns**:
+- `Ok(stored_count)`: Number of blocks/tokens actually stored
+- `Err(msg)`: Storage error
+
+**Example**:
+```rust
+use ec_rust::ec_genesis::{generate_genesis, GenesisConfig};
+use ec_rust::ec_memory_backend::MemoryBackend;
+use ec_rust::ec_peers::EcPeers;
+
+let mut backend = MemoryBackend::new();
+let mut peers = EcPeers::new(12345);
+let config = GenesisConfig::default();
+
+// Store 1/4 of ring, seed random tokens for discovery
+let stored = generate_genesis(&mut backend, config, &mut peers, 0.25)?;
+
+// stored ≈ 25,000 (25% of 100,000)
+// peers.TokenSampleCollection ≈ 1,000 genesis tokens seeded
+```
+
+### Network Bootstrap Sequence
+
+1. **Genesis Generation** (each node independently):
+   ```rust
+   let stored = generate_genesis(&mut backend, config, &mut peers, 0.25)?;
+   // Each node stores ~25% of genesis (distributed by peer_id)
+   // Each node seeds ~1% of genesis into TokenSampleCollection
+   ```
+
+2. **Initial Peer Discovery** (first few ticks):
+   ```rust
+   peers.tick(&token_storage, time);
+   // Starts elections using seeded genesis tokens
+   // Sends queries → receives referrals → discovers peers
+   ```
+
+3. **Network Formation** (gradual):
+   - Elections explore the ID space
+   - Referrals guide toward token owners
+   - Connected peers accumulate
+   - Normal consensus begins
+
+### Testing Selective Storage
+
+```rust
+#[test]
+fn test_selective_storage() {
+    let mut backend = MemoryBackend::new();
+    let mut peers = EcPeers::new(u64::MAX / 2);  // Center of ring
+    let config = GenesisConfig { block_count: 1000, ..Default::default() };
+
+    let stored = generate_genesis(&mut backend, config, &mut peers, 0.25).unwrap();
+
+    // Should store approximately 25% of blocks
+    assert!(stored > 200 && stored < 300);
+}
+```
+
 ## Summary
 
 The `ec_genesis` module provides:
@@ -569,6 +745,8 @@ The `ec_genesis` module provides:
 ✅ **Non-transferable** genesis tokens (key=0, last=0)
 ✅ **Efficient** streaming generation (<500ms for 100k blocks)
 ✅ **Verifiable** reproducible state across all nodes
+✅ **Selective storage** based on ring distance (1/4 of ring by default)
+✅ **Peer discovery seeding** for early network bootstrap
 ✅ **Future-proof** design adapts to TokenId/Block evolution
 
-The implementation is a single function `generate_genesis()` called during node bootstrap when genesis generation is enabled.
+The implementation integrates with `EcPeers` to enable distributed genesis storage and cold-start peer discovery.

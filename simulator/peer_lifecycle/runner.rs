@@ -164,8 +164,19 @@ impl PeerLifecycleRunner {
         self.build_result()
     }
 
-    /// Initialize the peer network
+    /// Initialize the peer network (dispatches to Random or Genesis mode)
     fn initialize_network(&mut self) {
+        if let Some(ref genesis_config) = self.config.token_distribution.genesis_config {
+            // Genesis mode: deterministic bootstrap from genesis tokens
+            self.initialize_network_with_genesis(genesis_config.clone());
+        } else {
+            // Random mode: random token allocation
+            self.initialize_network_with_random();
+        }
+    }
+
+    /// Initialize network with random token allocation (original implementation)
+    fn initialize_network_with_random(&mut self) {
         let num_peers = self.config.initial_state.num_peers;
 
         // Create global token mapping (no peer IDs yet - they will be allocated)
@@ -234,6 +245,99 @@ impl PeerLifecycleRunner {
         for peer_id in peer_ids {
             self.peer_to_group.insert(peer_id, "initial".to_string());
         }
+    }
+
+    /// Initialize network with genesis token allocation (new implementation)
+    fn initialize_network_with_genesis(&mut self, genesis_config: ec_rust::ec_genesis::GenesisConfig) {
+        use super::token_allocation::GenesisTokenSet;
+        use ec_rust::ec_genesis::generate_genesis;
+        use ec_rust::ec_memory_backend::MemoryBackend;
+
+        let num_peers = self.config.initial_state.num_peers;
+        let storage_fraction = self.config.token_distribution.genesis_storage_fraction;
+
+        println!("╔════════════════════════════════════════════════════════╗");
+        println!("║  Genesis Bootstrap Mode                               ║");
+        println!("╚════════════════════════════════════════════════════════╝");
+        println!("Generating {} genesis tokens...", genesis_config.block_count);
+        println!("Allocating {} peer IDs from genesis tokens...", num_peers);
+        println!("Each peer stores {:.0}% of the ring", storage_fraction * 100.0);
+        println!();
+
+        // 1. Pre-generate all genesis token IDs
+        let mut genesis_set = GenesisTokenSet::new(
+            &genesis_config,
+            StdRng::from_seed(self.rng.gen()),
+        );
+
+        // 2. Allocate peer IDs from genesis tokens
+        let peer_ids = genesis_set.allocate_peer_ids(num_peers)
+            .expect("Failed to allocate peer IDs from genesis tokens");
+
+        println!("Allocated {} peer IDs", peer_ids.len());
+        println!("Running genesis generation for each peer...\n");
+
+        // 3. Create each peer with genesis-generated storage
+        for (idx, peer_id) in peer_ids.iter().enumerate() {
+            println!("  [{}/{}] Starting genesis for peer {:016x}...",
+                idx + 1, peer_ids.len(), peer_id);
+
+            // Create peer manager first (needed for genesis)
+            let peer_rng = StdRng::from_seed(self.rng.gen());
+            let mut peer_manager = EcPeers::with_config_and_rng(
+                *peer_id,
+                self.config.peer_config.clone(),
+                peer_rng,
+            );
+
+            // Create backend for this peer
+            let mut backend = MemoryBackend::new();
+
+            // Generate genesis with selective storage and token seeding
+            let stored_count = generate_genesis(
+                &mut backend,
+                genesis_config.clone(),
+                &mut peer_manager,
+                storage_fraction,
+            ).expect("Genesis generation failed");
+
+            // Extract token storage (using Clone we just added)
+            let token_storage = backend.tokens().clone();
+
+            // Progress reporting - show completion
+            println!("  [{}/{}] ✓ Peer {:016x} complete ({} tokens stored)",
+                idx + 1, peer_ids.len(), peer_id, stored_count);
+
+            let peer = SimPeer {
+                peer_id: *peer_id,
+                peer_manager,
+                token_storage,
+                known_tokens: Vec::new(),
+                active: true,
+            };
+
+            self.peers.insert(*peer_id, peer);
+        }
+
+        println!("\n✓ All peers initialized with genesis storage");
+
+        // 4. Initialize topology for genesis mode
+        self.initialize_topology_genesis(&genesis_set);
+
+        // 5. Create "genesis-cold-start" peer group
+        let initial_group = PeerGroup {
+            name: "genesis-cold-start".to_string(),
+            peer_ids: peer_ids.clone(),
+            join_round: 0,
+            coverage_fraction: storage_fraction,
+        };
+
+        self.peer_groups.insert("genesis-cold-start".to_string(), initial_group);
+        for peer_id in peer_ids {
+            self.peer_to_group.insert(peer_id, "genesis-cold-start".to_string());
+        }
+
+        println!("✓ Genesis bootstrap complete\n");
     }
 
     /// Initialize peer topology based on configuration
@@ -348,6 +452,69 @@ impl PeerLifecycleRunner {
 
             TopologyMode::Isolated => {
                 // No initial connections - peers discover via elections
+            }
+        }
+    }
+
+    /// Initialize peer topology for genesis mode
+    ///
+    /// In genesis mode, peers don't have a GlobalTokenMapping with view_width,
+    /// so we only support topologies that don't depend on ring distance knowledge:
+    /// - Isolated: No initial connections (most realistic for cold start)
+    /// - RandomIdentified: Each peer knows N random others (bootstrap scenario)
+    fn initialize_topology_genesis(&mut self, _genesis_set: &super::token_allocation::GenesisTokenSet) {
+        use super::config::TopologyMode;
+        use rand::seq::SliceRandom;
+
+        let peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
+
+        match &self.config.initial_state.initial_topology {
+            TopologyMode::Isolated => {
+                // No initial connections - peers discover via genesis token elections
+                println!("✓ Topology: Isolated (cold start from genesis tokens)");
+            }
+
+            TopologyMode::RandomIdentified { peers_per_node } => {
+                // Each peer gets N random peers in Identified state
+                println!("✓ Topology: RandomIdentified ({} peers per node)", peers_per_node);
+
+                for (peer_id, peer) in &mut self.peers {
+                    // Get all other peers
+                    let mut available_peers: Vec<PeerId> = peer_ids.iter()
+                        .filter(|&&id| id != *peer_id)
+                        .copied()
+                        .collect();
+
+                    // Shuffle and take N peers
+                    available_peers.shuffle(&mut self.rng);
+                    let selected_peers: Vec<PeerId> = available_peers.iter()
+                        .take(*peers_per_node)
+                        .copied()
+                        .collect();
+
+                    // Add selected peers as Identified
+                    for &other_id in &selected_peers {
+                        peer.peer_manager.add_identified_peer(other_id, 0);
+                    }
+                }
+            }
+
+            // Other modes not supported in genesis (they require ring distance knowledge)
+            TopologyMode::FullyKnown { .. } => {
+                println!("WARNING: FullyKnown topology not realistic for genesis mode");
+                println!("         Using Isolated instead (peers will discover via elections)");
+            }
+
+            TopologyMode::LocalKnowledge { .. } => {
+                println!("WARNING: LocalKnowledge topology not realistic for genesis mode");
+                println!("         (peers don't know ring distances at genesis)");
+                println!("         Using Isolated instead (peers will discover via elections)");
+            }
+
+            TopologyMode::Ring { .. } => {
+                println!("WARNING: Ring topology not realistic for genesis mode");
+                println!("         (peers don't know ring positions at genesis)");
+                println!("         Using Isolated instead (peers will discover via elections)");
             }
         }
     }
@@ -670,7 +837,7 @@ impl PeerLifecycleRunner {
         }
     }
 
-    /// Handle PeerJoin event
+    /// Handle PeerJoin event (dispatches to genesis or random mode)
     fn handle_peer_join(
         &mut self,
         count: usize,
@@ -683,8 +850,127 @@ impl PeerLifecycleRunner {
         println!("  [Round {}] {} peers joining (group: '{}', coverage: {:.0}%)",
             self.current_round, count, group_name, coverage_fraction * 100.0);
 
+        // Check if we're in genesis mode
+        if self.config.token_distribution.genesis_config.is_some() {
+            self.handle_peer_join_genesis(count, coverage_fraction, bootstrap_method, group_name);
+        } else {
+            self.handle_peer_join_random(count, coverage_fraction, bootstrap_method, group_name);
+        }
+    }
+
+    /// Handle PeerJoin event in Genesis mode
+    fn handle_peer_join_genesis(
+        &mut self,
+        count: usize,
+        coverage_fraction: f64,
+        bootstrap_method: BootstrapMethod,
+        group_name: String,
+    ) {
+        use super::token_allocation::GenesisTokenSet;
+        use ec_rust::ec_genesis::generate_genesis;
+        use ec_rust::ec_memory_backend::MemoryBackend;
+
+        // Get genesis config
+        let genesis_config = self.config.token_distribution.genesis_config.clone()
+            .expect("Genesis config should be Some in genesis mode");
+
+        // Re-create GenesisTokenSet to allocate new peer IDs
+        // (This regenerates all token IDs - we could optimize by caching)
+        let mut genesis_set = GenesisTokenSet::new(
+            &genesis_config,
+            StdRng::from_seed(self.rng.gen()),
+        );
+
+        // Get existing peer IDs for bootstrap
+        let existing_peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
+
+        // Resolve bootstrap method to actual peer IDs
+        let initial_knowledge = match bootstrap_method {
+            BootstrapMethod::Random(n) => {
+                use rand::seq::SliceRandom;
+                existing_peer_ids.choose_multiple(&mut self.rng, n)
+                    .copied()
+                    .collect()
+            }
+            BootstrapMethod::Specific(peers) => peers,
+            BootstrapMethod::None => vec![],
+        };
+
+        // Allocate peer IDs for new peers
+        let new_peer_ids = genesis_set.allocate_peer_ids(count)
+            .expect("Failed to allocate peer IDs from genesis tokens");
+
+        // Create each new peer with genesis generation
+        for peer_id in &new_peer_ids {
+            // Create peer manager
+            let peer_rng = StdRng::from_seed(self.rng.gen());
+            let mut peer_manager = EcPeers::with_config_and_rng(
+                *peer_id,
+                self.config.peer_config.clone(),
+                peer_rng,
+            );
+
+            // Create backend and run genesis
+            let mut backend = MemoryBackend::new();
+            generate_genesis(
+                &mut backend,
+                genesis_config.clone(),
+                &mut peer_manager,
+                coverage_fraction,
+            ).expect("Genesis generation failed for late joiner");
+
+            // Extract token storage
+            let token_storage = backend.tokens().clone();
+
+            // Add initial knowledge (bootstrap peers)
+            for &known_peer_id in &initial_knowledge {
+                if known_peer_id != *peer_id && self.peers.contains_key(&known_peer_id) {
+                    peer_manager.add_identified_peer(known_peer_id, self.current_round as EcTime);
+                }
+            }
+
+            let peer = SimPeer {
+                peer_id: *peer_id,
+                peer_manager,
+                token_storage,
+                known_tokens: Vec::new(),
+                active: true,
+            };
+
+            self.peers.insert(*peer_id, peer);
+        }
+
+        // Create or update peer group
+        if let Some(group) = self.peer_groups.get_mut(&group_name) {
+            group.peer_ids.extend(new_peer_ids.iter().copied());
+        } else {
+            let group = PeerGroup {
+                name: group_name.clone(),
+                peer_ids: new_peer_ids.clone(),
+                join_round: self.current_round,
+                coverage_fraction,
+            };
+            self.peer_groups.insert(group_name.clone(), group);
+        }
+
+        // Track group membership
+        for peer_id in new_peer_ids {
+            self.peer_to_group.insert(peer_id, group_name.clone());
+        }
+
+        println!("  ✓ {} genesis peers joined successfully", count);
+    }
+
+    /// Handle PeerJoin event in Random mode
+    fn handle_peer_join_random(
+        &mut self,
+        count: usize,
+        coverage_fraction: f64,
+        bootstrap_method: BootstrapMethod,
+        group_name: String,
+    ) {
         let global_mapping = self.global_mapping.as_mut()
-            .expect("Global mapping not initialized");
+            .expect("Global mapping not initialized in Random mode");
 
         // Resolve bootstrap method to actual peer IDs
         let initial_knowledge = match bootstrap_method {

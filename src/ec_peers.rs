@@ -599,13 +599,17 @@ impl EcPeers {
         if let Some(peer) = self.peers.get_mut(&sender_peer_id) {
             match peer.state {
                 PeerState::Identified { last_invitation_election_at, .. } => {
-                    // Accepted - check per-peer invitation cooldown
+                    // Peer is already known (from initial topology or discovery)
+                    // Always respond regardless of distance (they're legitimate)
+                    // Check per-peer invitation cooldown
                     const INVITATION_COOLDOWN: EcTime = 60; // Minimum 60 ticks between invitations from same peer
 
                     if let Some(last_time) = last_invitation_election_at {
                         if time - last_time > INVITATION_COOLDOWN {
                             trigger_election = true
                         }
+                    } else {
+                        trigger_election = true
                     }
                 },
                 PeerState::Connected { .. } => {
@@ -1038,10 +1042,13 @@ impl EcPeers {
             .choose_multiple(&mut self.rng, excess)
             .copied()
             .collect::<Vec<_>>();
+        // TODO just do in the loop
 
         for peer_id in to_evict {
             self.peers.remove(&peer_id);
             // Also remove from active list if present
+
+            // TODO should not be in active at all
             self.active.retain(|&p| p != peer_id);
         }
     }
@@ -1250,6 +1257,20 @@ impl EcPeers {
         self.peers.get(peer_id)
             .map(|peer| peer.state.is_connected() || peer.state.is_pending())
             .unwrap_or(false)
+    }
+
+    /// Seed a genesis token into the TokenSampleCollection
+    ///
+    /// Used during genesis generation to bootstrap peer discovery.
+    /// Only adds if there's capacity in the collection.
+    ///
+    /// # Arguments
+    /// * `token` - Genesis token ID to add
+    ///
+    /// # Returns
+    /// * `true` if token was added, `false` if rejected (at capacity or duplicate)
+    pub fn seed_genesis_token(&mut self, token: TokenId) -> bool {
+        self.token_samples.add_token(token)
     }
 
     /// Update the commit chain head for a peer

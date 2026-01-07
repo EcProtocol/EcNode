@@ -9,6 +9,7 @@
 use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_proof_of_storage::ring_distance;
+use ec_rust::ec_genesis::GenesisConfig;
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -211,6 +212,129 @@ impl GlobalTokenMapping {
     /// Get all currently allocated peer IDs
     pub fn allocated_peer_ids(&self) -> &HashSet<PeerId> {
         &self.allocated_peer_ids
+    }
+
+    /// Get count of allocated peer IDs
+    pub fn peer_count(&self) -> usize {
+        self.allocated_peer_ids.len()
+    }
+}
+
+// ============================================================================
+// Genesis Token Set
+// ============================================================================
+
+/// Pre-generated genesis token IDs for peer ID allocation
+///
+/// This pre-computes all genesis token IDs without generating blocks/storage.
+/// Peer IDs are sampled from this set to ensure they are valid, discoverable tokens.
+pub struct GenesisTokenSet {
+    /// All genesis token IDs (deterministically generated)
+    token_ids: Vec<TokenId>,
+
+    /// Allocated peer IDs (subset of token_ids)
+    allocated_peer_ids: HashSet<PeerId>,
+
+    /// Random number generator for sampling
+    rng: StdRng,
+}
+
+impl GenesisTokenSet {
+    /// Create new genesis token set by pre-generating all token IDs
+    ///
+    /// This is fast because it only generates token IDs (hashing),
+    /// not full blocks and storage.
+    pub fn new(config: &GenesisConfig, mut rng: StdRng) -> Self {
+        use blake3::Hasher;
+
+        let mut token_ids = Vec::with_capacity(config.block_count);
+        let mut seed_bytes = config.seed_string.as_bytes().to_vec();
+
+        // Generate all token IDs using same algorithm as genesis generation
+        for i in 1..=config.block_count {
+            // Format counter as 7-digit zero-padded string
+            let counter_str = format!("{:07}", i);
+
+            // Hash: Blake3(seed || counter)
+            let mut hasher = Hasher::new();
+            hasher.update(&seed_bytes);
+            hasher.update(counter_str.as_bytes());
+
+            let hash = hasher.finalize();
+            let hash_bytes = hash.as_bytes();
+
+            // Extract first 8 bytes as TokenId
+            let token_id = u64::from_le_bytes(
+                hash_bytes[0..8]
+                    .try_into()
+                    .expect("hash should have at least 8 bytes"),
+            );
+
+            token_ids.push(token_id);
+
+            // Update seed for next iteration
+            seed_bytes = token_id.to_le_bytes().to_vec();
+        }
+
+        Self {
+            token_ids,
+            allocated_peer_ids: HashSet::new(),
+            rng,
+        }
+    }
+
+    /// Allocate N peer IDs from genesis tokens
+    ///
+    /// Samples random tokens from the set and marks them as allocated.
+    /// Returns error if not enough tokens available.
+    pub fn allocate_peer_ids(&mut self, mut count: usize) -> Result<Vec<PeerId>, String> {
+        use rand::seq::SliceRandom;
+
+        // Check if enough tokens available
+        let available = self.token_ids.len() - self.allocated_peer_ids.len();
+        if available < count {
+            return Err(format!(
+                "Not enough genesis tokens: need {}, have {} available",
+                count, available
+            ));
+        }
+
+        let mut allocated = Vec::with_capacity(count);
+        
+        while count > 0 {
+            self.token_ids.choose_multiple(&mut self.rng, count).for_each(|&peer_id|
+                if !self.allocated_peer_ids.insert(peer_id) {
+                    allocated.push(peer_id);
+                    count -= 1;
+                }
+            )            
+        }
+
+        Ok(allocated)
+    }
+
+    /// Get list of peer IDs within view_width of target peer
+    ///
+    /// Used for topology initialization in genesis mode.
+    /// Returns allocated peer IDs that are within ring distance.
+    pub fn get_nearby_peers(&self, peer_id: PeerId, view_width: u64) -> Vec<PeerId> {
+        self.allocated_peer_ids
+            .iter()
+            .filter(|&&other_id| {
+                other_id != peer_id && ring_distance(peer_id, other_id) <= view_width
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Get all allocated peer IDs
+    pub fn allocated_peer_ids(&self) -> &HashSet<PeerId> {
+        &self.allocated_peer_ids
+    }
+
+    /// Get count of all genesis tokens
+    pub fn total_tokens(&self) -> usize {
+        self.token_ids.len()
     }
 
     /// Get count of allocated peer IDs

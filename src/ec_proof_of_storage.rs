@@ -879,13 +879,13 @@ impl PeerElection {
         if channel.state == ChannelState::Blocked {
             return Err(ElectionError::ChannelBlocked);
         }
-
+        
+        // Get all participating peers to filter suggestions
+        let participating = self.get_participating_peers();
+        
         // Destroy the channel (no other answer should come for it)
         self.first_hop_peers.remove(&channel.first_hop_peer);
         self.channels.remove(&ticket);
-
-        // Get all participating peers to filter suggestions
-        let participating = self.get_participating_peers();
 
         // Shuffle suggested peers to avoid predictability
         use rand::seq::SliceRandom;

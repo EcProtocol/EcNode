@@ -93,11 +93,21 @@ pub enum TopologyMode {
 
 /// Configuration for token distribution
 ///
-/// Uses a global token mapping with per-peer views based on:
+/// Two modes supported:
+///
+/// **Random mode** (genesis_config = None):
+/// - Uses a global token mapping with per-peer views
 /// - neighbor_overlap: How many neighbors on each side should overlap (determines view_width)
 /// - coverage_fraction: Quality parameter - fraction of tokens within range that peer knows (0.0-1.0)
+///
+/// **Genesis mode** (genesis_config = Some):
+/// - Uses deterministic genesis generation
+/// - Peers sample peer_ids from genesis tokens
+/// - Each peer stores genesis_storage_fraction of the ring
+/// - Genesis tokens seed TokenSampleCollection for discovery
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenDistributionConfig {
+    // Random mode fields (not used when genesis_config is Some)
     /// Total number of tokens in the global mapping (excluding peer IDs)
     pub total_tokens: usize,
 
@@ -108,6 +118,21 @@ pub struct TokenDistributionConfig {
     /// Fraction of tokens within view_width that peer knows (0.0-1.0)
     /// This is the "quality" parameter
     pub coverage_fraction: f64,
+
+    // Genesis mode fields (when Some, use genesis instead of random)
+    /// If Some, use Genesis generation instead of Random token distribution
+    /// Peer IDs will be sampled from genesis tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genesis_config: Option<ec_rust::ec_genesis::GenesisConfig>,
+
+    /// Storage fraction for Genesis selective storage (only used when genesis_config is Some)
+    /// Each peer stores this fraction of the ring (0.25 = 1/4 of ring)
+    #[serde(default = "default_genesis_storage_fraction")]
+    pub genesis_storage_fraction: f64,
+}
+
+fn default_genesis_storage_fraction() -> f64 {
+    0.25
 }
 
 // ============================================================================
@@ -298,6 +323,8 @@ impl Default for TokenDistributionConfig {
             total_tokens: 10_000,
             neighbor_overlap: 5,  // Overlap with 5 neighbors on each side
             coverage_fraction: 0.8,  // Know 80% of nearby tokens
+            genesis_config: None,  // Use Random mode by default
+            genesis_storage_fraction: 0.25,  // 1/4 of ring if genesis is enabled
         }
     }
 }

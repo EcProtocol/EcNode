@@ -68,6 +68,10 @@ path = "benches/argon2_single_hash_bench.rs"
 name = "genesis_demo"
 path = "examples/genesis_demo.rs"
 
+[[example]]
+name = "peer_lifecycle_genesis_sim"
+path = "simulator/peer_lifecycle_genesis_sim.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"

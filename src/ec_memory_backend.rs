@@ -49,6 +49,7 @@ use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 /// // Verify the token was stored
 /// assert!(TokenStorageBackend::lookup(&storage, &token_id).is_some());
 /// ```
+#[derive(Clone)]
 pub struct MemTokens {
     /// Token mappings sorted by TokenId for binary search and range scans
     /// Format: (TokenId, BlockId, ParentBlockId, EcTime)
