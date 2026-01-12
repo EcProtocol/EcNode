@@ -1351,10 +1351,15 @@ impl EcPeers {
         self.elections_started_total += 1;
 
         // Update last_invitation_election_at for spam prevention
+        // If peer doesn't exist, add them to Identified state
         if let Some(peer) = self.peers.get_mut(&responder_peer) {
             if let PeerState::Identified { last_invitation_election_at, .. } = &mut peer.state {
                 *last_invitation_election_at = Some(time);
             }
+        } else {
+            // Add unknown invitation sender to Identified state
+            // This allows us to promote them to Pending when the election completes
+            self.add_identified_peer(responder_peer, time);
         }
 
         // Spawn initial channels and return Query actions

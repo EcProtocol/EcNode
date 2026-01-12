@@ -32,7 +32,7 @@ fn main() {
     config.peer_config.election_config.consensus_threshold = 8; // 6/10 instead of 8/10
 
     // Simulation parameters
-    config.rounds = 150;
+    config.rounds = 300;
 
     // Adjust peer management parameters
     config.peer_config.connection_timeout = 10000; // Long timeout to prevent premature disconnects
@@ -88,7 +88,7 @@ fn main() {
                 round: 50,
                 event: NetworkEvent::PeerJoin {
                     count: 5, // 5 new peers join
-                    coverage_fraction: 0.90, // Same storage fraction as initial peers (90%)
+                    coverage_fraction: 0.3, // Same storage fraction as initial peers (90%)
                     bootstrap_method: BootstrapMethod::Random(4), // Each knows 4 random existing peers
                     group_name: Some("late-joiners".to_string()),
                 },
@@ -102,7 +102,19 @@ fn main() {
             ScheduledEvent {
                 round: 145,
                 event: NetworkEvent::ReportStats {
-                    label: Some("Round 145: Final state".to_string()),
+                    label: Some("Round 145: Mid-point check".to_string()),
+                },
+            },
+            ScheduledEvent {
+                round: 250,
+                event: NetworkEvent::ReportStats {
+                    label: Some("Round 250: Convergence check".to_string()),
+                },
+            },
+            ScheduledEvent {
+                round: 295,
+                event: NetworkEvent::ReportStats {
+                    label: Some("Round 295: Final state".to_string()),
                 },
             },
         ],
