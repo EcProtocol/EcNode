@@ -293,12 +293,13 @@ impl PeerLifecycleRunner {
             // Create backend for this peer
             let mut backend = MemoryBackend::new();
 
-            // Generate genesis with selective storage and token seeding
+            // Generate genesis with selective storage and token seeding (using shared RNG)
             let stored_count = generate_genesis(
                 &mut backend,
                 genesis_config.clone(),
                 &mut peer_manager,
                 storage_fraction,
+                &mut self.rng,
             ).expect("Genesis generation failed");
 
             // Extract token storage (using Clone we just added)
@@ -910,13 +911,14 @@ impl PeerLifecycleRunner {
                 peer_rng,
             );
 
-            // Create backend and run genesis
+            // Create backend and run genesis (using shared RNG)
             let mut backend = MemoryBackend::new();
             generate_genesis(
                 &mut backend,
                 genesis_config.clone(),
                 &mut peer_manager,
                 coverage_fraction,
+                &mut self.rng,
             ).expect("Genesis generation failed for late joiner");
 
             // Extract token storage

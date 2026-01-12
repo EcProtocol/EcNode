@@ -7,7 +7,7 @@ use crate::ec_interface::{
     BatchedBackend, Block, BlockId, PeerId, TokenBlock, TokenId, TOKENS_PER_BLOCK,
 };
 use log::info;
-use rand::{Rng, random, thread_rng};
+use rand::Rng;
 
 /// Configuration for genesis generation
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -149,34 +149,39 @@ fn create_genesis_block(token_id: TokenId, block_id: BlockId) -> Block {
 /// * `config` - Genesis generation configuration
 /// * `peers` - Peer manager for seeding token samples and getting peer_id
 /// * `storage_fraction` - Fraction of ring to store (0.25 = 1/4, 1.0 = all)
+/// * `rng` - Seeded RNG for reproducible token sampling
 ///
 /// # Returns
 /// * `Ok(stored_count)` - Number of blocks/tokens actually stored
 /// * `Err(msg)` - Storage error during batch commit
 ///
 /// # Determinism
-/// Given the same config, this function always generates the same tokens.
-/// However, different nodes (with different peer_ids) will store different subsets.
-/// Random token sampling for EcPeers is probabilistic but capacity-limited.
+/// Given the same config and RNG seed, this function always generates the same tokens
+/// and samples them identically. Different nodes (with different peer_ids) will store
+/// different subsets based on ring distance.
 ///
 /// # Example
 /// ```rust
 /// use ec_rust::ec_genesis::{generate_genesis, GenesisConfig};
 /// use ec_rust::ec_memory_backend::MemoryBackend;
 /// use ec_rust::ec_peers::EcPeers;
+/// use rand::rngs::StdRng;
+/// use rand::SeedableRng;
 ///
 /// let mut backend = MemoryBackend::new();
 /// let config = GenesisConfig::default();
 /// let mut peers = EcPeers::new(12345);
 /// let storage_fraction = 0.25; // Store 1/4 of ring
-/// let stored = generate_genesis(&mut backend, config, &mut peers, storage_fraction)?;
+/// let mut rng = StdRng::seed_from_u64(42);
+/// let stored = generate_genesis(&mut backend, config, &mut peers, storage_fraction, &mut rng)?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn generate_genesis<B: BatchedBackend>(
+pub fn generate_genesis<B: BatchedBackend, R: Rng>(
     backend: &mut B,
     config: GenesisConfig,
     peers: &mut crate::ec_peers::EcPeers,
     storage_fraction: f64,
+    rng: &mut R,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let peer_id = peers.peer_id;
 
@@ -194,8 +199,6 @@ pub fn generate_genesis<B: BatchedBackend>(
     // Track how many blocks/tokens we actually store
     let mut stored_count = 0;
     let mut seeded_count = 0;
-
-    let mut rng = thread_rng();
 
     // Calculate sampling probability for EcPeers
     // We want to seed ~1% of genesis tokens to avoid capacity overflow
@@ -381,20 +384,24 @@ mod tests {
     fn test_full_genesis_reproducibility() {
         use crate::ec_memory_backend::MemoryBackend;
         use crate::ec_peers::EcPeers;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
 
         let config = GenesisConfig {
             block_count: 100,
             seed_string: "Test Genesis".to_string(),
         };
 
-        // Generate genesis in two separate backends with same peer_id
+        // Generate genesis in two separate backends with same peer_id and same RNG seed
         let mut backend1 = MemoryBackend::new();
         let mut peers1 = EcPeers::new(12345);
-        generate_genesis(&mut backend1, config.clone(), &mut peers1, 1.0).unwrap();
+        let mut rng1 = StdRng::seed_from_u64(42);
+        generate_genesis(&mut backend1, config.clone(), &mut peers1, 1.0, &mut rng1).unwrap();
 
         let mut backend2 = MemoryBackend::new();
         let mut peers2 = EcPeers::new(12345);
-        generate_genesis(&mut backend2, config, &mut peers2, 1.0).unwrap();
+        let mut rng2 = StdRng::seed_from_u64(42);
+        generate_genesis(&mut backend2, config, &mut peers2, 1.0, &mut rng2).unwrap();
 
         // Both should have same number of blocks
         // Note: We'd need to add inspection methods to MemoryBackend to fully verify
@@ -405,6 +412,8 @@ mod tests {
     fn test_small_genesis() {
         use crate::ec_memory_backend::MemoryBackend;
         use crate::ec_peers::EcPeers;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
 
         let mut backend = MemoryBackend::new();
         let mut peers = EcPeers::new(12345);
@@ -412,8 +421,9 @@ mod tests {
             block_count: 10,
             seed_string: "Small Genesis".to_string(),
         };
+        let mut rng = StdRng::seed_from_u64(42);
 
-        let result = generate_genesis(&mut backend, config, &mut peers, 1.0);
+        let result = generate_genesis(&mut backend, config, &mut peers, 1.0, &mut rng);
         assert!(result.is_ok(), "Genesis generation failed: {:?}", result);
     }
 
@@ -447,6 +457,8 @@ mod tests {
     fn test_selective_storage() {
         use crate::ec_memory_backend::MemoryBackend;
         use crate::ec_peers::EcPeers;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
 
         let mut backend = MemoryBackend::new();
         let mut peers = EcPeers::new(u64::MAX / 2); // Center of ring
@@ -454,9 +466,10 @@ mod tests {
             block_count: 1000,
             seed_string: "Test Selective".to_string(),
         };
+        let mut rng = StdRng::seed_from_u64(42);
 
         // Store only 25% of ring
-        let stored = generate_genesis(&mut backend, config, &mut peers, 0.25).unwrap();
+        let stored = generate_genesis(&mut backend, config, &mut peers, 0.25, &mut rng).unwrap();
 
         // Should store approximately 25% of blocks
         // Allow some variance due to hash distribution
@@ -494,6 +507,8 @@ mod tests {
     fn test_token_seeding_into_peers() {
         use crate::ec_memory_backend::MemoryBackend;
         use crate::ec_peers::EcPeers;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
 
         let mut backend = MemoryBackend::new();
         let mut peers = EcPeers::new(12345);
@@ -501,8 +516,9 @@ mod tests {
             block_count: 10000,
             seed_string: "Test Seeding".to_string(),
         };
+        let mut rng = StdRng::seed_from_u64(42);
 
-        generate_genesis(&mut backend, config, &mut peers, 1.0).unwrap();
+        generate_genesis(&mut backend, config, &mut peers, 1.0, &mut rng).unwrap();
 
         // Verify that some tokens were seeded (approximately 1% of 10000 = ~100)
         // This is indirect - we can't inspect TokenSampleCollection directly from here

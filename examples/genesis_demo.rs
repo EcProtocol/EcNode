@@ -8,6 +8,9 @@
 
 use ec_rust::ec_genesis::{generate_genesis, GenesisConfig};
 use ec_rust::ec_memory_backend::MemoryBackend;
+use ec_rust::ec_peers::EcPeers;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::time::Instant;
 
 fn main() {
@@ -49,13 +52,19 @@ fn demo_small_genesis() {
     println!("  Blocks: {}\n", config.block_count);
 
     let mut backend = MemoryBackend::new();
+    let mut peers = EcPeers::new(12345); // Create peer manager with peer_id
+    let mut rng = StdRng::seed_from_u64(42); // Seeded RNG for reproducibility
+    let storage_fraction = 1.0; // Store all tokens (full archive)
+
     let start = Instant::now();
 
-    generate_genesis(&mut backend, config).expect("Genesis generation failed");
+    let stored = generate_genesis(&mut backend, config, &mut peers, storage_fraction, &mut rng)
+        .expect("Genesis generation failed");
 
     let duration = start.elapsed();
 
     println!("Generation time: {:?}", duration);
+    println!("Stored {} blocks", stored);
     println!("\nFirst 10 tokens have been generated.");
     println!("(Token values are deterministic - same seed always produces same tokens)");
 }
@@ -68,14 +77,20 @@ fn demo_full_genesis() {
     println!("  Blocks: {}\n", config.block_count);
 
     let mut backend = MemoryBackend::new();
+    let mut peers = EcPeers::new(12345); // Create peer manager with peer_id
+    let mut rng = StdRng::seed_from_u64(42); // Seeded RNG for reproducibility
+    let storage_fraction = 1.0; // Store all tokens (full archive)
+
     let start = Instant::now();
 
-    generate_genesis(&mut backend, config).expect("Genesis generation failed");
+    let stored = generate_genesis(&mut backend, config, &mut peers, storage_fraction, &mut rng)
+        .expect("Genesis generation failed");
 
     let duration = start.elapsed();
 
     println!("\nPerformance:");
     println!("  Total time: {:?}", duration);
+    println!("  Stored: {} blocks", stored);
     println!(
         "  Blocks/sec: {:.0}",
         100_000.0 / duration.as_secs_f64()
@@ -92,16 +107,25 @@ fn demo_determinism() {
         seed_string: "Test Seed".to_string(),
     };
 
-    // Generate genesis twice with same config
-    println!("Generating genesis state twice with identical config...\n");
+    // Generate genesis twice with same config and same RNG seed
+    println!("Generating genesis state twice with identical config and RNG seed...\n");
 
     let mut backend1 = MemoryBackend::new();
-    generate_genesis(&mut backend1, config.clone()).expect("Genesis 1 failed");
+    let mut peers1 = EcPeers::new(12345);
+    let mut rng1 = StdRng::seed_from_u64(42); // Same RNG seed
+    let storage_fraction = 1.0;
+
+    generate_genesis(&mut backend1, config.clone(), &mut peers1, storage_fraction, &mut rng1)
+        .expect("Genesis 1 failed");
 
     let mut backend2 = MemoryBackend::new();
-    generate_genesis(&mut backend2, config).expect("Genesis 2 failed");
+    let mut peers2 = EcPeers::new(12345);
+    let mut rng2 = StdRng::seed_from_u64(42); // Same RNG seed
+
+    generate_genesis(&mut backend2, config, &mut peers2, storage_fraction, &mut rng2)
+        .expect("Genesis 2 failed");
 
     println!("✓ Both generations completed successfully");
     println!("✓ Both backends contain identical token/block mappings");
-    println!("  (Determinism guaranteed by Blake3 hash chaining)");
+    println!("  (Determinism guaranteed by Blake3 hash chaining and seeded RNG)");
 }
