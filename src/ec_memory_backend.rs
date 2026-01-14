@@ -436,6 +436,26 @@ impl MemoryBackend {
     pub fn blocks_mut(&mut self) -> &mut MemBlocks {
         &mut self.blocks
     }
+
+    /// Get immutable reference to commit chain (for metrics/testing)
+    pub fn commit_chain(&self) -> &EcCommitChain {
+        &self.commit_chain
+    }
+
+    /// Get mutable reference to commit chain (for testing)
+    pub fn commit_chain_mut(&mut self) -> &mut EcCommitChain {
+        &mut self.commit_chain
+    }
+
+    /// Get immutable reference to commit chain backend (for metrics/testing)
+    pub fn commit_chain_backend(&self) -> &MemCommitChain {
+        &self.commit_chain_backend
+    }
+
+    /// Get mutable reference to commit chain backend (for testing)
+    pub fn commit_chain_backend_mut(&mut self) -> &mut MemCommitChain {
+        &mut self.commit_chain_backend
+    }
 }
 
 impl Default for MemoryBackend {

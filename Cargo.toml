@@ -72,6 +72,10 @@ path = "examples/genesis_demo.rs"
 name = "peer_lifecycle_genesis_sim"
 path = "simulator/peer_lifecycle_genesis_sim.rs"
 
+[[example]]
+name = "commit_chain_sim"
+path = "simulator/commit_chain_sim.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"
