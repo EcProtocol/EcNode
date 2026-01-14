@@ -83,6 +83,9 @@ pub struct AddressConfig {
     pub max_age_secs: u64,
     /// Future timestamp tolerance in seconds (24 hours default for clock skew)
     pub future_tolerance_secs: u64,
+    /// Network identity for cryptographic isolation (0 = mainnet default)
+    /// Network IDs are NOT transmitted in messages - they're appended internally during validation
+    pub network_id: u64,
 }
 
 impl AddressConfig {
@@ -95,6 +98,7 @@ impl AddressConfig {
         parallelism: 1,       // Single thread
         max_age_secs: 365 * 24 * 3600,      // 1 year
         future_tolerance_secs: 24 * 3600,   // 24 hours
+        network_id: 0,        // Mainnet default
     };
 
     /// Production configuration: ~1 day of computation expected
@@ -125,6 +129,7 @@ impl AddressConfig {
         parallelism: 1,       // Single thread
         max_age_secs: 365 * 24 * 3600,      // 1 year
         future_tolerance_secs: 24 * 3600,   // 24 hours
+        network_id: 0,        // Mainnet default
     };
 
     /// Alternative: Maximum ASIC resistance (higher memory)
@@ -138,6 +143,7 @@ impl AddressConfig {
         parallelism: 1,
         max_age_secs: 365 * 24 * 3600,      // 1 year
         future_tolerance_secs: 24 * 3600,   // 24 hours
+        network_id: 0,        // Mainnet default
     };
 
     /// Alternative: Maximum validation speed (low latency)
@@ -151,6 +157,7 @@ impl AddressConfig {
         parallelism: 1,
         max_age_secs: 365 * 24 * 3600,      // 1 year
         future_tolerance_secs: 24 * 3600,   // 24 hours
+        network_id: 0,        // Mainnet default
     };
 }
 
@@ -265,17 +272,23 @@ impl PeerIdentity {
             .expect("System time before Unix epoch")
             .as_secs();
 
+        // Get network_id from config (default: 0 for mainnet)
+        let network_id = config.network_id;
+
         // Try different salts until we find one that meets the difficulty requirement
         loop {
             attempts += 1;
 
-            // Generate random salt (192 bits: 128 random + 64 timestamp)
+            // Generate 192-bit transmitted salt (128 random + 64 timestamp)
             let mut salt = [0u8; 24];
             rand::Rng::fill(&mut OsRng, &mut salt[0..16]);  // Random entropy
             salt[16..24].copy_from_slice(&timestamp.to_le_bytes());  // Unix timestamp
 
-            // Hash the public key with Argon2 and this salt
-            if let Ok(hash) = hash_public_key(&self.public_key, &salt, &config) {
+            // Extend to 256 bits with network_id for hashing (NOT transmitted)
+            let extended_salt = Self::extend_salt_with_network_id(&salt, network_id);
+
+            // Hash the public key with Argon2 and the extended salt
+            if let Ok(hash) = hash_public_key(&self.public_key, &extended_salt, &config) {
                 // Check if hash meets difficulty requirement
                 if check_difficulty(&hash, config.difficulty) {
                     let duration = start.elapsed().as_secs_f64();
@@ -285,6 +298,7 @@ impl PeerIdentity {
                         duration
                     );
 
+                    // Store only the 192-bit salt (network_id NOT stored)
                     self.salt = Some(salt);
                     self.peer_id = Some(hash);
                     self.attempts = attempts;
@@ -325,6 +339,25 @@ impl PeerIdentity {
     /// The timestamp is stored in the last 8 bytes of the 24-byte salt (little-endian).
     pub fn extract_timestamp(salt: &Salt) -> u64 {
         u64::from_le_bytes(salt[16..24].try_into().expect("Salt timestamp extraction"))
+    }
+
+    /// Extend 192-bit transmitted salt with network_id for internal Argon2 validation
+    ///
+    /// This function creates a 256-bit salt for hashing by appending the network_id
+    /// to the transmitted 192-bit salt. The network_id is NOT transmitted in messages,
+    /// providing both cryptographic isolation and security through obscurity.
+    ///
+    /// # Arguments
+    /// * `salt` - The 192-bit transmitted salt (entropy + timestamp)
+    /// * `network_id` - The local network identifier (0 = mainnet)
+    ///
+    /// # Returns
+    /// A 256-bit salt: [entropy | timestamp | network_id]
+    fn extend_salt_with_network_id(salt: &Salt, network_id: u64) -> [u8; 32] {
+        let mut extended = [0u8; 32];
+        extended[0..24].copy_from_slice(salt);  // Copy 192-bit transmitted salt
+        extended[24..32].copy_from_slice(&network_id.to_le_bytes());  // Append network_id
+        extended
     }
 
     /// Validate timestamp is within acceptable range
@@ -389,8 +422,12 @@ impl PeerIdentity {
         if !Self::validate_timestamp(salt, config, now) {
             return false;
         }
-        // Re-compute the hash
-        match hash_public_key(public_key, salt, config) {
+
+        // Extend 192-bit transmitted salt with local network_id for validation
+        let extended_salt = Self::extend_salt_with_network_id(salt, config.network_id);
+
+        // Re-compute the hash with extended salt (includes network_id)
+        match hash_public_key(public_key, &extended_salt, config) {
             Ok(computed_hash) => {
                 // Check that the hash matches the claimed peer-id
                 if &computed_hash != peer_id {
@@ -443,9 +480,11 @@ impl PeerIdentity {
 }
 
 /// Hash a public key with Argon2 and the given salt
+///
+/// Accepts salts of any length (typically 192-bit or 256-bit for network isolation)
 fn hash_public_key(
     public_key: &PublicKey,
-    salt: &Salt,
+    salt: &[u8],
     config: &AddressConfig,
 ) -> Result<[u8; 32], String> {
     // Configure Argon2 parameters
@@ -738,6 +777,109 @@ mod tests {
             &salt,
             &AddressConfig::TEST,
             now
+        ));
+    }
+
+    // ==================== Network Identity Isolation Tests ====================
+
+    #[test]
+    fn test_extend_salt_with_network_id() {
+        let salt = [1u8; 24];  // 192-bit salt
+        let network_id = 0x123456789ABCDEFu64;
+        let extended = PeerIdentity::extend_salt_with_network_id(&salt, network_id);
+
+        assert_eq!(extended.len(), 32);
+        assert_eq!(&extended[0..24], &salt);  // First 192 bits unchanged
+        assert_eq!(&extended[24..32], &network_id.to_le_bytes());  // Last 64 bits = network_id
+    }
+
+    #[test]
+    fn test_mainnet_default() {
+        // Verify default config uses network_id = 0 (mainnet)
+        let config = AddressConfig::TEST;
+        assert_eq!(config.network_id, 0);
+    }
+
+    #[test]
+    fn test_cross_network_identity_rejected() {
+        // Mine for Network A (network_id = 1000)
+        let mut identity = PeerIdentity::new();
+        let config_a = AddressConfig {
+            network_id: 1000,
+            ..AddressConfig::TEST
+        };
+        identity.mine(config_a);
+
+        // Identity salt is 192 bits (no network_id visible)
+        assert_eq!(identity.salt().unwrap().len(), 24);
+
+        // Try to validate on Network B (network_id = 2000)
+        let config_b = AddressConfig {
+            network_id: 2000,
+            ..AddressConfig::TEST
+        };
+
+        // Validation fails because network_id is extended differently
+        assert!(!PeerIdentity::validate(
+            &identity.public_key,
+            identity.salt().unwrap(),
+            identity.peer_id().unwrap(),
+            &config_b
+        ));
+    }
+
+    #[test]
+    fn test_mainnet_and_testnet_isolated() {
+        // Mine for mainnet (network_id = 0)
+        let mut mainnet_identity = PeerIdentity::new();
+        mainnet_identity.mine(AddressConfig::TEST);  // Uses default network_id = 0
+
+        // Try to validate on testnet (network_id = 12345)
+        let testnet_config = AddressConfig {
+            network_id: 12345,
+            ..AddressConfig::TEST
+        };
+
+        assert!(!PeerIdentity::validate(
+            &mainnet_identity.public_key,
+            mainnet_identity.salt().unwrap(),
+            mainnet_identity.peer_id().unwrap(),
+            &testnet_config
+        ));
+    }
+
+    #[test]
+    fn test_same_salt_different_networks_different_hashes() {
+        // Generate a random 192-bit salt
+        let mut salt = [0u8; 24];
+        rand::Rng::fill(&mut OsRng, &mut salt);
+
+        // Extend with different network IDs
+        let extended_mainnet = PeerIdentity::extend_salt_with_network_id(&salt, 0);
+        let extended_testnet = PeerIdentity::extend_salt_with_network_id(&salt, 12345);
+
+        // Extended salts should be different
+        assert_ne!(extended_mainnet, extended_testnet);
+
+        // This means same 192-bit salt produces different hashes on different networks
+    }
+
+    #[test]
+    fn test_identity_validates_on_same_network() {
+        // Mine for a custom network (network_id = 9999)
+        let mut identity = PeerIdentity::new();
+        let config = AddressConfig {
+            network_id: 9999,
+            ..AddressConfig::TEST
+        };
+        identity.mine(config);
+
+        // Should validate successfully on the same network
+        assert!(PeerIdentity::validate(
+            &identity.public_key,
+            identity.salt().unwrap(),
+            identity.peer_id().unwrap(),
+            &config
         ));
     }
 }

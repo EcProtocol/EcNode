@@ -52,6 +52,41 @@ When validating an identity, nodes check:
 - **1-year expiration**: Balances security (prevents hoarding) with usability (re-mining only once/year)
 - **24-hour tolerance**: Generous allowance for clock drift, timezone confusion, leap seconds
 
+### Network Identity Integration
+
+**Hidden Cryptographic Network Isolation**: To enable isolated test networks and prevent accidental mainnet joins, ecRust implements network identity through a **hidden** network_id that is NOT transmitted in messages.
+
+**Transmitted Salt** (192 bits / 24 bytes) - UNCHANGED:
+```
+[0..16]:  128-bit random entropy
+[16..24]: 64-bit Unix timestamp
+```
+
+**Internal Validation Salt** (256 bits / 32 bytes) - Used only during Argon2:
+```
+[0..16]:  128-bit random entropy (from transmitted salt)
+[16..24]: 64-bit Unix timestamp (from transmitted salt)
+[24..32]: 64-bit network identity (appended by node, NOT transmitted)
+```
+
+**How It Works**:
+1. **Mining**: Node generates 192-bit salt, extends it to 256 bits with local `network_id`, hashes with Argon2, stores only 192-bit salt
+2. **Transmission**: Only the 192-bit salt is included in messages (network_id hidden)
+3. **Validation**: Receiving node appends its local `network_id` to create 256-bit salt, validates with Argon2
+
+**Configuration**:
+- `network_id: 0` (default) - Mainnet, compatible with nodes that don't use network isolation
+- `network_id: N` (non-zero) - Isolated network (testnet, private deployment)
+
+**Security Benefits**:
+- **Cryptographic isolation**: Identities mined for network A (network_id=1000) will fail PoW validation on network B (network_id=2000)
+- **Hidden network IDs**: Attackers cannot observe network_id values from wire traffic
+- **No fingerprinting**: All networks use identical 192-bit salt format
+- **Discovery protection**: Cannot enumerate network IDs by observing messages
+- **Defense in depth**: Must know network_id AND complete PoW to mine valid identity
+
+**Attack Cost**: Without knowing the network_id, an attacker must search $2^{64}$ network IDs × $2^{24}$ PoW attempts ≈ $2^{88}$ Argon2 hashes ≈ $10^{16}$ years.
+
 ### Message Flow
 
 ```mermaid
@@ -219,15 +254,21 @@ fn validate_identity_block_production(
         return false;
     }
 
-    // 6. PROOF-OF-WORK VALIDATION: Verify Argon2(public_key, salt) == peer_id
+    // 6. NETWORK IDENTITY EXTENSION (INTERNAL ONLY)
+    // Extend 192-bit transmitted salt with local network_id to create 256-bit validation salt
+    // This provides cryptographic network isolation WITHOUT transmitting network_id
+    let extended_salt = extend_salt_with_network_id(&salt, config.network_id);
+
+    // 7. PROOF-OF-WORK VALIDATION: Verify Argon2(public_key, extended_salt) == peer_id
     // This is the expensive check (~5ms), only run after fast-fail above
+    // Note: extended_salt includes network_id, so identities from other networks will fail
     if !PeerIdentity::validate(
         sender_public_key,
-        &salt,
+        &extended_salt,
         &claimed_peer_id,
         config
     ) {
-        log::warn("Identity-block rejected: invalid PoW");
+        log::warn("Identity-block rejected: invalid PoW (or wrong network)");
         return false;
     }
 
@@ -244,41 +285,47 @@ fn validate_identity_block_production(
 3. **Cryptographic Binding**: peer-id cryptographically derived from public key
 4. **Timestamp Binding**: Timestamp cryptographically bound into PoW hash
 5. **Expiration Enforcement**: Identities expire after 1 year, preventing unlimited hoarding
-6. **Non-Transferable**: Can't steal someone's identity token
-7. **Fast-Fail DoS Protection**: Timestamp + trailing-zero checks before Argon2 prevent computational DoS
+6. **Network Isolation**: Network_id cryptographically bound into PoW hash (hidden from wire protocol)
+7. **Non-Transferable**: Can't steal someone's identity token
+8. **Fast-Fail DoS Protection**: Timestamp + trailing-zero checks before Argon2 prevent computational DoS
 
 **Validation Performance**:
 - **Step 4** (timestamp check): ~0.01µs (integer comparisons)
 - **Step 5** (trailing zeros): ~0.1µs (bitwise operations)
-- **Step 6** (Argon2): ~5ms (cryptographic hash)
+- **Step 6** (salt extension): ~0.01µs (memory copy + append)
+- **Step 7** (Argon2): ~5ms (cryptographic hash)
 - **Total**: ~5ms for valid blocks, <1µs for invalid difficulty/timestamp (DoS protection)
 
 ## Mathematical Analysis
 
 ### Core Validation Formula
 
-The core validation formula with timestamp:
+The core validation formula with timestamp and network identity:
 
-$$\text{peer\_id} = \text{Argon2}(\text{public\_key}, \text{salt})$$
+$$\text{peer\_id} = \text{Argon2}(\text{public\_key}, \text{extended\_salt})$$
 
 where:
-- $\text{salt} = \text{entropy}_{128} \| \text{timestamp}_{64}$ (192 bits total)
+- $\text{transmitted\_salt} = \text{entropy}_{128} \| \text{timestamp}_{64}$ (192 bits, on wire)
+- $\text{extended\_salt} = \text{entropy}_{128} \| \text{timestamp}_{64} \| \text{network\_id}_{64}$ (256 bits, internal only)
 - $\text{trailing\_zeros}(\text{peer\_id}) \geq \text{difficulty}$
 
 Given:
 - $pk$ = X25519 public key (32 bytes)
 - $e$ = random entropy (16 bytes)
 - $t$ = Unix timestamp (8 bytes)
-- $s = e \| t$ = combined salt (24 bytes)
+- $n$ = network identity (8 bytes, NOT transmitted)
+- $s_{tx} = e \| t$ = transmitted salt (24 bytes)
+- $s_{ext} = e \| t \| n$ = extended salt (32 bytes, validation only)
 - $d$ = difficulty (trailing zero bits)
 - $H(pk, s)$ = Argon2id(pk, s, memory=4MiB, iterations=1)
 
 Identity is valid iff:
-$$\exists e : H(pk, e \| t) \bmod 2^d = 0 \land t_{\text{min}} \leq t \leq t_{\text{max}}$$
+$$\exists e : H(pk, e \| t \| n) \bmod 2^d = 0 \land t_{\text{min}} \leq t \leq t_{\text{max}} \land n = n_{\text{local}}$$
 
 where:
 - $t_{\text{min}} = \text{now} - 365 \times 24 \times 3600$ (1 year ago)
 - $t_{\text{max}} = \text{now} + 24 \times 3600$ (24 hours ahead)
+- $n_{\text{local}}$ = local node's configured network_id
 
 ### Mining Complexity
 
