@@ -158,8 +158,8 @@ Issues and discussions are welcome.
 
 ## License
 
-TBD (project is still settling core architecture).
-
+- Source code and tooling in this repository are licensed under the Apache License 2.0.
+- Academic papers and manuscripts (e.g. in `/docs/` and `/Design/`) are licensed under Creative Commons licenses unless explicitly stated otherwise. These are generally also published with license attribution on Zenodo and arXiv.
 ---
 
 ## Final note
