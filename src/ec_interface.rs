@@ -368,6 +368,59 @@ impl BlockTime {
     }
 }
 
+// ============================================================================
+// Two-Slot Token State (for commit chain sync)
+// ============================================================================
+
+/// Trust source for token mappings
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustSource {
+    /// Two independent peers confirmed this mapping
+    Confirmed,
+    /// Our own mempool committed this (highest trust)
+    Local,
+}
+
+/// Trusted token mapping (current slot)
+#[derive(Debug, Clone, Copy)]
+pub struct TrustedMapping {
+    pub block: BlockId,
+    pub parent: BlockId,
+    pub time: EcTime,
+    pub source: TrustSource,
+}
+
+/// Pending token mapping awaiting confirmation (pending slot)
+#[derive(Debug, Clone, Copy)]
+pub struct PendingMapping {
+    pub block: BlockId,
+    pub parent: BlockId,
+    pub time: EcTime,
+    pub source_peer: PeerId,
+}
+
+/// Two-slot token state for sync
+///
+/// - `current`: Trusted state (Confirmed or Local) - served to queries
+/// - `pending`: Unconfirmed state from one peer - never served
+#[derive(Debug, Clone, Default)]
+pub struct TokenState {
+    pub current: Option<TrustedMapping>,
+    pub pending: Option<PendingMapping>,
+}
+
+impl TokenState {
+    /// Check if current state is Local
+    pub fn is_local(&self) -> bool {
+        matches!(self.current, Some(TrustedMapping { source: TrustSource::Local, .. }))
+    }
+
+    /// Get current block ID if exists
+    pub fn current_block(&self) -> Option<BlockId> {
+        self.current.map(|c| c.block)
+    }
+}
+
 pub trait EcTokens {
     fn lookup(&self, token: &TokenId) -> Option<&BlockTime>;
 
@@ -389,6 +442,24 @@ pub trait EcTokens {
     ///
     /// The returned `TokenSignature` can be wrapped in `Message::Answer` for transmission.
     fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature>;
+}
+
+/// Extended token storage trait with two-slot state support
+///
+/// Used by commit chain sync to check state before applying updates.
+pub trait EcTokensV2: EcTokens {
+    /// Lookup full token state (both current and pending slots)
+    fn lookup_state(&self, token: &TokenId) -> Option<TokenState>;
+
+    /// Lookup only current (trusted) mapping - for query serving
+    ///
+    /// Returns None if only pending exists (pending is never served)
+    fn lookup_current(&self, token: &TokenId) -> Option<TrustedMapping>;
+
+    /// Check if current state is Local
+    ///
+    /// Returns true if token has current state with TrustSource::Local
+    fn is_local(&self, token: &TokenId) -> bool;
 }
 
 pub trait EcBlocks {
@@ -441,16 +512,17 @@ pub trait EcCommitChainAccess {
 
     /// Tick function for commit chain sync operations
     ///
-    /// Orchestrates batch commits for mature shadows and returns actions for messaging.
+    /// Orchestrates two-slot sync and returns actions for messaging.
     /// Requires peers reference to find neighbors for sync.
     ///
     /// # Arguments
     /// * `peers` - Peer manager for finding sync targets
+    /// * `mempool` - Mempool for Local protection delegation
     /// * `time` - Current time
     ///
     /// # Returns
     /// List of (peer_id, message) tuples for ec_node to convert to messages
-    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, time: EcTime) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)>;
+    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, mempool: &mut crate::ec_mempool::EcMemPool, time: EcTime) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)>;
 }
 
 // ============================================================================
@@ -503,11 +575,33 @@ pub trait StorageBatch {
     /// Save a block to the batch
     fn save_block(&mut self, block: &Block);
 
-    /// Update a single token mapping
+    /// Update a single token mapping (from mempool commit)
     ///
     /// Updates the token to point to the specified block with the given parent at the given time.
     /// For newly created tokens (genesis transactions), use GENESIS_BLOCK_ID as the parent.
+    ///
+    /// This always sets `current = Local(...)` and clears any pending state.
+    /// Used by mempool when a block commits through consensus.
     fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime);
+
+    /// Update a token mapping from sync (commit chain)
+    ///
+    /// Handles the two-slot state machine:
+    /// - If no state: creates pending
+    /// - If pending exists with same block from different peer: promotes to confirmed
+    /// - If pending exists with lower block ID: replaces pending
+    /// - If current (Confirmed) exists: may create/update pending
+    ///
+    /// Note: Caller must check for Local state BEFORE calling this.
+    /// If current is Local and new block > current, delegate to mempool instead.
+    fn update_token_sync(
+        &mut self,
+        token: &TokenId,
+        block: &BlockId,
+        parent: &BlockId,
+        time: EcTime,
+        source_peer: PeerId,
+    );
 
     /// Commit all batched operations atomically
     ///

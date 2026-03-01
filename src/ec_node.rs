@@ -199,7 +199,7 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
         // Periodically query nearby peers to keep our commit chain up to date
         let sync_actions = {
             let mut backend = self.backend.borrow_mut();
-            backend.commit_chain_tick(&self.peers, self.time)
+            backend.commit_chain_tick(&self.peers, &mut self.mem_pool, self.time)
         };
 
         // Convert commit chain actions to message envelopes

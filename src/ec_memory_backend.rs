@@ -11,7 +11,8 @@ use std::collections::HashMap;
 
 use crate::ec_interface::{
     BatchedBackend, Block, BlockId, BlockTime, CommitBlock, CommitBlockId, EcBlocks,
-    EcCommitChainBackend, EcTime, EcTokens, PeerId, StorageBatch, TokenId, TokenSignature,
+    EcCommitChainBackend, EcTime, EcTokens, EcTokensV2, PeerId, PendingMapping, StorageBatch,
+    TokenId, TokenSignature, TokenState, TrustSource, TrustedMapping,
 };
 use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
 use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
@@ -26,6 +27,10 @@ use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 /// performance. The sorted Vec provides ~10x faster iteration than BTreeMap due to
 /// contiguous memory layout, which is critical for proof-of-storage signature searches.
 ///
+/// Implements the two-slot model for commit chain sync:
+/// - `current`: Trusted state (Confirmed or Local) - served in queries
+/// - `pending`: Unconfirmed state from one peer - never served
+///
 /// For production deployments with millions of tokens, consider RocksDB or other
 /// persistent storage backends.
 ///
@@ -33,7 +38,7 @@ use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 /// - Lookup: O(log n) via binary search
 /// - Set: O(n) worst case for insertion (maintains sort order)
 /// - Search signature: O(k) linear scan from lookup point (cache-friendly)
-/// - Memory: ~24 bytes per token (64-bit IDs), compact and contiguous
+/// - Memory: ~57 bytes per token worst case (both slots populated)
 ///
 /// # Example
 /// ```rust
@@ -51,9 +56,9 @@ use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 /// ```
 #[derive(Clone)]
 pub struct MemTokens {
-    /// Token mappings sorted by TokenId for binary search and range scans
-    /// Format: (TokenId, BlockId, ParentBlockId, EcTime)
-    tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,
+    /// Token states sorted by TokenId for binary search and range scans
+    /// Two-slot model: each token has current (trusted) and pending (unverified) slots
+    tokens: Vec<(TokenId, TokenState)>,
 }
 
 impl MemTokens {
@@ -65,9 +70,28 @@ impl MemTokens {
     }
 
     /// Create from unsorted mappings (will be sorted internally)
-    pub fn from_mappings(mut mappings: Vec<(TokenId, BlockId, BlockId, EcTime)>) -> Self {
-        mappings.sort_by_key(|(token, _, _, _)| *token);
-        Self { tokens: mappings }
+    ///
+    /// Converts legacy (token, block, parent, time) tuples to TokenState with Local trust.
+    pub fn from_mappings(mappings: Vec<(TokenId, BlockId, BlockId, EcTime)>) -> Self {
+        let mut tokens: Vec<(TokenId, TokenState)> = mappings
+            .into_iter()
+            .map(|(token, block, parent, time)| {
+                (
+                    token,
+                    TokenState {
+                        current: Some(TrustedMapping {
+                            block,
+                            parent,
+                            time,
+                            source: TrustSource::Local,
+                        }),
+                        pending: None,
+                    },
+                )
+            })
+            .collect();
+        tokens.sort_by_key(|(token, _)| *token);
+        Self { tokens }
     }
 
     /// Create a ProofOfStorage system using this storage backend
@@ -103,28 +127,41 @@ impl Default for MemTokens {
 impl TokenStorageBackend for MemTokens {
     fn lookup(&self, token: &TokenId) -> Option<BlockTime> {
         self.tokens
-            .binary_search_by_key(token, |(t, _, _, _)| *t)
+            .binary_search_by_key(token, |(t, _)| *t)
             .ok()
-            .map(|idx| {
-                let (_, block, parent, time) = self.tokens[idx];
-                BlockTime::new(block, parent, time)
+            .and_then(|idx| {
+                // Only return from current (trusted) slot
+                self.tokens[idx].1.current.map(|c| BlockTime::new(c.block, c.parent, c.time))
             })
     }
 
     fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-        match self.tokens.binary_search_by_key(token, |(t, _, _, _)| *t) {
+        // set() is called by mempool - always becomes Local, clears pending
+        let new_state = TokenState {
+            current: Some(TrustedMapping {
+                block: *block,
+                parent: *parent,
+                time,
+                source: TrustSource::Local,
+            }),
+            pending: None,
+        };
+
+        match self.tokens.binary_search_by_key(token, |(t, _)| *t) {
             Ok(idx) => {
-                // Token exists - only update if new time is newer
-                let (_, existing_block, existing_parent, existing_time) = &mut self.tokens[idx];
-                if *existing_time < time {
-                    *existing_block = *block;
-                    *existing_parent = *parent;
-                    *existing_time = time;
+                // Token exists - check if we should update based on time
+                if let Some(current) = &self.tokens[idx].1.current {
+                    if current.time < time {
+                        self.tokens[idx].1 = new_state;
+                    }
+                } else {
+                    // No current, always set
+                    self.tokens[idx].1 = new_state;
                 }
             }
             Err(idx) => {
                 // Token doesn't exist - insert at correct position to maintain sort order
-                self.tokens.insert(idx, (*token, *block, *parent, time));
+                self.tokens.insert(idx, (*token, new_state));
             }
         }
     }
@@ -147,31 +184,19 @@ impl TokenStorageBackend for MemTokens {
         }
 
         // Find starting position for forward search using binary search
-        let start_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _, _, _)| *t) {
+        let start_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _)| *t) {
             Ok(idx) => idx + 1,  // Found exact match, start after it
             Err(idx) => idx,     // Not found, idx is insertion point (first token > lookup_token)
         };
 
         // Search forward (above) for first 5 chunks
+        // Only consider tokens with current (trusted) state
         for i in start_idx..self.tokens.len() {
-            steps += 1;
-            let (token, _, _, _) = self.tokens[i];
-            if matches_chunk(&token, signature_chunks[chunk_idx]) {
-                found_tokens.push(token);
-                chunk_idx += 1;
-                if chunk_idx >= 5 {
-                    break;
-                }
-            }
-        }
-
-        // Ring wrap: from beginning to lookup_token
-        if chunk_idx < 5 {
-            for i in 0..start_idx.saturating_sub(1) {
+            let (token, state) = &self.tokens[i];
+            if state.current.is_some() {
                 steps += 1;
-                let (token, _, _, _) = self.tokens[i];
-                if matches_chunk(&token, signature_chunks[chunk_idx]) {
-                    found_tokens.push(token);
+                if matches_chunk(token, signature_chunks[chunk_idx]) {
+                    found_tokens.push(*token);
                     chunk_idx += 1;
                     if chunk_idx >= 5 {
                         break;
@@ -180,8 +205,25 @@ impl TokenStorageBackend for MemTokens {
             }
         }
 
+        // Ring wrap: from beginning to lookup_token
+        if chunk_idx < 5 {
+            for i in 0..start_idx.saturating_sub(1) {
+                let (token, state) = &self.tokens[i];
+                if state.current.is_some() {
+                    steps += 1;
+                    if matches_chunk(token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(*token);
+                        chunk_idx += 1;
+                        if chunk_idx >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Find starting position for backward search
-        let end_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _, _, _)| *t) {
+        let end_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _)| *t) {
             Ok(idx) => idx.saturating_sub(1),  // Found exact match, start before it
             Err(idx) => idx.saturating_sub(1), // Not found, start at position before insertion point
         };
@@ -189,13 +231,15 @@ impl TokenStorageBackend for MemTokens {
         // Search backward (below) for last 5 chunks
         if end_idx < self.tokens.len() {
             for i in (0..=end_idx).rev() {
-                steps += 1;
-                let (token, _, _, _) = self.tokens[i];
-                if matches_chunk(&token, signature_chunks[chunk_idx]) {
-                    found_tokens.push(token);
-                    chunk_idx += 1;
-                    if chunk_idx >= SIGNATURE_CHUNKS {
-                        break;
+                let (token, state) = &self.tokens[i];
+                if state.current.is_some() {
+                    steps += 1;
+                    if matches_chunk(token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(*token);
+                        chunk_idx += 1;
+                        if chunk_idx >= SIGNATURE_CHUNKS {
+                            break;
+                        }
                     }
                 }
             }
@@ -204,13 +248,15 @@ impl TokenStorageBackend for MemTokens {
         // Ring wrap: from end backwards to lookup_token
         if chunk_idx < SIGNATURE_CHUNKS && end_idx < self.tokens.len() {
             for i in (end_idx + 1..self.tokens.len()).rev() {
-                steps += 1;
-                let (token, _, _, _) = self.tokens[i];
-                if matches_chunk(&token, signature_chunks[chunk_idx]) {
-                    found_tokens.push(token);
-                    chunk_idx += 1;
-                    if chunk_idx >= SIGNATURE_CHUNKS {
-                        break;
+                let (token, state) = &self.tokens[i];
+                if state.current.is_some() {
+                    steps += 1;
+                    if matches_chunk(token, signature_chunks[chunk_idx]) {
+                        found_tokens.push(*token);
+                        chunk_idx += 1;
+                        if chunk_idx >= SIGNATURE_CHUNKS {
+                            break;
+                        }
                     }
                 }
             }
@@ -254,6 +300,151 @@ impl<'a> TokenStorageBackend for MemTokensRef<'a> {
 
     fn len(&self) -> usize {
         self.0.tokens.len()
+    }
+}
+
+// ============================================================================
+// EcTokensV2 Implementation (Two-Slot Model)
+// ============================================================================
+
+impl EcTokensV2 for MemTokens {
+    fn lookup_state(&self, token: &TokenId) -> Option<TokenState> {
+        self.tokens
+            .binary_search_by_key(token, |(t, _)| *t)
+            .ok()
+            .map(|idx| self.tokens[idx].1.clone())
+    }
+
+    fn lookup_current(&self, token: &TokenId) -> Option<TrustedMapping> {
+        self.tokens
+            .binary_search_by_key(token, |(t, _)| *t)
+            .ok()
+            .and_then(|idx| self.tokens[idx].1.current)
+    }
+
+    fn is_local(&self, token: &TokenId) -> bool {
+        self.tokens
+            .binary_search_by_key(token, |(t, _)| *t)
+            .ok()
+            .map_or(false, |idx| self.tokens[idx].1.is_local())
+    }
+}
+
+impl MemTokens {
+    /// Update a token from sync (two-slot state machine)
+    ///
+    /// Implements the confirmation logic:
+    /// - First peer: pending
+    /// - Second peer same block: confirmed
+    /// - Higher ID replaces pending
+    pub fn update_token_sync(
+        &mut self,
+        token: &TokenId,
+        block: &BlockId,
+        parent: &BlockId,
+        time: EcTime,
+        source_peer: PeerId,
+    ) {
+        match self.tokens.binary_search_by_key(token, |(t, _)| *t) {
+            Ok(idx) => {
+                let state = &mut self.tokens[idx].1;
+                Self::apply_sync_update(state, *block, *parent, time, source_peer);
+            }
+            Err(idx) => {
+                // New token - create with pending
+                let state = TokenState {
+                    current: None,
+                    pending: Some(PendingMapping {
+                        block: *block,
+                        parent: *parent,
+                        time,
+                        source_peer,
+                    }),
+                };
+                self.tokens.insert(idx, (*token, state));
+            }
+        }
+    }
+
+    /// Apply sync update to existing state (state machine logic)
+    fn apply_sync_update(
+        state: &mut TokenState,
+        block: BlockId,
+        parent: BlockId,
+        time: EcTime,
+        source_peer: PeerId,
+    ) {
+        match (&state.current, &state.pending) {
+            (None, None) => {
+                // First seen - create pending
+                state.pending = Some(PendingMapping {
+                    block,
+                    parent,
+                    time,
+                    source_peer,
+                });
+            }
+            (None, Some(p)) => {
+                if block == p.block && source_peer != p.source_peer {
+                    // Confirmation! Promote to current
+                    state.current = Some(TrustedMapping {
+                        block: p.block,
+                        parent: p.parent,
+                        time: p.time,
+                        source: TrustSource::Confirmed,
+                    });
+                    state.pending = None;
+                } else if block > p.block {
+                    // Higher ID replaces pending
+                    state.pending = Some(PendingMapping {
+                        block,
+                        parent,
+                        time,
+                        source_peer,
+                    });
+                }
+                // else: lower or equal ID from same peer - ignore
+            }
+            (Some(c), pending) => {
+                if block <= c.block {
+                    // Not newer than current, ignore
+                    return;
+                }
+                // Newer block - handle based on pending
+                match pending {
+                    None => {
+                        state.pending = Some(PendingMapping {
+                            block,
+                            parent,
+                            time,
+                            source_peer,
+                        });
+                    }
+                    Some(p) if block == p.block && source_peer != p.source_peer => {
+                        // Confirms pending - promote to current
+                        state.current = Some(TrustedMapping {
+                            block: p.block,
+                            parent: p.parent,
+                            time: p.time,
+                            source: TrustSource::Confirmed,
+                        });
+                        state.pending = None;
+                    }
+                    Some(p) if block > p.block => {
+                        // Higher ID replaces pending
+                        state.pending = Some(PendingMapping {
+                            block,
+                            parent,
+                            time,
+                            source_peer,
+                        });
+                    }
+                    _ => {
+                        // Lower ID or same peer - ignore
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -475,7 +666,10 @@ impl Default for MemoryBackend {
 pub struct MemoryBatch<'a> {
     backend: &'a mut MemoryBackend,
     blocks: Vec<Block>,
-    tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,  // (token, block, parent, time)
+    /// Local token updates (from mempool) - become Local trust
+    local_tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,
+    /// Sync token updates (from commit chain) - use two-slot state machine
+    sync_tokens: Vec<(TokenId, BlockId, BlockId, EcTime, PeerId)>,
 }
 
 impl<'a> StorageBatch for MemoryBatch<'a> {
@@ -484,7 +678,18 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
     }
 
     fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-        self.tokens.push((*token, *block, *parent, time));
+        self.local_tokens.push((*token, *block, *parent, time));
+    }
+
+    fn update_token_sync(
+        &mut self,
+        token: &TokenId,
+        block: &BlockId,
+        parent: &BlockId,
+        time: EcTime,
+        source_peer: PeerId,
+    ) {
+        self.sync_tokens.push((*token, *block, *parent, time, source_peer));
     }
 
     fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
@@ -493,9 +698,14 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
             self.backend.blocks.save(block);
         }
 
-        // Apply all token updates
-        for (token, block, parent, time) in &self.tokens {
+        // Apply local token updates (become Local trust)
+        for (token, block, parent, time) in &self.local_tokens {
             TokenStorageBackend::set(&mut self.backend.tokens, token, block, parent, *time);
+        }
+
+        // Apply sync token updates (two-slot state machine)
+        for (token, block, parent, time, source_peer) in &self.sync_tokens {
+            self.backend.tokens.update_token_sync(token, block, parent, *time, *source_peer);
         }
 
         // Create commit block if we committed any blocks
@@ -529,7 +739,8 @@ impl BatchedBackend for MemoryBackend {
         Box::new(MemoryBatch {
             backend: self,
             blocks: Vec::new(),
-            tokens: Vec::new(),
+            local_tokens: Vec::new(),
+            sync_tokens: Vec::new(),
         })
     }
 }
@@ -546,6 +757,21 @@ impl EcTokens for MemoryBackend {
 
     fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature> {
         EcTokens::tokens_signature(&self.tokens, token, peer)
+    }
+}
+
+// Implement EcTokensV2 for MemoryBackend (delegates to tokens field)
+impl EcTokensV2 for MemoryBackend {
+    fn lookup_state(&self, token: &TokenId) -> Option<TokenState> {
+        EcTokensV2::lookup_state(&self.tokens, token)
+    }
+
+    fn lookup_current(&self, token: &TokenId) -> Option<TrustedMapping> {
+        EcTokensV2::lookup_current(&self.tokens, token)
+    }
+
+    fn is_local(&self, token: &TokenId) -> bool {
+        EcTokensV2::is_local(&self.tokens, token)
     }
 }
 
@@ -621,6 +847,7 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
     fn commit_chain_tick(
         &mut self,
         peers: &crate::ec_peers::EcPeers,
+        mempool: &mut crate::ec_mempool::EcMemPool,
         time: EcTime,
     ) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)> {
         // Temporarily move commit_chain out to avoid borrow conflicts
@@ -631,8 +858,8 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
             EcCommitChain::new(0, my_range, CommitChainConfig::default()),
         );
 
-        // Call tick with self as storage
-        let messages = commit_chain.tick(peers, self, time);
+        // Call tick with self as storage and mempool for Local protection
+        let messages = commit_chain.tick(peers, self, mempool, time);
 
         // Restore commit_chain
         self.commit_chain = commit_chain;

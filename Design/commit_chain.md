@@ -7,10 +7,11 @@ The **Commit Chain** is a lightweight blockchain that tracks which transaction b
 ## Core Principles
 
 1. **Top-Down Sync**: Sync from newest to oldest (HEAD → past) to be useful quickly
-2. **Shadow System**: Unconfirmed mappings with multi-peer confirmation (no age tracking)
+2. **Two-Slot Storage**: Persistent current/pending state per token (no in-memory shadows)
 3. **Minimal Tracking**: Only track 4 closest active peers (2 above, 2 below on ring)
 4. **Batched Commits**: Atomic storage operations for consistency
-5. **Block Routing**: Blocks arrive via network routing, not directly from tracked peers
+5. **Local Protection**: Updates past Local state delegate to mempool for full validation
+6. **Highest ID Wins**: Deterministic conflict resolution across network
 
 ## Data Structures
 
@@ -52,15 +53,43 @@ None ──────> WaitingForCommit ──────> FetchingBlocks
 - `commit_block`: The CommitBlock we're processing
 - `waiting_for`: Set of BlockIds we still need
 
-### ShadowTokenMapping
+### Token State (Two-Slot Model)
 
-Unconfirmed token mappings awaiting multi-peer confirmation:
-- `block`: Latest BlockId for this token
-- `parent`: Parent BlockId (for chain validation)
-- `time`: Block timestamp
-- `confirmations`: Set of PeerIds that confirmed this mapping
+Persistent token state in storage:
 
-No age tracking - only confirmation count matters.
+```rust
+struct TokenState {
+    /// Trusted state: Confirmed or Local
+    current: Option<TrustedMapping>,
+
+    /// Pending state: Newer than current, awaiting confirmation
+    pending: Option<PendingMapping>,
+}
+
+struct TrustedMapping {
+    block: BlockId,
+    parent: BlockId,
+    time: EcTime,
+    source: TrustSource,  // Confirmed | Local
+}
+
+struct PendingMapping {
+    block: BlockId,
+    parent: BlockId,
+    time: EcTime,
+    source_peer: PeerId,
+}
+```
+
+### Trust Hierarchy
+
+```
+Local > Confirmed > Pending > None
+
+Local:     Our mempool committed - we KNOW this is correct
+Confirmed: Two peers agree - high confidence
+Pending:   One peer reported - unverified, never served
+```
 
 ## Synchronization Flow
 
@@ -92,7 +121,7 @@ For each tracked peer, run state machine:
 
 **State: FetchingBlocks**
 - Send `QueryBlock` for each block in `committed_blocks` we don't have
-- On receive Block → apply to shadow system
+- On receive Block → apply to storage
 - When all blocks received:
   - If `commit_block.time < watermark` or `previous == GENESIS`: Trace complete
   - Else: request previous CommitBlock (going backwards in time)
@@ -105,76 +134,110 @@ For each tracked peer, run state machine:
 
 **Per-tick processing** (`process_peer_logs`):
 1. Collect work from all peer logs
-2. Apply received blocks to shadow system with peer confirmation
+2. For each block, check storage state and route appropriately
 3. Advance trace states, update watermark when traces complete
 
-### Phase 4: Shadow Management
+### Phase 4: Token Update Routing
 
-**Applying blocks to shadows** (`apply_block_to_shadow`):
+**For each token in received block**:
 
 ```
-For each token in block:
-    if token in shadow:
-        if block.id == shadow.block:
-            → Add peer to confirmations (same mapping)
-        else if block.parent == shadow.parent:
-            → Higher block.id wins, clear confirmations, add peer
-        else:
-            → Higher time wins, clear confirmations, add peer
-    else:
-        Check DB:
-        if block.time > db.time:
-            → Create shadow with peer confirmation
-        else:
-            → Ignore (DB wins even if conflict)
+┌─────────────────────────────────────────┐
+│  Check storage.lookup(token)            │
+└─────────────────────────────────────────┘
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+        ▼                       ▼
+┌───────────────┐       ┌───────────────┐
+│ current.is_   │       │ Otherwise     │
+│ local() AND   │       │               │
+│ block.id >    │       │               │
+│ current.block │       │               │
+└───────────────┘       └───────────────┘
+        │                       │
+        ▼                       ▼
+┌───────────────┐       ┌───────────────┐
+│ DELEGATE TO   │       │ Normal sync:  │
+│ MEMPOOL       │       │ update_token_ │
+│               │       │ sync(...)     │
+└───────────────┘       └───────────────┘
 ```
 
-**Key invariant**: DB is always trusted over shadows.
+**Why delegate to mempool for Local?**
+- Local means WE committed this transaction
+- Someone claiming a newer block must prove the chain
+- Mempool already handles chain validation, voting, consensus
+- If mempool commits → becomes new Local (we validated it)
 
-### Phase 5: Batched Promotion
+### Phase 5: Storage State Machine
 
-**Every tick** (`promote_shadows`):
+**In `update_token_sync`** (called by commit chain):
 
-If shadows to promote OR blocks to store:
-1. Start batch: `storage.begin_batch()`
-2. For each shadow with enough confirmations:
-   - `batch.update_token(token, block, parent, time)`
-   - `batch.save_block(block)` - if in received_blocks (REMOVE from pool)
-3. For each block in `blocks_to_store`:
-   - `batch.save_block(block)` - (block-id in range, no tokens in range)
-4. `batch.commit()` - Atomic write
-5. Clear `blocks_to_store` on success
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Current State │ Pending │ Event              │ Action       │
+├───────────────┼─────────┼────────────────────┼──────────────┤
+│ None          │ None    │ Peer A reports     │ pending=(A)  │
+│ None          │ P(A)    │ Peer B, same block │ confirm→curr │
+│ None          │ P(A)    │ Peer B, higher ID  │ pending=(B)  │
+│ None          │ P(A)    │ Peer B, lower ID   │ no change    │
+│ Confirmed     │ None    │ Peer, higher ID    │ pending=(P)  │
+│ Confirmed     │ P(A)    │ Peer B, same block │ confirm→curr │
+│ Confirmed     │ P(A)    │ Peer, higher ID    │ pending=(P)  │
+│ Local         │ *       │ Peer, higher ID    │ → MEMPOOL    │
+└─────────────────────────────────────────────────────────────┘
+```
 
-**Confirmation threshold**: Default 2 peers (configurable)
+**In `update_token`** (called by mempool):
+- Always sets `current = Local(block)`
+- Always clears `pending = None`
+- Mempool commits are always trusted
 
-## Watermark System
+### Phase 6: Query Serving
 
-**Global watermark**: Single value tracking sync depth across all peers
+**Only serve current slot**:
 
-**Initialization**: Set to `sync_target` (e.g., 30 days back)
-
-**Updates**: When trace completes:
 ```rust
-if commit_block.time < watermark || commit_block.previous == GENESIS_BLOCK_ID {
-    watermark = max(watermark, first_commit_time)
-    // Trace complete
+fn answer_query(token: TokenId) -> QueryResponse {
+    match storage.lookup_current(token) {
+        Some(mapping) => QueryResponse::Found(mapping),
+        None => QueryResponse::NotFound,  // pending exists but not served
+    }
 }
 ```
 
-**Direction**: Watermark moves forward (deeper into history) as we sync more
+Pending mappings are never served - only current (Confirmed or Local).
+
+## Conflict Resolution
+
+**Single rule: Highest transaction ID wins**
+
+```rust
+if new_block.id > existing_block.id {
+    // New block wins
+} else {
+    // Keep existing
+}
+```
+
+This is:
+- **Deterministic**: All nodes make same choice
+- **Simple**: One comparison
+- **Convergent**: Network agrees on highest ID
 
 ## Block Storage Strategy
 
 Three categories of blocks:
 
 1. **Blocks with tokens in our range**:
-   - Stored via shadow promotion
-   - Removed from `received_blocks` when promoted
+   - Applied via storage state machine
+   - Stored when mapping is confirmed
 
 2. **Blocks with block-id in range but no tokens**:
    - Added to `blocks_to_store`
-   - Saved during batch promotion
-   - Cleared after successful commit
+   - Saved during batch commit
+   - We must store these to serve as witnesses
 
 3. **Blocks outside our range**:
    - Not stored (routing only)
@@ -207,83 +270,110 @@ fn generate_ticket(id: u64) -> MessageTicket {
 
 ### Multi-Peer Confirmation
 
-Shadows require confirmations from multiple independent peers:
-- Default threshold: 2 peers
-- Peers are geographically distributed on ring (2 above, 2 below)
+Updates require confirmation from two independent peers:
+- Default threshold: 2 peers (source + 1 confirmer)
+- Peers are distributed on ring (2 above, 2 below)
 - Block routing provides cross-network validation
 
-### Conflict Resolution
+### Local Protection
 
-**Same parent** (fork scenario):
-- Highest block-id wins deterministically
-- Ensures network converges on same choice
-
-**Different parent** (reorganization):
-- Highest timestamp wins
-- Reflects most recent state
-
-**DB vs Shadow**:
-- DB always wins (committed state is trusted)
-- Shadow only created if block.time > db.time
+When `current = Local`:
+- We committed this via our mempool
+- Any update must go through mempool consensus
+- Full network validation required
+- Prevents attackers from overwriting our commits
 
 ### Attack Resistance
 
 **Sybil Attack**: Limited by peer selection (closest on ring)
 **Eclipse Attack**: Multiple independent sync paths (4 peers)
-**History Rewrite**: Multi-peer confirmation required for commits
+**History Rewrite**: Multi-peer confirmation + Local protection
 **Spam**: Ticket system prevents replay attacks
+
+### Byzantine Higher ID Attack
+
+Attacker sends fabricated block with very high ID:
+1. Block wins on ID (stored as pending)
+2. No honest peer confirms it
+3. Pending stays unconfirmed forever
+4. We never serve pending data
+5. Eventually honest blocks with even higher IDs arrive
+
+Result: Attack delays but doesn't corrupt.
 
 ## Performance Characteristics
 
 ### Memory Overhead
 
-Per peer (worst case):
+Per peer:
 - `PeerChainLog`: ~128 bytes
 - Active traces: ~200 bytes each
-- Shadow mappings: ~80 bytes per unconfirmed token
 - Received blocks: ~300 bytes per block (temporary)
 
-**Total**: ~1KB per tracked peer + shadows + pending blocks
+**No shadow memory**: State is in persistent storage
+
+### Storage Overhead
+
+Per token (worst case - both slots populated):
+```
+Current slot:  block(8) + parent(8) + time(8) + source(1) = 25 bytes
+Pending slot:  block(8) + parent(8) + time(8) + source_peer(8) = 32 bytes
+Total:         57 bytes per token (worst case)
+Typical:       25 bytes (only current populated)
+```
 
 ### Network Overhead
 
 - 4 concurrent traces maximum
 - Each trace: 1 CommitBlock + N transaction blocks
 - Retry logic: 1 message every 10 ticks for stalled traces
-- Block routing: shared with normal network traffic
-
-### Storage Overhead
-
-Per committed shadow:
-- Token mapping: set() call to DB
-- Block: save_block() call to DB
-- Batched atomically for consistency
+- Local protection: triggers mempool consensus (rare)
 
 ## Integration Points
 
 ### Required Traits
 
 **Storage must implement**:
-- `EcTokens` - For shadow DB lookups
-- `BatchedBackend` - For atomic batch commits
+- `EcTokensV2` - For two-slot lookups
+- `BatchedBackend` - For atomic batch commits with sync support
+
+**Mempool access**:
+- `mempool.block(block, time)` - Submit for consensus (Local protection)
 
 **Peers must provide**:
 - `is_active(peer_id)` - Check if peer is Pending/Connected
 - `find_closest_active_peers(target, count)` - Find sync candidates
 - `get_commit_chain_head(peer_id)` - Get peer's latest CommitBlock
 
-### Message Handling
+### Storage Interface
 
-**In `EcNode`**:
-- Route `QueryCommitBlock` messages to owning peer
-- Route `QueryBlock` messages (normal routing)
-- Route `CommitBlock` responses to requester
-- Route `Block` messages (normal routing)
+```rust
+pub trait EcTokensV2: EcTokens {
+    /// Lookup full token state (both slots)
+    fn lookup_state(&self, token: &TokenId) -> Option<TokenState>;
 
-**In `EcMemoryBackend` (or storage layer)**:
-- Call `commit_chain.tick()` each round
-- Pass messages to `handle_commit_block()` and `handle_block()`
-- Convert `TickMessage` to network messages
+    /// Lookup only current (trusted) - for query serving
+    fn lookup_current(&self, token: &TokenId) -> Option<TrustedMapping>;
+
+    /// Check if current state is Local
+    fn is_local(&self, token: &TokenId) -> bool;
+}
+
+pub trait StorageBatch {
+    fn save_block(&mut self, block: &Block);
+
+    /// Update from mempool commit - always becomes Local
+    fn update_token(&mut self, token: &TokenId, block: &BlockId,
+                    parent: &BlockId, time: EcTime);
+
+    /// Update from sync - handles pending/confirmation logic
+    fn update_token_sync(&mut self, token: &TokenId, block: &BlockId,
+                         parent: &BlockId, time: EcTime, source_peer: PeerId);
+
+    fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>>;
+    fn block_count(&self) -> usize;
+}
+```
 
 ## Configuration
 
@@ -291,21 +381,18 @@ Per committed shadow:
 pub struct CommitChainConfig {
     /// Initial sync target (e.g., 30 days back in seconds)
     pub sync_target: EcTime,  // Default: 30 * 24 * 3600
-
-    /// Minimum confirmations to promote shadow to DB
-    pub confirmation_threshold: usize,  // Default: 2
 }
 ```
+
+Note: `confirmation_threshold` removed - always 2 (source + 1 confirmer).
 
 ## Example: Synchronization Scenario
 
 **New node joins network**:
 
 1. **Tick 0**: Discover 4 closest active peers
-   - Peer 1000 (above)
-   - Peer 2000 (above)
-   - Peer 8000 (below)
-   - Peer 9000 (below)
+   - Peer 1000 (above), Peer 2000 (above)
+   - Peer 8000 (below), Peer 9000 (below)
 
 2. **Tick 1**: Start traces at all 4 heads
    - Send `QueryCommitBlock` to each peer
@@ -315,90 +402,65 @@ pub struct CommitChainConfig {
    - Peer 2000: CommitBlock #5001 (contains blocks 100, 103, 104)
    - Request blocks 100-104
 
-4. **Tick 5**: Receive blocks
-   - Block 100: confirmed by both peers → shadow gets 2 confirmations
-   - Block 101: confirmed by peer 1000 only → shadow gets 1 confirmation
-   - Block 103: confirmed by peer 2000 only → shadow gets 1 confirmation
-   - Apply all to shadow system
+4. **Tick 5**: Receive blocks, apply to storage
+   - Block 100 token T: peer 1000 reports → `pending = (100, 1000)`
+   - Block 100 token T: peer 2000 confirms → `current = Confirmed(100)`
+   - Block 101 token U: peer 1000 only → stays pending
+   - Block 103 token V: peer 2000 only → stays pending
 
-5. **Tick 5**: Promote shadows
-   - Block 100 has 2 confirmations → Batch commit to DB
-   - Blocks 101, 103 still in shadow (waiting for more confirmations)
-
-6. **Tick 6**: Continue traces backwards
-   - Request previous CommitBlocks from all peers
+5. **Tick 6**: Continue traces backwards
+   - Block 101 may get confirmed by peer 8000 or 9000
    - Repeat until watermark reached
 
-**Result**: Node is useful immediately with latest tokens, continues syncing history in background.
+**Result**: Node is useful immediately with confirmed tokens.
 
-## Comparison to Traditional Sync
+## Example: Local Protection
 
-| Aspect | Traditional (Bottom-Up) | Commit Chain (Top-Down) |
-|--------|------------------------|-------------------------|
-| Time to useful | Hours (must sync all) | Seconds (get latest first) |
-| Memory footprint | Large pending state | Small shadow set |
-| Fraud detection | Assumes global order | Multi-peer confirmation |
-| Byzantine tolerance | Weak | Strong (independent peers) |
-| Network efficiency | Sequential | Parallel (4 peers) |
-| Storage writes | Incremental | Batched atomic |
+**Node has Local(100) for token T, peer sends block 200**:
 
-## Mathematical Properties
+1. Commit chain receives block 200 for token T
+2. Check storage: `current = Local(100)`, block 200 > 100
+3. Delegate to mempool: `mempool.block(block_200, time)`
+4. Mempool runs normal consensus:
+   - Checks chain: does 200's parent eventually reach 100?
+   - Collects votes from network
+   - If valid and votes pass → commits
+5. On commit: storage gets `update_token(T, 200, ...)` → `current = Local(200)`
 
-### Convergence
+**Result**: Our commit is protected, update validated by network.
 
-Given:
-- `n` active peers in network
-- `f` Byzantine (faulty) peers where `f < n/3`
-- Confirmation threshold `t = 2`
+## Comparison to Shadow System (Previous Design)
 
-**Theorem**: If at least 2 honest peers confirm a mapping, the probability of accepting a fraudulent mapping approaches 0 as the network stabilizes.
-
-**Proof sketch**:
-- We track 4 peers (2 above, 2 below)
-- Probability all 4 are Byzantine: `(f/n)^4`
-- For `f < n/3`: This approaches 0 as `n` increases
-- With `t=2`: Need at least 2 Byzantine in our set of 4
-- Network-wide: Multiple sync paths provide independent verification
-
-### Worst-Case Shadow Size
-
-Maximum shadows per peer = (tokens in range) × (unconfirmed mapping rate)
-
-For a peer with range covering `R` tokens:
-- If all tokens update simultaneously: `R` shadows created
-- Promotion rate: 1 shadow per tick per token (at threshold)
-- Steady state: `R × (arrival_rate / confirmation_rate)` shadows
-
-**Example**: 10,000 tokens, 100 updates/sec, threshold=2, 4 peers
-- Shadow arrival: 100/sec
-- Confirmation rate: ~50/sec (2 out of 4 peers)
-- Steady state: ~2,000 shadows (~160KB)
-
-## Future Enhancements
-
-1. **Adaptive Peer Selection**: Choose peers based on network regions for better fault tolerance
+| Aspect | Shadow System | Two-Slot Storage |
+|--------|--------------|------------------|
+| Memory | O(unconfirmed tokens) | O(1) - in DB |
+| Crash resilience | Lost | Persisted |
+| Max state per token | Unbounded (confirmation set) | 2 slots |
+| Local protection | None | Mempool delegation |
+| Query serving | Could serve shadows | Only serve current |
+| Complexity | Shadow + promote logic | Simple state machine |
 
 ## Implementation Status
 
 ✅ **Completed**:
 - Top-down synchronization
-- Shadow system with multi-peer confirmation
 - Dynamic peer tracking (drop inactive, add new)
-- Batched atomic commits
 - Ticket-based replay protection
-- Conflict resolution (same parent → highest block-id, different parent → highest time)
-- DB check before shadow creation
 - Received blocks pool (shared across traces)
 - Retry logic (every 10 ticks)
 
-⏸️ **Pending Integration**:
-- Message routing in EcNode
-- Backend trait implementation
+🔄 **In Progress**:
+- Two-slot storage state machine
+- Mempool delegation for Local protection
+- Storage trait extensions
+
+⏸️ **Pending**:
 - Network testing with packet loss/delay
 - Performance benchmarking
 
 ---
 
-**Document Version**: 1.0
-**Last Updated**: 2026-01-03
+**Document Version**: 2.0
+**Last Updated**: 2026-03-01
 **Implementation**: [src/ec_commit_chain.rs](../src/ec_commit_chain.rs)
+**Storage Design**: [Design/unconfirmed_storage.md](./unconfirmed_storage.md)

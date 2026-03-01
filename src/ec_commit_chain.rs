@@ -1,19 +1,21 @@
-//! Commit Chain Module - Simplified Top-Down Sync
+//! Commit Chain Module - Two-Slot Sync
 //!
 //! Implements continuous background synchronization by tracking 4 peer chains
 //! (2 above, 2 below on ring) and syncing from newest to oldest.
 //!
 //! Key principles:
 //! - Global watermark (how far back we've synced)
-//! - Shadow mappings with multi-peer confirmation
+//! - Two-slot persistent storage (current + pending)
 //! - Top-down sync (latest → oldest)
 //! - Simple 2-state machine per peer
-//! - Check Shadow first (fast), then DB (expensive)
+//! - Local protection via mempool delegation
+//! - Highest transaction ID wins (deterministic conflict resolution)
 
 use crate::ec_interface::{
-    Block, BlockId, CommitBlock, CommitBlockId, EcBlocks, EcCommitChainBackend, EcTime, EcTokens,
-    MessageTicket, PeerId, TokenId, GENESIS_BLOCK_ID,
+    Block, BlockId, CommitBlock, CommitBlockId, EcBlocks, EcCommitChainBackend, EcTime,
+    EcTokensV2, MessageTicket, PeerId, StorageBatch, TokenId, GENESIS_BLOCK_ID,
 };
+use crate::ec_mempool::EcMemPool;
 use crate::ec_peers::PeerRange;
 use std::collections::{HashMap, HashSet};
 
@@ -25,21 +27,12 @@ use std::collections::{HashMap, HashSet};
 pub struct CommitChainConfig {
     /// Initial sync target (e.g., 30 days back)
     pub sync_target: EcTime,
-
-    /// Minimum confirmations to promote shadow to DB
-    pub confirmation_threshold: usize,
-
-    /// Maximum requests per tick (removed - not needed with only 4 peers)
-    /// Kept for backward compatibility, not used
-    pub max_requests_per_tick: usize,
 }
 
 impl Default for CommitChainConfig {
     fn default() -> Self {
         Self {
             sync_target: 30 * 24 * 3600, // 30 days
-            confirmation_threshold: 2,   // 2 peers must agree
-            max_requests_per_tick: 20,   // Not used anymore, kept for compatibility
         }
     }
 }
@@ -47,16 +40,6 @@ impl Default for CommitChainConfig {
 // ============================================================================
 // Data Structures
 // ============================================================================
-
-/// Shadow token mapping - tracks most recent update with confirmations
-#[derive(Debug, Clone)]
-struct ShadowTokenMapping {
-    block: BlockId,
-    parent: BlockId,
-    time: EcTime,
-    /// Peers that confirmed this exact (block, parent, time) tuple
-    confirmations: HashSet<PeerId>,
-}
 
 /// Trace state machine (per peer)
 #[derive(Debug, Clone)]
@@ -116,9 +99,6 @@ pub struct EcCommitChain {
     /// Track 4 peers (2 above, 2 below on ring)
     peer_logs: HashMap<PeerId, PeerChainLog>,
 
-    /// Shadow mappings (unconfirmed tokens)
-    shadows: HashMap<TokenId, ShadowTokenMapping>,
-
     /// Blocks to store (block-id in range, but no tokens in range)
     blocks_to_store: HashMap<BlockId, Block>,
 
@@ -134,6 +114,26 @@ pub struct EcCommitChain {
     ticket_secret: u64,
 }
 
+// ============================================================================
+// Sync Operation Types
+// ============================================================================
+
+/// Represents a sync update to apply during batch commit
+enum SyncOperation {
+    /// Update token via sync (two-slot state machine)
+    UpdateTokenSync {
+        token: TokenId,
+        block: BlockId,
+        parent: BlockId,
+        time: EcTime,
+        source_peer: PeerId,
+    },
+    /// Save block (no tokens in our range, but block-id in range)
+    SaveBlock(Block),
+    /// Delegate to mempool (Local protection)
+    DelegateToMempool(Block),
+}
+
 impl EcCommitChain {
     pub fn new(peer_id: PeerId, my_range: PeerRange, config: CommitChainConfig) -> Self {
         // Simple ticket secret (in production: crypto random)
@@ -145,7 +145,6 @@ impl EcCommitChain {
             watermark: config.sync_target, // Initial watermark
             config,
             peer_logs: HashMap::new(),
-            shadows: HashMap::new(),
             blocks_to_store: HashMap::new(),
             received_blocks: HashMap::new(),
             ticket_secret,
@@ -166,166 +165,6 @@ impl EcCommitChain {
 
     fn verify_ticket(&self, id: u64, ticket: MessageTicket) -> bool {
         self.generate_ticket(id) == ticket
-    }
-
-    // ========================================================================
-    // Shadow Logic
-    // ========================================================================
-
-    /// Apply a block to shadow system
-    ///
-    /// peer_id is added as a confirmation when creating/updating shadow.
-    ///
-    /// Strategy:
-    /// 1. Check if any tokens in our range
-    /// 2. If no tokens but block-id in range: store block
-    /// 3. For each token in range:
-    ///    - Check Shadow first (fast HashMap lookup)
-    ///    - If in Shadow: apply conflict resolution
-    ///      - Same block-id → count confirmation
-    ///      - Same parent → highest block-id wins
-    ///      - Different parent → highest time wins
-    ///    - If not in Shadow: check DB (expensive)
-    ///      - If DB has token and block is newer → create shadow
-    ///      - If DB has token and is newer/same → ignore (DB wins)
-    ///      - If DB doesn't have token → create shadow
-    fn apply_block_to_shadow(&mut self, block: &Block, storage: &dyn EcTokens, peer_id: PeerId) {
-        // Check if any tokens in our range
-        let tokens_in_range = block.parts[0..block.used as usize]
-            .iter()
-            .any(|tb| self.my_range.in_range(&tb.token));
-
-        if !tokens_in_range {
-            // No tokens in our range - check if block-id in range
-            if self.my_range.in_range(&block.id) {
-                // Must store for serving to others
-                self.blocks_to_store.insert(block.id, block.clone());
-            }
-            return;
-        }
-
-        // Process tokens in our range
-        for i in 0..block.used as usize {
-            let token = block.parts[i].token;
-            if !self.my_range.in_range(&token) {
-                continue;
-            }
-
-            let parent = block.parts[i].last;
-
-            // Check Shadow first (fast HashMap lookup)
-            if let Some(shadow) = self.shadows.get_mut(&token) {
-                // Same block-id → count confirmation
-                if block.id == shadow.block {
-                    shadow.confirmations.insert(peer_id);
-                    continue;
-                }
-
-                // Same parent → conflict: highest block-id wins
-                if parent == shadow.parent {
-                    if block.id > shadow.block {
-                        shadow.block = block.id;
-                        shadow.time = block.time;
-                        shadow.confirmations.clear();
-                        shadow.confirmations.insert(peer_id);
-                    }
-                    // Else: shadow has higher block-id, ignore
-                } else {
-                    // Different parent → check if newer time
-                    if block.time > shadow.time {
-                        shadow.block = block.id;
-                        shadow.parent = parent;
-                        shadow.time = block.time;
-                        shadow.confirmations.clear();
-                        shadow.confirmations.insert(peer_id);
-                    }
-                    // Else: shadow is newer, ignore
-                }
-            } else {
-                // Not in shadow - check DB (expensive)
-                if let Some(current) = storage.lookup(&token) {
-                    // DB has this token - only create shadow if block is newer
-                    if block.time > current.time() {
-                        let mut confirmations = HashSet::new();
-                        confirmations.insert(peer_id);
-                        self.shadows.insert(
-                            token,
-                            ShadowTokenMapping {
-                                block: block.id,
-                                parent,
-                                time: block.time,
-                                confirmations,
-                            },
-                        );
-                    }
-                    // Else: DB is newer or same time, ignore (DB wins even if conflict)
-                } else {
-                    // First time seeing this token - create shadow
-                    let mut confirmations = HashSet::new();
-                    confirmations.insert(peer_id);
-                    self.shadows.insert(
-                        token,
-                        ShadowTokenMapping {
-                            block: block.id,
-                            parent,
-                            time: block.time,
-                            confirmations,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// Promote shadows that have enough confirmations
-    ///
-    /// Creates a batch with:
-    /// - Token updates for promoted shadows
-    /// - Block saves for all dependent blocks (from received_blocks)
-    /// - Block saves for blocks in our range (from blocks_to_store)
-    fn promote_shadows(&mut self, storage: &mut dyn crate::ec_interface::BatchedBackend) {
-        // Collect shadows to promote
-        let mut to_promote = Vec::new();
-        for (token, shadow) in &self.shadows {
-            if shadow.confirmations.len() >= self.config.confirmation_threshold {
-                to_promote.push(*token);
-            }
-        }
-
-        // If nothing to promote and no blocks to store, skip
-        if to_promote.is_empty() && self.blocks_to_store.is_empty() {
-            return;
-        }
-
-        // Start batch
-        let mut batch = storage.begin_batch();
-
-        // Promote shadows: update tokens and save dependent blocks
-        for token in to_promote {
-            if let Some(shadow) = self.shadows.remove(&token) {
-                // Update token mapping
-                batch.update_token(&token, &shadow.block, &shadow.parent, shadow.time);
-
-                // Save the block if we have it
-                if let Some(block) = self.received_blocks.remove(&shadow.block) {
-                    batch.save_block(&block);
-                }
-            }
-        }
-
-        // Save all blocks in our block-id range (but no tokens in range)
-        for block in self.blocks_to_store.values() {
-            batch.save_block(block);
-        }
-
-        // Commit batch
-        if let Err(e) = batch.commit() {
-            // Log error but continue - shadows were removed so we won't retry
-            eprintln!("Error committing batch: {:?}", e);
-        } else {
-            // Clear blocks_to_store on successful commit
-            self.blocks_to_store.clear();
-        }
     }
 
     // ========================================================================
@@ -401,7 +240,7 @@ impl EcCommitChain {
 
     /// Handle incoming CommitBlock
     ///
-    /// Tracks which peer committed which blocks (for confirmations later)
+    /// Tracks which peer committed which blocks
     pub fn handle_commit_block(
         &mut self,
         block: CommitBlock,
@@ -456,55 +295,141 @@ impl EcCommitChain {
     ///
     /// Blocks arrive via routing from any peer (not necessarily tracking peers).
     /// Multiple logs may need the same block, so we store in shared pool.
-    ///
-    /// Note: apply_block_to_shadow happens in process_peer_logs, not here.
-    /// This allows the peer-chain to be counted as a confirmation.
     pub fn handle_block(&mut self, block: Block, _ticket: MessageTicket) -> bool {
         // Note: Ticket validation is now handled by TicketManager in ec_node.rs
         // This method is only called after ticket has been validated
 
         // Just store in shared pool
-        // Will be applied to shadow in process_peer_logs
+        // Will be applied to storage in process_peer_logs
         self.received_blocks.insert(block.id, block);
 
         true
     }
 
-    /// Process received blocks for all peer logs
+    /// Collect sync operations from received blocks (read phase)
     ///
-    /// Called during tick to advance traces based on received blocks
-    fn process_peer_logs(&mut self, token_storage: &dyn EcTokens) {
-        // Step 1: Collect blocks to process from peer logs (without mutating)
+    /// Reads storage state to determine what operations are needed.
+    /// Returns list of operations to apply and work items for trace updates.
+    fn collect_sync_operations<S>(
+        &self,
+        storage: &S,
+    ) -> (Vec<SyncOperation>, Vec<(PeerId, CommitBlock)>)
+    where
+        S: EcTokensV2,
+    {
+        let mut operations = Vec::new();
         let mut work: Vec<(PeerId, CommitBlock)> = Vec::new();
 
+        // Collect work from peer logs
         for (peer_id, log) in &self.peer_logs {
             if let Some(TraceState::FetchingBlocks {
                 commit_block,
                 waiting_for,
             }) = &log.current_trace
             {
-                // Check if all blocks have arrived
-                let all_received = waiting_for
+                // Check if any blocks have arrived
+                let has_new_blocks = waiting_for
                     .iter()
-                    .all(|id| self.received_blocks.contains_key(id));
-                if all_received || !waiting_for.is_empty() {
+                    .any(|id| self.received_blocks.contains_key(id));
+                if has_new_blocks {
                     work.push((*peer_id, commit_block.clone()));
                 }
             }
         }
 
-        // Step 2: Apply blocks to shadows (can mutate shadows safely)
+        // Collect operations for each block
         for (peer_id, commit_block) in &work {
             for block_id in &commit_block.committed_blocks {
-                if let Some(block) = self.received_blocks.get(block_id).cloned() {
-                    // Apply to shadow with peer confirmation
-                    // This will add the peer to confirmations when creating/updating shadow
-                    self.apply_block_to_shadow(&block, token_storage, *peer_id);
+                if let Some(block) = self.received_blocks.get(block_id) {
+                    // Check tokens in our range
+                    let tokens_in_range: Vec<_> = (0..block.used as usize)
+                        .filter(|&i| self.my_range.in_range(&block.parts[i].token))
+                        .collect();
+
+                    if tokens_in_range.is_empty() {
+                        // No tokens in our range - check if block-id in range
+                        if self.my_range.in_range(&block.id) {
+                            operations.push(SyncOperation::SaveBlock(*block));
+                        }
+                        continue;
+                    }
+
+                    // Check for Local protection
+                    let mut delegate_to_mempool = false;
+                    for &i in &tokens_in_range {
+                        let token = block.parts[i].token;
+                        if storage.is_local(&token) {
+                            if let Some(current_block) = storage
+                                .lookup_state(&token)
+                                .and_then(|s| s.current_block())
+                            {
+                                if block.id > current_block {
+                                    // Local exists and new block is higher
+                                    delegate_to_mempool = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if delegate_to_mempool {
+                        operations.push(SyncOperation::DelegateToMempool(*block));
+                    } else {
+                        // Normal sync updates
+                        for &i in &tokens_in_range {
+                            let token = block.parts[i].token;
+                            let parent = block.parts[i].last;
+
+                            // Skip if Local (already handled above, or block.id <= current)
+                            if !storage.is_local(&token) {
+                                operations.push(SyncOperation::UpdateTokenSync {
+                                    token,
+                                    block: block.id,
+                                    parent,
+                                    time: block.time,
+                                    source_peer: *peer_id,
+                                });
+                            }
+                        }
+                        operations.push(SyncOperation::SaveBlock(*block));
+                    }
                 }
             }
         }
 
-        // Step 3: Update peer logs (advance traces, update watermark)
+        (operations, work)
+    }
+
+    /// Apply sync operations to batch and mempool (write phase)
+    fn apply_sync_operations(
+        operations: &[SyncOperation],
+        batch: &mut dyn StorageBatch,
+        mempool: &mut EcMemPool,
+        time: EcTime,
+    ) {
+        for op in operations {
+            match op {
+                SyncOperation::UpdateTokenSync {
+                    token,
+                    block,
+                    parent,
+                    time: block_time,
+                    source_peer,
+                } => {
+                    batch.update_token_sync(token, block, parent, *block_time, *source_peer);
+                }
+                SyncOperation::SaveBlock(block) => {
+                    batch.save_block(block);
+                }
+                SyncOperation::DelegateToMempool(block) => {
+                    mempool.block(block, time);
+                }
+            }
+        }
+    }
+
+    /// Update peer logs after processing (advance traces, update watermark)
+    fn update_peer_logs_after_sync(&mut self, work: Vec<(PeerId, CommitBlock)>) {
         for (peer_id, commit_block) in work {
             let log = match self.peer_logs.get_mut(&peer_id) {
                 Some(l) => l,
@@ -571,22 +496,43 @@ impl EcCommitChain {
         &mut self,
         peers: &crate::ec_peers::EcPeers,
         storage: &mut S,
-        _time: EcTime,
+        mempool: &mut EcMemPool,
+        time: EcTime,
     ) -> Vec<(PeerId, TickMessage)>
     where
-        S: crate::ec_interface::EcTokens + crate::ec_interface::BatchedBackend,
+        S: EcTokensV2 + crate::ec_interface::BatchedBackend,
     {
         let mut messages = Vec::new();
 
         // Update tracked peers (drop inactive, add new if below 4)
         self.update_tracked_peers(peers);
 
-        // Process received blocks (advance traces, add confirmations)
-        // Use immutable reference for read-only token lookups
-        self.process_peer_logs(storage as &dyn crate::ec_interface::EcTokens);
+        // Phase 1: Collect operations (reads storage, no mutations)
+        let (operations, work) = self.collect_sync_operations(storage);
+
+        // Phase 2: Create batch and apply operations
+        let mut batch = storage.begin_batch();
+
+        // Apply collected sync operations
+        Self::apply_sync_operations(&operations, &mut *batch, mempool, time);
+
+        // Save blocks in our block-id range (no tokens in range)
+        for block in self.blocks_to_store.values() {
+            batch.save_block(block);
+        }
+
+        // Commit batch
+        if let Err(e) = batch.commit() {
+            eprintln!("Error committing batch: {:?}", e);
+        } else {
+            // Clear blocks_to_store on successful commit
+            self.blocks_to_store.clear();
+        }
+
+        // Phase 3: Update peer logs (advance traces, update watermark)
+        self.update_peer_logs_after_sync(work);
 
         // Generate requests for each peer's trace
-        // No budget - only 4 peers max with limited blocks each
 
         // Collect work to do (without holding mutable borrows)
         let mut start_traces = Vec::new();
@@ -659,9 +605,6 @@ impl EcCommitChain {
             }
         }
 
-        // Promote shadows (batched write operation)
-        self.promote_shadows(storage);
-
         messages
     }
 
@@ -707,10 +650,14 @@ pub enum TickMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec_interface::{
+        BatchedBackend, BlockTime, EcTokens, PendingMapping, TokenId, TokenSignature, TokenState,
+        TrustSource, TrustedMapping,
+    };
     use std::collections::HashMap;
 
     struct MockTokenStorage {
-        tokens: HashMap<TokenId, crate::ec_interface::BlockTime>,
+        tokens: HashMap<TokenId, TokenState>,
     }
 
     impl MockTokenStorage {
@@ -722,14 +669,23 @@ mod tests {
     }
 
     impl EcTokens for MockTokenStorage {
-        fn lookup(&self, token: &TokenId) -> Option<&crate::ec_interface::BlockTime> {
-            self.tokens.get(token)
+        fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
+            // For compatibility - return None, use lookup_state instead
+            None
         }
 
         fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
             self.tokens.insert(
                 *token,
-                crate::ec_interface::BlockTime::new(*block, *parent, time),
+                TokenState {
+                    current: Some(TrustedMapping {
+                        block: *block,
+                        parent: *parent,
+                        time,
+                        source: TrustSource::Local,
+                    }),
+                    pending: None,
+                },
             );
         }
 
@@ -737,8 +693,24 @@ mod tests {
             &self,
             _token: &TokenId,
             _peer: &PeerId,
-        ) -> Option<crate::ec_interface::TokenSignature> {
-            None // Not needed for commit chain tests
+        ) -> Option<TokenSignature> {
+            None
+        }
+    }
+
+    impl EcTokensV2 for MockTokenStorage {
+        fn lookup_state(&self, token: &TokenId) -> Option<TokenState> {
+            self.tokens.get(token).cloned()
+        }
+
+        fn lookup_current(&self, token: &TokenId) -> Option<TrustedMapping> {
+            self.tokens.get(token).and_then(|s| s.current)
+        }
+
+        fn is_local(&self, token: &TokenId) -> bool {
+            self.tokens
+                .get(token)
+                .map_or(false, |s| s.is_local())
         }
     }
 
@@ -746,21 +718,107 @@ mod tests {
     struct MockBatch<'a> {
         storage: &'a mut MockTokenStorage,
         blocks: Vec<Block>,
-        tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,
+        sync_updates: Vec<(TokenId, BlockId, BlockId, EcTime, PeerId)>,
+        local_updates: Vec<(TokenId, BlockId, BlockId, EcTime)>,
     }
 
-    impl<'a> crate::ec_interface::StorageBatch for MockBatch<'a> {
+    impl<'a> StorageBatch for MockBatch<'a> {
         fn save_block(&mut self, block: &Block) {
             self.blocks.push(*block);
         }
 
         fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-            self.tokens.push((*token, *block, *parent, time));
+            self.local_updates.push((*token, *block, *parent, time));
+        }
+
+        fn update_token_sync(
+            &mut self,
+            token: &TokenId,
+            block: &BlockId,
+            parent: &BlockId,
+            time: EcTime,
+            source_peer: PeerId,
+        ) {
+            self.sync_updates.push((*token, *block, *parent, time, source_peer));
         }
 
         fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
-            for (token, block, parent, time) in &self.tokens {
+            // Apply local updates (become Local)
+            for (token, block, parent, time) in &self.local_updates {
                 self.storage.set(token, block, parent, *time);
+            }
+
+            // Apply sync updates (two-slot logic)
+            for (token, block, parent, time, source_peer) in &self.sync_updates {
+                let state = self.storage.tokens.entry(*token).or_default();
+
+                match (&state.current, &state.pending) {
+                    (None, None) => {
+                        // First seen - create pending
+                        state.pending = Some(PendingMapping {
+                            block: *block,
+                            parent: *parent,
+                            time: *time,
+                            source_peer: *source_peer,
+                        });
+                    }
+                    (None, Some(p)) => {
+                        if *block == p.block && *source_peer != p.source_peer {
+                            // Confirmation! Promote to current
+                            state.current = Some(TrustedMapping {
+                                block: p.block,
+                                parent: p.parent,
+                                time: p.time,
+                                source: TrustSource::Confirmed,
+                            });
+                            state.pending = None;
+                        } else if *block > p.block {
+                            // Higher ID replaces pending
+                            state.pending = Some(PendingMapping {
+                                block: *block,
+                                parent: *parent,
+                                time: *time,
+                                source_peer: *source_peer,
+                            });
+                        }
+                    }
+                    (Some(c), pending) => {
+                        if *block <= c.block {
+                            // Not newer than current, ignore
+                            continue;
+                        }
+                        // Newer block - handle based on pending
+                        match pending {
+                            None => {
+                                state.pending = Some(PendingMapping {
+                                    block: *block,
+                                    parent: *parent,
+                                    time: *time,
+                                    source_peer: *source_peer,
+                                });
+                            }
+                            Some(p) if *block == p.block && *source_peer != p.source_peer => {
+                                // Confirms pending
+                                state.current = Some(TrustedMapping {
+                                    block: p.block,
+                                    parent: p.parent,
+                                    time: p.time,
+                                    source: TrustSource::Confirmed,
+                                });
+                                state.pending = None;
+                            }
+                            Some(p) if *block > p.block => {
+                                state.pending = Some(PendingMapping {
+                                    block: *block,
+                                    parent: *parent,
+                                    time: *time,
+                                    source_peer: *source_peer,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -771,21 +829,20 @@ mod tests {
     }
 
     impl crate::ec_interface::BatchedBackend for MockTokenStorage {
-        fn begin_batch(&mut self) -> Box<dyn crate::ec_interface::StorageBatch + '_> {
+        fn begin_batch(&mut self) -> Box<dyn StorageBatch + '_> {
             Box::new(MockBatch {
                 storage: self,
                 blocks: Vec::new(),
-                tokens: Vec::new(),
+                sync_updates: Vec::new(),
+                local_updates: Vec::new(),
             })
         }
     }
 
     #[test]
-    fn test_shadow_confirmation() {
+    fn test_two_slot_confirmation() {
         use crate::ec_interface::{TokenBlock, TOKENS_PER_BLOCK};
 
-        let my_range = PeerRange::new(0, 1000);
-        let mut chain = EcCommitChain::new(500, my_range, CommitChainConfig::default());
         let mut storage = MockTokenStorage::new();
 
         // Create a block
@@ -796,72 +853,80 @@ mod tests {
             parts: [TokenBlock::default(); TOKENS_PER_BLOCK],
             signatures: [None; TOKENS_PER_BLOCK],
         };
-        block.parts[0].token = 50; // In range
+        block.parts[0].token = 50;
         block.parts[0].last = GENESIS_BLOCK_ID;
 
-        // Apply from peer 1
-        chain.apply_block_to_shadow(&block, &storage, 1);
-        assert_eq!(chain.shadows.len(), 1);
-        assert_eq!(chain.shadows[&50].confirmations.len(), 1);
+        // Apply from peer 1 via batch
+        {
+            let mut batch = storage.begin_batch();
+            batch.update_token_sync(&50, &100, &GENESIS_BLOCK_ID, 1000, 1);
+            batch.commit().unwrap();
+        }
+
+        // Should be pending
+        let state = storage.lookup_state(&50).unwrap();
+        assert!(state.current.is_none());
+        assert!(state.pending.is_some());
+        assert_eq!(state.pending.unwrap().block, 100);
 
         // Apply same block from peer 2 (confirmation)
-        chain.apply_block_to_shadow(&block, &storage, 2);
-        assert_eq!(chain.shadows.len(), 1);
-        assert_eq!(chain.shadows[&50].confirmations.len(), 2);
+        {
+            let mut batch = storage.begin_batch();
+            batch.update_token_sync(&50, &100, &GENESIS_BLOCK_ID, 1000, 2);
+            batch.commit().unwrap();
+        }
 
-        // Promote (threshold = 2)
-        chain.promote_shadows(&mut storage);
-        assert_eq!(chain.shadows.len(), 0);
-        assert!(storage.lookup(&50).is_some());
-        assert_eq!(storage.lookup(&50).unwrap().block(), 100);
+        // Should be confirmed now
+        let state = storage.lookup_state(&50).unwrap();
+        assert!(state.current.is_some());
+        assert!(state.pending.is_none());
+        assert_eq!(state.current.unwrap().block, 100);
+        assert_eq!(state.current.unwrap().source, TrustSource::Confirmed);
     }
 
     #[test]
-    fn test_conflict_resolution() {
+    fn test_highest_id_wins() {
         use crate::ec_interface::{TokenBlock, TOKENS_PER_BLOCK};
 
-        let my_range = PeerRange::new(0, 1000);
-        let mut chain = EcCommitChain::new(500, my_range, CommitChainConfig::default());
         let mut storage = MockTokenStorage::new();
 
-        // First block
-        let mut block1 = Block {
-            id: 100,
-            time: 1000,
-            used: 1,
-            parts: [TokenBlock::default(); TOKENS_PER_BLOCK],
-            signatures: [None; TOKENS_PER_BLOCK],
-        };
-        block1.parts[0].token = 50;
-        block1.parts[0].last = GENESIS_BLOCK_ID;
+        // Apply block 100 from peer 1
+        {
+            let mut batch = storage.begin_batch();
+            batch.update_token_sync(&50, &100, &GENESIS_BLOCK_ID, 1000, 1);
+            batch.commit().unwrap();
+        }
 
-        chain.apply_block_to_shadow(&block1, &storage, 1);
+        // Apply block 200 from peer 2 (higher ID wins)
+        {
+            let mut batch = storage.begin_batch();
+            batch.update_token_sync(&50, &200, &GENESIS_BLOCK_ID, 1000, 2);
+            batch.commit().unwrap();
+        }
 
-        // Conflicting block (higher ID wins)
-        let mut block2 = Block {
-            id: 200,
-            time: 1000,
-            used: 1,
-            parts: [TokenBlock::default(); TOKENS_PER_BLOCK],
-            signatures: [None; TOKENS_PER_BLOCK],
-        };
-        block2.parts[0].token = 50;
-        block2.parts[0].last = GENESIS_BLOCK_ID;
+        // Pending should be block 200
+        let state = storage.lookup_state(&50).unwrap();
+        assert!(state.current.is_none());
+        assert_eq!(state.pending.unwrap().block, 200);
 
-        chain.apply_block_to_shadow(&block2, &storage, 2);
+        // Apply block 200 from peer 3 (confirmation)
+        {
+            let mut batch = storage.begin_batch();
+            batch.update_token_sync(&50, &200, &GENESIS_BLOCK_ID, 1000, 3);
+            batch.commit().unwrap();
+        }
 
-        // Should have block2 (200 > 100)
-        assert_eq!(chain.shadows[&50].block, 200);
-        assert_eq!(chain.shadows[&50].confirmations.len(), 1); // Peer 2 confirmed the winner
+        // Should be confirmed with block 200
+        let state = storage.lookup_state(&50).unwrap();
+        assert_eq!(state.current.unwrap().block, 200);
     }
 
     #[test]
-    fn test_block_not_in_token_range_but_in_block_range() {
+    fn test_block_in_range_no_tokens() {
         use crate::ec_interface::{TokenBlock, TOKENS_PER_BLOCK};
 
         let my_range = PeerRange::new(0, 1000);
         let mut chain = EcCommitChain::new(500, my_range, CommitChainConfig::default());
-        let storage = MockTokenStorage::new();
 
         // Block with token outside range, but block-id in range
         let mut block = Block {
@@ -873,11 +938,32 @@ mod tests {
         };
         block.parts[0].token = 2000; // Token outside range
 
-        chain.apply_block_to_shadow(&block, &storage, 999);
+        // Store in received_blocks
+        chain.received_blocks.insert(block.id, block);
 
-        // Should store block for serving
-        assert_eq!(chain.blocks_to_store.len(), 1);
-        assert!(chain.blocks_to_store.contains_key(&50));
-        assert_eq!(chain.shadows.len(), 0);
+        // Set up a peer log to reference this block
+        let commit_block = CommitBlock::new(999, GENESIS_BLOCK_ID, 1000, vec![block.id]);
+        chain.peer_logs.insert(
+            100,
+            PeerChainLog {
+                peer_id: 100,
+                known_head: Some(999),
+                current_trace: Some(TraceState::FetchingBlocks {
+                    commit_block,
+                    waiting_for: [block.id].into_iter().collect(),
+                }),
+                first_commit_time: Some(1000),
+            },
+        );
+
+        // Collect sync operations
+        let storage = MockTokenStorage::new();
+        let (operations, _work) = chain.collect_sync_operations(&storage);
+
+        // Should have a SaveBlock operation for the block
+        let save_count = operations.iter().filter(|op| {
+            matches!(op, SyncOperation::SaveBlock(b) if b.id == 50)
+        }).count();
+        assert_eq!(save_count, 1, "Block should be saved since block-id is in range");
     }
 }
