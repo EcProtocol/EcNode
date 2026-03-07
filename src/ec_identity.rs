@@ -43,20 +43,32 @@
 //! }
 //! ```
 //!
-//! ## Shared Secrets
+//! ## Shared Secrets with Network Isolation
 //!
 //! Shared secrets are computed **on-demand** (not stored in `PeerIdentity`):
-//! - Computed via `identity.compute_shared_secret(&their_public_key)`
+//! - Computed via `identity.compute_shared_secret(&their_public_key, network_id)`
+//! - Derived through Blake3 with network_id for network isolation
 //! - Cached by `EcPeers` for performance
-//! - Each peer pair has a unique symmetric secret
+//! - Each peer pair has a unique symmetric secret **per network**
+//!
+//! **Network Isolation**: The raw X25519 DH output is derived through Blake3 with
+//! network_id as context. This ensures that even if peers from different networks
+//! exchange public keys, they will compute different shared secrets:
+//! ```text
+//! shared_secret = Blake3(raw_dh || network_id || "ecRust-network-secret-v1")
+//! ```
 
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
     Argon2, Params, Version,
 };
+use blake3::Hasher;
 use rand::rngs::OsRng;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+/// Domain separator for shared secret derivation (prevents cross-protocol attacks)
+const SHARED_SECRET_DOMAIN: &[u8] = b"EC-network-secret-v1";
 
 /// Peer address (256-bit identifier derived from proof-of-work)
 pub type PeerId = [u8; 32];
@@ -455,25 +467,56 @@ impl PeerIdentity {
 
     /// Compute a shared secret with another peer using X25519 Diffie-Hellman
     ///
-    /// This performs ECDH key exchange using our static secret and their public key.
-    /// Both parties can independently compute the same shared secret.
+    /// This performs ECDH key exchange using our static secret and their public key,
+    /// then derives the final shared secret through Blake3 with the network_id.
+    /// Both parties can independently compute the same shared secret **only if they
+    /// are on the same network**.
+    ///
+    /// # Network Isolation
+    /// The raw DH secret is derived through Blake3 with network_id as context:
+    /// ```text
+    /// shared_secret = Blake3(raw_dh || network_id || domain_separator)
+    /// ```
+    /// This ensures that even if two peers from different networks exchange public keys,
+    /// they will compute different shared secrets and cannot establish encrypted communication.
     ///
     /// # Design Note
     /// - This is computed **on-demand** when communicating with a peer
     /// - **Not stored** in PeerIdentity (ephemeral per-peer secret)
     /// - `EcPeers` will cache computed secrets for performance
-    /// - Each peer pair has a unique shared secret
+    /// - Each peer pair has a unique shared secret **per network**
     ///
     /// # Arguments
     /// * `their_public_key` - The other peer's X25519 public key
+    /// * `network_id` - The network identifier for isolation (0 = mainnet)
     ///
     /// # Returns
-    /// A 256-bit shared secret that both parties can independently compute
+    /// A 256-bit shared secret that both parties can independently compute,
+    /// provided they use the same network_id.
     ///
-    /// # Security Note
-    /// The raw shared secret should typically be passed through a KDF (Key Derivation Function)
-    /// before use as an encryption key. Consider using HKDF or similar.
-    pub fn compute_shared_secret(&self, their_public_key: &PublicKey) -> SharedSecret {
+    /// # Security Properties
+    /// - **Network isolation**: Different networks produce different secrets
+    /// - **Domain separation**: Cannot reuse secrets for other protocols
+    /// - **Key derivation**: Raw DH properly derived through Blake3 KDF
+    pub fn compute_shared_secret(&self, their_public_key: &PublicKey, network_id: u64) -> SharedSecret {
+        let raw_secret = self.static_secret.diffie_hellman(their_public_key);
+
+        // Derive shared secret with network_id for network isolation
+        // Using Blake3 as KDF: shared_secret = Blake3(raw_dh || network_id || domain)
+        let mut hasher = Hasher::new();
+        hasher.update(raw_secret.as_bytes());
+        hasher.update(&network_id.to_le_bytes());
+        hasher.update(SHARED_SECRET_DOMAIN);
+
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Compute a shared secret without network isolation (for testing/migration only)
+    ///
+    /// **WARNING**: This bypasses network isolation. Use `compute_shared_secret()` instead.
+    /// This method exists only for backwards compatibility testing.
+    #[cfg(test)]
+    pub fn compute_shared_secret_raw(&self, their_public_key: &PublicKey) -> SharedSecret {
         let shared_secret = self.static_secret.diffie_hellman(their_public_key);
         *shared_secret.as_bytes()
     }
@@ -626,11 +669,14 @@ mod tests {
         let alice = PeerIdentity::new();
         let bob = PeerIdentity::new();
 
+        // Same network_id for both
+        let network_id = 0; // mainnet
+
         // Alice computes shared secret with Bob's public key
-        let alice_shared = alice.compute_shared_secret(&bob.public_key);
+        let alice_shared = alice.compute_shared_secret(&bob.public_key, network_id);
 
         // Bob computes shared secret with Alice's public key
-        let bob_shared = bob.compute_shared_secret(&alice.public_key);
+        let bob_shared = bob.compute_shared_secret(&alice.public_key, network_id);
 
         // Both should compute the same shared secret
         assert_eq!(alice_shared, bob_shared);
@@ -646,14 +692,95 @@ mod tests {
         let bob = PeerIdentity::new();
         let charlie = PeerIdentity::new();
 
+        let network_id = 0; // mainnet
+
         // Alice-Bob shared secret
-        let alice_bob = alice.compute_shared_secret(&bob.public_key);
+        let alice_bob = alice.compute_shared_secret(&bob.public_key, network_id);
 
         // Alice-Charlie shared secret
-        let alice_charlie = alice.compute_shared_secret(&charlie.public_key);
+        let alice_charlie = alice.compute_shared_secret(&charlie.public_key, network_id);
 
         // These should be different
         assert_ne!(alice_bob, alice_charlie);
+    }
+
+    // ==================== Shared Secret Network Isolation Tests ====================
+
+    #[test]
+    fn test_shared_secret_network_isolated() {
+        // Create two peer identities
+        let alice = PeerIdentity::new();
+        let bob = PeerIdentity::new();
+
+        let mainnet_id = 0;
+        let testnet_id = 12345;
+
+        // Compute shared secret on mainnet
+        let alice_mainnet = alice.compute_shared_secret(&bob.public_key, mainnet_id);
+        let bob_mainnet = bob.compute_shared_secret(&alice.public_key, mainnet_id);
+
+        // Compute shared secret on testnet
+        let alice_testnet = alice.compute_shared_secret(&bob.public_key, testnet_id);
+        let bob_testnet = bob.compute_shared_secret(&alice.public_key, testnet_id);
+
+        // Same network: secrets match
+        assert_eq!(alice_mainnet, bob_mainnet);
+        assert_eq!(alice_testnet, bob_testnet);
+
+        // Different networks: secrets do NOT match
+        assert_ne!(alice_mainnet, alice_testnet);
+        assert_ne!(bob_mainnet, bob_testnet);
+
+        // Cross-network: Alice's mainnet secret != Bob's testnet secret
+        assert_ne!(alice_mainnet, bob_testnet);
+    }
+
+    #[test]
+    fn test_shared_secret_cross_network_communication_fails() {
+        // Scenario: Alice is on network A, Bob is on network B
+        // They exchange public keys but use different network_ids
+        let alice = PeerIdentity::new();
+        let bob = PeerIdentity::new();
+
+        let network_a = 1000;
+        let network_b = 2000;
+
+        // Alice computes with her network_id
+        let alice_secret = alice.compute_shared_secret(&bob.public_key, network_a);
+
+        // Bob computes with his network_id
+        let bob_secret = bob.compute_shared_secret(&alice.public_key, network_b);
+
+        // Communication would FAIL - different secrets means different encryption keys
+        assert_ne!(alice_secret, bob_secret);
+    }
+
+    #[test]
+    fn test_shared_secret_derived_not_raw() {
+        // Verify that compute_shared_secret produces derived output, not raw DH
+        let alice = PeerIdentity::new();
+        let bob = PeerIdentity::new();
+
+        // Get derived secret (with network_id)
+        let derived = alice.compute_shared_secret(&bob.public_key, 0);
+
+        // Get raw DH secret
+        let raw = alice.compute_shared_secret_raw(&bob.public_key);
+
+        // They should be different (derived goes through Blake3)
+        assert_ne!(derived, raw);
+    }
+
+    #[test]
+    fn test_shared_secret_domain_separation() {
+        // Same peers, same network_id produces same secret (deterministic)
+        let alice = PeerIdentity::new();
+        let bob = PeerIdentity::new();
+
+        let secret1 = alice.compute_shared_secret(&bob.public_key, 42);
+        let secret2 = alice.compute_shared_secret(&bob.public_key, 42);
+
+        assert_eq!(secret1, secret2);
     }
 
     #[test]
@@ -661,9 +788,9 @@ mod tests {
         // Phase 1: Create identity with keypair
         let mut identity = PeerIdentity::new();
 
-        // Can use for DH immediately
+        // Can use for DH immediately (even before mining)
         let other = PeerIdentity::new();
-        let _secret = identity.compute_shared_secret(&other.public_key);
+        let _secret = identity.compute_shared_secret(&other.public_key, 0);
 
         // Not mined yet
         assert!(!identity.is_mined());

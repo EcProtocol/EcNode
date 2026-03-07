@@ -87,6 +87,57 @@ When validating an identity, nodes check:
 
 **Attack Cost**: Without knowing the network_id, an attacker must search $2^{64}$ network IDs × $2^{24}$ PoW attempts ≈ $2^{88}$ Argon2 hashes ≈ $10^{16}$ years.
 
+### Shared Secret Network Isolation
+
+**Problem**: Identity PoW isolation prevents cross-network identity validation, but if two peers from different networks somehow exchange public keys, they could still compute valid X25519 shared secrets and potentially establish encrypted communication.
+
+**Solution**: Derive shared secrets through Blake3 with network_id as context, ensuring cryptographic isolation at the communication layer as well.
+
+**Derivation Formula**:
+$$\text{shared\_secret} = \text{Blake3}(\text{raw\_dh} \| \text{network\_id} \| \text{domain\_separator})$$
+
+where:
+- $\text{raw\_dh} = \text{X25519}(\text{my\_private}, \text{their\_public})$ (32 bytes)
+- $\text{network\_id}$ = 64-bit network identifier (little-endian)
+- $\text{domain\_separator}$ = `"EC-network-secret-v1"` (prevents cross-protocol attacks)
+
+**Security Properties**:
+
+| Property | Guarantee | Mechanism |
+|----------|-----------|-----------|
+| **Network isolation** | Same key pair produces different secrets on different networks | network_id in KDF |
+| **Domain separation** | Cannot reuse secrets for other protocols | Domain separator string |
+| **Forward compatibility** | Version in separator allows future upgrades | `v1` suffix |
+| **Key derivation best practice** | Raw DH goes through proper KDF | Blake3 derivation |
+
+**Mathematical Proof of Isolation**:
+
+Given two networks $A$ (network_id = $n_A$) and $B$ (network_id = $n_B$) where $n_A \neq n_B$:
+
+For peers Alice and Bob with key pairs $(a, A = g^a)$ and $(b, B = g^b)$:
+
+$$\text{raw\_dh} = \text{X25519}(a, B) = \text{X25519}(b, A) = g^{ab}$$
+
+On network $A$:
+$$S_A = \text{Blake3}(g^{ab} \| n_A \| \text{domain})$$
+
+On network $B$:
+$$S_B = \text{Blake3}(g^{ab} \| n_B \| \text{domain})$$
+
+Since Blake3 is a cryptographic hash:
+$$n_A \neq n_B \implies S_A \neq S_B \text{ (with overwhelming probability)}$$
+
+**Attack Vector Analysis**:
+
+| Attack | Description | Mitigation |
+|--------|-------------|------------|
+| **Cross-network key reuse** | Use same keypair on multiple networks | Different shared secrets per network |
+| **Network discovery via DH** | Probe networks by attempting handshakes | No information leakage (secrets simply don't match) |
+| **Replay attacks** | Replay encrypted messages to different network | Decryption fails (different key) |
+| **Protocol confusion** | Use ecRust keys for other X25519 protocols | Domain separator prevents |
+
+**Implementation Note**: The `compute_shared_secret()` function requires network_id as a parameter, ensuring the caller explicitly specifies which network context to use. This prevents accidental cross-network communication.
+
 ### Message Flow
 
 ```mermaid
@@ -552,6 +603,12 @@ impl PeerIdentity {
   - **Mitigation**: Argon2 output is uniformly random regardless of timestamp
   - **Result**: No advantage over entropy grinding
 
+**9. Cross-Network Communication Attack**
+- **Attack**: Exchange public keys with peer from different network, establish encrypted channel
+- **Mitigation**: Shared secrets derived with network_id via Blake3 KDF
+- **Result**: Computed secrets differ on different networks, decryption fails, no communication possible
+- **Formula**: $S = \text{Blake3}(\text{raw\_dh} \| \text{network\_id} \| \text{domain})$
+
 ### Trust Model
 
 | Property | Guarantee | Mechanism |
@@ -565,6 +622,7 @@ impl PeerIdentity {
 | **Consensus Agreement** | Network agrees on validity | Existing voting mechanism |
 | **No Trust Bypass** | Identity-blocks don't grant peer privileges | Excluded from Identified status logic |
 | **Clock Drift Tolerance** | Handles reasonable clock skew | 24-hour future tolerance |
+| **Communication Isolation** | Cross-network encrypted communication impossible | Blake3 KDF with network_id |
 
 ### Additional Security Benefits
 
@@ -909,6 +967,7 @@ The identity-block design provides a **trustless, automated peer registration me
 - **Natural duplicate protection**: Network rejects duplicate genesis blocks for same token
 - **No trust bypass**: Identity-blocks do NOT grant "Identified" peer status
 - **Consensus-based**: Leverages existing mempool voting mechanism
+- **Complete network isolation**: Both identity PoW AND shared secrets use network_id, preventing cross-network communication
 
 **✅ Economic Model**:
 - **Genesis registration**: Free (self-submission via identity-block)
