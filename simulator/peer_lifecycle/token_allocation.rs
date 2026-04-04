@@ -6,7 +6,7 @@
 // Peer IDs are allocated from the token pool, ensuring all peer IDs are valid,
 // discoverable tokens that can be found through proof-of-storage elections.
 
-use ec_rust::ec_interface::{BlockId, PeerId, TokenId};
+use ec_rust::ec_interface::{BlockId, PeerId, TokenId, GENESIS_BLOCK_ID};
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_proof_of_storage::ring_distance;
 use ec_rust::ec_genesis::GenesisConfig;
@@ -244,7 +244,7 @@ impl GenesisTokenSet {
     ///
     /// This is fast because it only generates token IDs (hashing),
     /// not full blocks and storage.
-    pub fn new(config: &GenesisConfig, mut rng: StdRng) -> Self {
+    pub fn new(config: &GenesisConfig, rng: StdRng) -> Self {
         use blake3::Hasher;
 
         let mut token_ids = Vec::with_capacity(config.block_count);
@@ -283,6 +283,11 @@ impl GenesisTokenSet {
         }
     }
 
+    /// Allocate a single peer ID from genesis tokens
+    pub fn allocate_peer_id(&mut self) -> Option<PeerId> {
+        self.allocate_peer_ids(1).ok().and_then(|mut ids| ids.pop())
+    }
+
     /// Allocate N peer IDs from genesis tokens
     ///
     /// Samples random tokens from the set and marks them as allocated.
@@ -299,16 +304,21 @@ impl GenesisTokenSet {
             ));
         }
 
-        let mut allocated = Vec::with_capacity(count);
-        
-        while count > 0 {
-            self.token_ids.choose_multiple(&mut self.rng, count).for_each(|&peer_id|
-                if !self.allocated_peer_ids.insert(peer_id) {
-                    allocated.push(peer_id);
-                    count -= 1;
-                }
-            )            
+        let mut candidates: Vec<PeerId> = self
+            .token_ids
+            .iter()
+            .copied()
+            .filter(|peer_id| !self.allocated_peer_ids.contains(peer_id))
+            .collect();
+        candidates.shuffle(&mut self.rng);
+
+        let allocated: Vec<PeerId> = candidates.into_iter().take(count).collect();
+        count = allocated.len();
+        for peer_id in &allocated {
+            self.allocated_peer_ids.insert(*peer_id);
         }
+
+        debug_assert_eq!(count, allocated.len());
 
         Ok(allocated)
     }
@@ -323,6 +333,51 @@ impl GenesisTokenSet {
             .filter(|&&other_id| {
                 other_id != peer_id && ring_distance(peer_id, other_id) <= view_width
             })
+            .copied()
+            .collect()
+    }
+
+    /// Build a genesis-backed token view for a peer using ring-distance selective storage.
+    pub fn get_peer_view(&self, peer_id: PeerId, storage_fraction: f64) -> MemTokens {
+        let mappings = self
+            .peer_mappings(peer_id, storage_fraction)
+            .into_iter()
+            .map(|(token_id, block_id)| (token_id, block_id, GENESIS_BLOCK_ID, 0))
+            .collect();
+
+        MemTokens::from_mappings(mappings)
+    }
+
+    /// Build the genesis token-to-block mappings a peer should store.
+    pub fn peer_mappings(&self, peer_id: PeerId, storage_fraction: f64) -> Vec<(TokenId, BlockId)> {
+        let half_ring = (u64::MAX / 2) as f64;
+        let max_distance = if storage_fraction >= 1.0 {
+            u64::MAX / 2
+        } else {
+            (half_ring * storage_fraction) as u64
+        };
+
+        self
+            .token_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &token_id)| {
+                let in_range = storage_fraction >= 1.0
+                    || ring_distance(peer_id, token_id) <= max_distance;
+                if in_range {
+                    Some((token_id, idx as BlockId + 1))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Sample genesis tokens for seeding TokenSampleCollection.
+    pub fn sample_seed_tokens<R: Rng>(&self, rng: &mut R, probability: f64) -> Vec<TokenId> {
+        self.token_ids
+            .iter()
+            .filter(|_| rng.gen_bool(probability))
             .copied()
             .collect()
     }
@@ -346,6 +401,7 @@ impl GenesisTokenSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ec_rust::ec_proof_of_storage::TokenStorageBackend;
     use rand::SeedableRng;
 
     #[test]
@@ -380,7 +436,7 @@ mod tests {
         let view = mapping.get_peer_view(peer_id, 10000, 1.0);
 
         // Peer should always know their own ID
-        assert!(view.lookup(&peer_id).is_some());
+        assert!(TokenStorageBackend::lookup(&view, &peer_id).is_some());
     }
 
     #[test]
@@ -393,11 +449,11 @@ mod tests {
 
         // Full coverage
         let full_view = mapping.get_peer_view(peer_id, u64::MAX / 2, 1.0);
-        let full_count = full_view.len();
+        let full_count = TokenStorageBackend::len(&full_view);
 
         // Half coverage (probabilistic, so approximate)
         let half_view = mapping.get_peer_view(peer_id, u64::MAX / 2, 0.5);
-        let half_count = half_view.len();
+        let half_count = TokenStorageBackend::len(&half_view);
 
         // Half coverage should have roughly half the tokens (with some variance)
         assert!(half_count < full_count);

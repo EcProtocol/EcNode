@@ -26,6 +26,7 @@ fn main() {
                 memory_cost: 1024,    // 1 MiB
                 time_cost: 1,
                 parallelism: 1,
+                ..AddressConfig::TEST
             },
         ),
         (
@@ -35,6 +36,7 @@ fn main() {
                 memory_cost: 256,     // 256 KiB
                 time_cost: 1,
                 parallelism: 1,
+                ..AddressConfig::TEST
             },
         ),
         (
@@ -44,6 +46,7 @@ fn main() {
                 memory_cost: 4096,    // 4 MiB
                 time_cost: 1,
                 parallelism: 1,
+                ..AddressConfig::TEST
             },
         ),
     ];

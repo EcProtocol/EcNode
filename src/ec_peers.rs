@@ -514,22 +514,11 @@ impl EcPeers {
     // ========================================================================
 
     fn idx_adj(&self, idx: usize, adj: isize) -> usize {
-        let tmp = idx as isize + adj;
         let len = self.active.len() as isize;
-
-        let res = if tmp >= len {
-            tmp - len
-        } else if tmp < 0 {
-            len + tmp
-        } else {
-            tmp
-        };
-
-        if res == len || res < 0 {
-            panic!("adj {} {} -> {}", idx, adj, res);
+        if len == 0 {
+            panic!("idx_adj called with empty active set");
         }
-
-        res as usize
+        (idx as isize + adj).rem_euclid(len) as usize
     }
 
     // ========================================================================
@@ -1224,6 +1213,14 @@ impl EcPeers {
     /// Get total number of active elections
     pub fn num_active_elections(&self) -> usize {
         self.active_elections.len()
+    }
+
+    /// Get number of peers for which we know a commit-chain head
+    pub fn num_peers_with_commit_chain_heads(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|peer| peer.commit_chain_head.is_some())
+            .count()
     }
 
     /// Get election statistics

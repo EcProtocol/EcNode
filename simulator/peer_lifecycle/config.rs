@@ -176,6 +176,12 @@ pub enum NetworkEvent {
         selection: PeerSelection,
     },
 
+    /// Reactivate previously crashed peers with stale persisted state
+    PeerReturn {
+        selection: PeerSelection,
+        bootstrap_method: BootstrapMethod,
+    },
+
     /// Change network conditions
     NetworkCondition {
         delay_fraction: Option<f64>,

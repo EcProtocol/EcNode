@@ -2,7 +2,7 @@
 use hashbrown::HashMap;
 
 use crate::ec_interface::{
-    Block, BlockId, EcBlocks, EcTime, EcTokens, Event, EventSink, PeerId, PublicKeyReference,
+    Block, BlockId, EcBlocks, EcTime, EcTokensV2, Event, EventSink, PeerId, PublicKeyReference,
     Signature, TokenId, SOME_STEPS_INTO_THE_FUTURE, TOKENS_PER_BLOCK, VOTE_THRESHOLD,
 };
 use crate::ec_mempool::BlockState::Pending;
@@ -162,7 +162,8 @@ impl EcMemPool {
     /// Should be called at the start of each tick before evaluation.
     pub(crate) fn cleanup_expired(&mut self, time: EcTime) {
         // TODO: Make timeout configurable? Currently 200 ticks
-        self.pool.retain(|_, state| time - state.time < 200);
+        self.pool
+            .retain(|_, state| time.saturating_sub(state.time) < 200);
     }
 
     /// Evaluate all pending blocks and determine which can proceed to commit
@@ -177,7 +178,7 @@ impl EcMemPool {
     /// - Vec of messages for reorg parent requests
     pub(crate) fn evaluate_pending_blocks(
         &self,
-        tokens: &dyn EcTokens,
+        tokens: &dyn EcTokensV2,
         time: EcTime,
         id: PeerId,
         event_sink: &mut dyn EventSink,
@@ -194,7 +195,7 @@ impl EcMemPool {
                 for i in 0..block.used as usize {
                     let token_id = block.parts[i].token;
                     let last_mapping = block.parts[i].last;
-                    let current_mapping = tokens.lookup(&token_id).map_or(0, |t| t.block);
+                    let current_mapping = tokens.lookup_current(&token_id).map_or(0, |t| t.block);
 
                     if current_mapping == last_mapping {
                         // Chain is correct - we can verify this
@@ -374,7 +375,7 @@ impl EcMemPool {
                 };
 
                 for i in 0..ranges.len() {
-                    if balance[i] <= VOTE_THRESHOLD && balance[i] >= -VOTE_THRESHOLD {
+                    if balance[i] <= VOTE_THRESHOLD {
                         block_state.remaining |= 1 << i
                     }
                 }
@@ -445,13 +446,11 @@ impl EcMemPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec_interface::{BlockTime, EcBlocks, EcTokens, TokenId, TokenSignature};
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::rc::Rc;
 
     struct MockEcBlocks {
-        blocks: HashMap<BlockId, Block>,
+        blocks: hashbrown::HashMap<BlockId, Block>,
     }
 
     impl EcBlocks for MockEcBlocks {
@@ -468,32 +467,6 @@ mod tests {
         }
     }
 
-    struct MockEcTokens {
-        tokens: HashMap<TokenId, BlockTime>,
-    }
-
-    impl EcTokens for MockEcTokens {
-        fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
-            self.tokens.get(token)
-        }
-
-        fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-            self.tokens.insert(
-                *token,
-                BlockTime {
-                    block: *block,
-                    parent: *parent,
-                    time,
-                },
-            );
-        }
-
-        fn tokens_signature(&self, _token: &TokenId, _key: &PeerId) -> Option<TokenSignature> {
-            // Not needed for this test
-            None
-        }
-    }
-
     #[test]
     fn test_query() {
         let block_id = 1;
@@ -506,7 +479,7 @@ mod tests {
         };
 
         let blocks = Rc::new(RefCell::new(MockEcBlocks {
-            blocks: HashMap::new(),
+            blocks: hashbrown::HashMap::new(),
         }));
 
         let mut mem_pool = EcMemPool::new();

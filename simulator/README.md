@@ -141,6 +141,48 @@ The simulator tracks:
 
 ---
 
+### 3. Integrated Lifecycle Simulator (`integrated_simulation`, `integrated_genesis_simulation`, `integrated_long_run`)
+
+A combined simulator that runs full `EcNode` instances while also exercising peer churn,
+commit-chain sync, and transaction flow.
+
+**Locations:**
+- `simulator/integrated_simulation.rs`
+- `simulator/integrated_genesis_simulation.rs`
+- `simulator/integrated_long_run.rs`
+- `simulator/integrated/` (config, runner, stats)
+
+**Why use it**
+- Tests the interaction of the major system parts together, not in isolation
+- Covers joins, crashes, stale returns, transaction injection, and commit-chain catch-up
+- Reports commit latency, onboarding timing, recovery timing, and sampled network transit delay
+
+**Bootstrap modes**
+- `integrated_simulation`: starts from an initially formed peer population
+- `integrated_genesis_simulation`: starts the initial cohort from deterministic genesis-backed state
+
+**Network model**
+- Messages are placed into an explicit in-flight queue
+- Each message samples:
+  - packet loss
+  - fixed extra delay rounds
+  - uniform jitter
+  - a geometric tail via repeated `delay_fraction`
+- This keeps the old tail behavior, but makes latency an explicit model instead of a per-round re-roll
+
+**Documentation**
+- See `simulator/INTEGRATED_SIMULATION.md` for the lifecycle sequence, metrics, and realism notes
+- See `simulator/INTEGRATED_LONG_RUN_REPORT.md` for one longer genesis-backed baseline run
+
+**Usage**
+```bash
+cargo run --example integrated_simulation
+cargo run --example integrated_genesis_simulation
+cargo run --release --example integrated_long_run
+```
+
+---
+
 ## Other Test Examples
 
 Additional focused test examples in this directory:

@@ -76,6 +76,18 @@ path = "simulator/peer_lifecycle_genesis_sim.rs"
 name = "commit_chain_sim"
 path = "simulator/commit_chain_sim.rs"
 
+[[example]]
+name = "integrated_simulation"
+path = "simulator/integrated_simulation.rs"
+
+[[example]]
+name = "integrated_genesis_simulation"
+path = "simulator/integrated_genesis_simulation.rs"
+
+[[example]]
+name = "integrated_long_run"
+path = "simulator/integrated_long_run.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"

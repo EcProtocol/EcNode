@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ec_interface::{
-    BatchedBackend, Block, BlockId, BlockUseCase, EcBlocks, EcCommitChainAccess, EcTime, EcTokens, Event,
+    BatchedBackend, Block, BlockId, BlockUseCase, EcBlocks, EcCommitChainAccess, EcTime, EcTokensV2, Event,
     EventSink, Message, MessageEnvelope, MessageTicket, NoOpSink, PeerId,
 };
 use crate::ec_mempool::{BlockState, EcMemPool};
@@ -13,7 +13,7 @@ use crate::ec_ticket_manager::TicketManager;
 use crate::ec_mempool::MessageRequest;
 
 pub struct EcNode<
-    B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static,
+    B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static,
     T: TokenStorageBackend,
 > {
     backend: Rc<RefCell<B>>,
@@ -27,7 +27,7 @@ pub struct EcNode<
     rng: rand::rngs::StdRng,
 }
 
-impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T: TokenStorageBackend>
+impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, T: TokenStorageBackend>
     EcNode<B, T>
 {
     /// Create a new node with default NoOpSink (zero overhead)
@@ -65,8 +65,36 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
         self.peers.update_peer(peer, self.time);
     }
 
+    pub fn add_identified_peer(&mut self, peer: PeerId) -> bool {
+        self.peers.add_identified_peer(peer, self.time)
+    }
+
+    pub fn seed_genesis_token(&mut self, token: u64) -> bool {
+        self.peers.seed_genesis_token(token)
+    }
+
     pub fn num_peers(&self) -> usize {
         self.peers.num_peers()
+    }
+
+    pub fn num_connected_peers(&self) -> usize {
+        self.peers.num_connected()
+    }
+
+    pub fn num_identified_peers(&self) -> usize {
+        self.peers.num_identified()
+    }
+
+    pub fn num_pending_peers(&self) -> usize {
+        self.peers.num_pending()
+    }
+
+    pub fn num_active_elections(&self) -> usize {
+        self.peers.num_active_elections()
+    }
+
+    pub fn num_peers_with_commit_chain_heads(&self) -> usize {
+        self.peers.num_peers_with_commit_chain_heads()
     }
 
     pub fn block(&mut self, block: &Block) {
@@ -195,12 +223,39 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             }
         }
 
-        // Phase 4: Commit chain sync
+        // Phase 4: Drive peer discovery/lifecycle so full-node simulations exercise
+        // both elections and commit-chain head exchange.
+        let peer_actions = self.peers.tick(&self.token_storage, self.time);
+
+        // Phase 5: Commit chain sync
         // Periodically query nearby peers to keep our commit chain up to date
         let sync_actions = {
             let mut backend = self.backend.borrow_mut();
             backend.commit_chain_tick(&self.peers, &mut self.mem_pool, self.time)
         };
+
+        let head_of_chain = self
+            .backend
+            .borrow()
+            .get_commit_chain_head()
+            .unwrap_or(0);
+
+        for action in peer_actions {
+            match action {
+                PeerAction::SendQuery { receiver, .. }
+                | PeerAction::SendInvitation { receiver, .. } => {
+                    responses.push(action.into_envelope(
+                        self.peer_id,
+                        receiver,
+                        self.time,
+                        head_of_chain,
+                    ));
+                }
+                PeerAction::SendAnswer { .. } | PeerAction::SendReferral { .. } => {
+                    unreachable!("EcPeers::tick only produces query/invitation actions")
+                }
+            }
+        }
 
         // Convert commit chain actions to message envelopes
         for (receiver, tick_message) in sync_actions {
@@ -208,8 +263,11 @@ impl<B: BatchedBackend + EcTokens + EcBlocks + EcCommitChainAccess + 'static, T:
             match tick_message {
                 TickMessage::QueryBlock {
                     block_id,
-                    ticket,
+                    ..
                 } => {
+                    let ticket = self
+                        .ticket_manager
+                        .generate_ticket(block_id, BlockUseCase::CommitChain);
                     responses.push(MessageEnvelope {
                         sender: self.peer_id,
                         receiver,

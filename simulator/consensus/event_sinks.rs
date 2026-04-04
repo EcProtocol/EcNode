@@ -128,6 +128,15 @@ impl EventSink for ConsoleEventSink {
                     from_peer & 0xFFFF,
                 );
             }
+            Event::IdentityBlockReceived { peer_id, sender } => {
+                println!(
+                    "{:>5} {:>6} IdentityBlock    peer:{:x} from:{:x}",
+                    round,
+                    peer_fmt,
+                    peer_id & 0xFFFF,
+                    sender & 0xFFFF,
+                );
+            }
         }
     }
 }
@@ -227,6 +236,11 @@ impl EventSink for CsvEventSink {
                 "{},{},VoteReceived,{},{}",
                 round, peer, block_id, from_peer
             ),
+            Event::IdentityBlockReceived { peer_id, sender } => writeln!(
+                self.writer,
+                "{},{},IdentityBlockReceived,0,{},{},{},peer_id",
+                round, peer, sender, peer_id, 0
+            ),
         };
 
         if let Err(e) = result {
@@ -296,6 +310,7 @@ impl CollectorEventSink {
                 Event::BlockNotFound { .. } => counts.block_not_found += 1,
                 Event::BlockStateChange { .. } => counts.state_change += 1,
                 Event::VoteReceived { .. } => counts.vote_received += 1,
+                Event::IdentityBlockReceived { .. } => counts.identity_block_received += 1,
             }
         }
         counts
@@ -319,6 +334,7 @@ pub struct EventTypeCounts {
     pub block_not_found: usize,
     pub state_change: usize,
     pub vote_received: usize,
+    pub identity_block_received: usize,
 }
 
 impl EventSink for CollectorEventSink {

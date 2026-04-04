@@ -26,7 +26,6 @@ fn main() {
 
         commit_chain: CommitChainConfig {
             sync_target: 100, // Sync back 100 rounds
-            confirmation_threshold: 2,
             ..Default::default()
         },
 

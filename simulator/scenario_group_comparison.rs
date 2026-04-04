@@ -49,6 +49,8 @@ fn main() {
         total_tokens: 100_000,
         neighbor_overlap: 10,
         coverage_fraction: 0.95,  // 95% coverage
+        genesis_config: None,
+        genesis_storage_fraction: 0.25,
     };
 
     // Configure events: peers join at different rounds

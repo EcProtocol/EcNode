@@ -608,6 +608,13 @@ impl MemoryBackend {
         }
     }
 
+    /// Reset non-persistent runtime state for a node restart while preserving
+    /// stored tokens, blocks, and persisted commit-chain history.
+    pub fn reset_runtime_state(&mut self) {
+        let my_range = crate::ec_peers::PeerRange::new(0, u64::MAX);
+        self.commit_chain = EcCommitChain::new(self.peer_id, my_range, CommitChainConfig::default());
+    }
+
     /// Get immutable reference to token storage
     pub fn tokens(&self) -> &MemTokens {
         &self.tokens
@@ -745,14 +752,16 @@ impl BatchedBackend for MemoryBackend {
     }
 }
 
-// Implement EcTokens for MemoryBackend (delegates to tokens field)
+// Implement EcTokens for MemoryBackend (compatibility wrapper only)
 impl EcTokens for MemoryBackend {
-    fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
-        EcTokens::lookup(&self.tokens, token)
+    fn lookup(&self, _token: &TokenId) -> Option<&BlockTime> {
+        unimplemented!(
+            "EcTokens::lookup not supported for MemoryBackend - use EcTokensV2::lookup_current or TokenStorageBackend::lookup instead"
+        )
     }
 
     fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-        EcTokens::set(&mut self.tokens, token, block, parent, time)
+        TokenStorageBackend::set(&mut self.tokens, token, block, parent, time)
     }
 
     fn tokens_signature(&self, token: &TokenId, peer: &PeerId) -> Option<TokenSignature> {
@@ -782,7 +791,7 @@ impl TokenStorageBackend for MemoryBackend {
     }
 
     fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-        TokenStorageBackend::set(&mut self.tokens, token, block, parent, time)
+        TokenStorageBackend::set(&mut self.tokens, token, block, parent, time);
     }
 
     fn search_signature(

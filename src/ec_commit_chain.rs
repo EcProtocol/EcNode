@@ -142,7 +142,7 @@ impl EcCommitChain {
         Self {
             peer_id,
             my_range,
-            watermark: config.sync_target, // Initial watermark
+            watermark: 0,
             config,
             peer_logs: HashMap::new(),
             blocks_to_store: HashMap::new(),
@@ -211,14 +211,14 @@ impl EcCommitChain {
             }
 
             // Add closest candidate
-            if let Some(&candidate) = new_candidates.first() {
-                if let Some(head) = peers.get_commit_chain_head(&candidate) {
-                    self.peer_logs
-                        .insert(candidate, PeerChainLog::new(candidate, head));
-                } else {
-                    // No commit chain head available yet, skip
-                    break;
-                }
+            if let Some((candidate, head)) = new_candidates
+                .into_iter()
+                .find_map(|candidate| peers.get_commit_chain_head(&candidate).map(|head| (candidate, head)))
+            {
+                self.peer_logs
+                    .insert(candidate, PeerChainLog::new(candidate, head));
+            } else {
+                break;
             }
         }
 
@@ -269,10 +269,8 @@ impl EcCommitChain {
             return false;
         }
 
-        // Track first (latest) commit time
-        if log.first_commit_time.is_none() {
-            log.first_commit_time = Some(block.time);
-        }
+        // Track the oldest commit time seen in this trace as we walk backwards.
+        log.first_commit_time = Some(block.time);
 
         // Filter out blocks already committed locally
         let mut waiting_for = HashSet::new();
@@ -331,7 +329,7 @@ impl EcCommitChain {
                 let has_new_blocks = waiting_for
                     .iter()
                     .any(|id| self.received_blocks.contains_key(id));
-                if has_new_blocks {
+                if has_new_blocks || waiting_for.is_empty() {
                     work.push((*peer_id, commit_block.clone()));
                 }
             }
@@ -429,7 +427,9 @@ impl EcCommitChain {
     }
 
     /// Update peer logs after processing (advance traces, update watermark)
-    fn update_peer_logs_after_sync(&mut self, work: Vec<(PeerId, CommitBlock)>) {
+    fn update_peer_logs_after_sync(&mut self, work: Vec<(PeerId, CommitBlock)>, time: EcTime) {
+        let cutoff = time.saturating_sub(self.config.sync_target);
+
         for (peer_id, commit_block) in work {
             let log = match self.peer_logs.get_mut(&peer_id) {
                 Some(l) => l,
@@ -442,7 +442,7 @@ impl EcCommitChain {
 
                 // Check if trace complete
                 if waiting_for.is_empty() {
-                    if commit_block.time < self.watermark
+                    if commit_block.time <= self.watermark.max(cutoff)
                         || commit_block.previous == GENESIS_BLOCK_ID
                     {
                         // Trace complete! Update global watermark
@@ -530,7 +530,7 @@ impl EcCommitChain {
         }
 
         // Phase 3: Update peer logs (advance traces, update watermark)
-        self.update_peer_logs_after_sync(work);
+        self.update_peer_logs_after_sync(work, time);
 
         // Generate requests for each peer's trace
 
@@ -654,7 +654,8 @@ mod tests {
         BatchedBackend, BlockTime, EcTokens, PendingMapping, TokenId, TokenSignature, TokenState,
         TrustSource, TrustedMapping,
     };
-    use std::collections::HashMap;
+    use crate::ec_peers::EcPeers;
+    use std::collections::{HashMap, HashSet};
 
     struct MockTokenStorage {
         tokens: HashMap<TokenId, TokenState>,
@@ -669,7 +670,7 @@ mod tests {
     }
 
     impl EcTokens for MockTokenStorage {
-        fn lookup(&self, token: &TokenId) -> Option<&BlockTime> {
+        fn lookup(&self, _token: &TokenId) -> Option<&BlockTime> {
             // For compatibility - return None, use lookup_state instead
             None
         }
@@ -886,8 +887,6 @@ mod tests {
 
     #[test]
     fn test_highest_id_wins() {
-        use crate::ec_interface::{TokenBlock, TOKENS_PER_BLOCK};
-
         let mut storage = MockTokenStorage::new();
 
         // Apply block 100 from peer 1
@@ -965,5 +964,51 @@ mod tests {
             matches!(op, SyncOperation::SaveBlock(b) if b.id == 50)
         }).count();
         assert_eq!(save_count, 1, "Block should be saved since block-id is in range");
+    }
+
+    #[test]
+    fn test_update_tracked_peers_skips_active_peers_without_heads() {
+        let my_range = PeerRange::new(0, 1000);
+        let mut chain = EcCommitChain::new(100, my_range, CommitChainConfig::default());
+        let mut peers = EcPeers::new(100);
+
+        peers.update_peer(&110, 0);
+        peers.update_peer(&120, 0);
+        peers.update_peer_commit_chain_head(&120, 999);
+
+        chain.update_tracked_peers(&peers);
+
+        assert!(!chain.peer_logs.contains_key(&110));
+        assert!(chain.peer_logs.contains_key(&120));
+    }
+
+    #[test]
+    fn test_empty_waiting_for_advances_trace_without_new_blocks() {
+        let my_range = PeerRange::new(0, 1000);
+        let mut chain = EcCommitChain::new(500, my_range, CommitChainConfig::default());
+
+        let commit_block = CommitBlock::new(900, 800, 25, vec![10, 20]);
+        chain.peer_logs.insert(
+            42,
+            PeerChainLog {
+                peer_id: 42,
+                known_head: Some(commit_block.id),
+                current_trace: Some(TraceState::FetchingBlocks {
+                    commit_block: commit_block.clone(),
+                    waiting_for: HashSet::new(),
+                }),
+                first_commit_time: Some(commit_block.time),
+            },
+        );
+
+        chain.update_peer_logs_after_sync(vec![(42, commit_block)], 50);
+
+        let log = chain.peer_logs.get(&42).unwrap();
+        match log.current_trace.as_ref() {
+            Some(TraceState::WaitingForCommit { requested_id, .. }) => {
+                assert_eq!(*requested_id, 800);
+            }
+            _ => panic!("trace should advance to the previous commit block"),
+        }
     }
 }

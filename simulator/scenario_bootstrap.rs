@@ -60,6 +60,8 @@ fn main() {
         total_tokens: 100_000,
         neighbor_overlap: 10,
         coverage_fraction: 0.95,  // 95% - excellent shared state knowledge
+        genesis_config: None,
+        genesis_storage_fraction: 0.25,
     };
 
     config.metrics.sample_interval = 10;

@@ -50,6 +50,8 @@ fn run_simulation(coverage: f64, label: &str) -> (f64, f64, f64) {
         total_tokens: 100_000,
         neighbor_overlap: 10,
         coverage_fraction: coverage,  // VARIED
+        genesis_config: None,
+        genesis_storage_fraction: 0.25,
     };
 
     config.metrics.sample_interval = 10;
