@@ -13,5 +13,8 @@ pub mod stats;
 pub use config::{IntegratedSimConfig, NetworkConfig, TransactionFlowConfig, TransactionSourcePolicy};
 pub use runner::IntegratedRunner;
 pub use stats::{
-    DistributionSummary, OnboardingSummary, RecoverySummary, RoundMetrics, SimResult,
+    DistributionSummary, FloatDistributionSummary, MempoolPressureSummary, MessageTypeBreakdown,
+    NeighborhoodBucketSummary, NeighborhoodSummary, OnboardingSummary, RecoverySummary,
+    RoundMetrics, SimResult, TransactionSpreadSummary, TransactionWorkloadSummary,
+    VoteIngressSummary,
 };

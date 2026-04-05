@@ -1,5 +1,6 @@
 // track the state of transactions
 use hashbrown::HashMap;
+use std::cmp::Reverse;
 
 use crate::ec_interface::{
     Block, BlockId, EcBlocks, EcTime, EcTokensV2, Event, EventSink, PeerId, PublicKeyReference,
@@ -22,12 +23,15 @@ pub enum MessageRequest {
 }
 
 impl MessageRequest {
-    pub fn sort_key(&self) -> (TokenId, bool, BlockId) {
+    pub fn sort_key(&self) -> (TokenId, Reverse<BlockId>, Reverse<bool>) {
         match self {
-            // group equal token_id and get possitive votes first
-            MessageRequest::Vote(block_id, token_id, _, possitive) => (*token_id, *possitive, *block_id),
-            MessageRequest::Parent(_, parent_id) => (*parent_id, false, 0),
-            MessageRequest::MissingParent(block_id) => (*block_id, false, 0),
+            // Group equal token_id together, prefer highest block_id first, and for equal block_id
+            // let positive votes win the tie. This keeps conflicting token updates deterministic.
+            MessageRequest::Vote(block_id, token_id, _, positive) => {
+                (*token_id, Reverse(*block_id), Reverse(*positive))
+            }
+            MessageRequest::Parent(_, parent_id) => (*parent_id, Reverse(0), Reverse(false)),
+            MessageRequest::MissingParent(block_id) => (*block_id, Reverse(0), Reverse(false)),
         }
     }
 }
@@ -122,6 +126,22 @@ pub struct EcMemPool {
     pool: HashMap<BlockId, PoolBlockState>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MempoolDiagnostics {
+    pub total_entries: usize,
+    pub pending_entries: usize,
+    pub committed_entries: usize,
+    pub blocked_entries: usize,
+    pub pending_without_block: usize,
+    pub pending_no_trusted_votes: usize,
+    pub pending_with_trusted_votes: usize,
+    pub pending_waiting_validation: usize,
+    pub pending_waiting_token_votes: usize,
+    pub pending_waiting_witness: usize,
+    pub pending_age_50_plus: usize,
+    pub pending_age_200_plus: usize,
+}
+
 fn validate_signature(key: &PublicKeyReference, signature: &Signature) -> bool {
     // TODO real validation of signature <-> public-key-hash
     key == signature
@@ -154,6 +174,55 @@ impl EcMemPool {
         Self {
             pool: HashMap::new(),
         }
+    }
+
+    pub fn diagnostics(&self, time: EcTime) -> MempoolDiagnostics {
+        let mut diagnostics = MempoolDiagnostics {
+            total_entries: self.pool.len(),
+            ..MempoolDiagnostics::default()
+        };
+
+        for state in self.pool.values() {
+            match state.state {
+                BlockState::Pending => {
+                    diagnostics.pending_entries += 1;
+
+                    if state.block.is_none() {
+                        diagnostics.pending_without_block += 1;
+                    }
+
+                    if state.votes.is_empty() {
+                        diagnostics.pending_no_trusted_votes += 1;
+                    } else {
+                        diagnostics.pending_with_trusted_votes += 1;
+                    }
+
+                    if state.validate != 0 {
+                        diagnostics.pending_waiting_validation += 1;
+                    }
+
+                    if state.remaining & ((1 << TOKENS_PER_BLOCK) - 1) != 0 {
+                        diagnostics.pending_waiting_token_votes += 1;
+                    }
+
+                    if state.remaining & (1 << TOKENS_PER_BLOCK) != 0 {
+                        diagnostics.pending_waiting_witness += 1;
+                    }
+
+                    let age = time.saturating_sub(state.time);
+                    if age >= 50 {
+                        diagnostics.pending_age_50_plus += 1;
+                    }
+                    if age >= 200 {
+                        diagnostics.pending_age_200_plus += 1;
+                    }
+                }
+                BlockState::Commit => diagnostics.committed_entries += 1,
+                BlockState::Blocked => diagnostics.blocked_entries += 1,
+            }
+        }
+
+        diagnostics
     }
 
     /// Clean up expired blocks from the pool
@@ -265,6 +334,13 @@ impl EcMemPool {
             .get(block)
             .and_then(|b| b.block)
             .or_else(|| blocks.lookup(block));
+    }
+
+    pub(crate) fn early_voters(&self, block: &BlockId) -> Vec<PeerId> {
+        self.pool
+            .get(block)
+            .map(|state| state.votes.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Validates a block in the memory pool against its parent block.
@@ -494,5 +570,27 @@ mod tests {
         // Test that querying a block in the mempool also works
         mem_pool.block(&block, 0);
         assert_eq!(mem_pool.query(&block_id, &*blocks.borrow()), Some(block));
+    }
+
+    #[test]
+    fn vote_requests_sort_highest_block_id_first_within_token() {
+        let mut requests = vec![
+            MessageRequest::Vote(10, 77, 0b0000_0001, true),
+            MessageRequest::Vote(30, 77, 0b0000_0001, true),
+            MessageRequest::Vote(20, 77, 0b0000_0001, true),
+            MessageRequest::Vote(15, 66, 0b0000_0001, true),
+        ];
+
+        requests.sort_unstable_by_key(MessageRequest::sort_key);
+
+        let ordered: Vec<(BlockId, TokenId)> = requests
+            .into_iter()
+            .map(|request| match request {
+                MessageRequest::Vote(block_id, token_id, _, _) => (block_id, token_id),
+                other => panic!("unexpected request in sort test: {:?}", std::mem::discriminant(&other)),
+            })
+            .collect();
+
+        assert_eq!(ordered, vec![(15, 66), (30, 77), (20, 77), (10, 77)]);
     }
 }

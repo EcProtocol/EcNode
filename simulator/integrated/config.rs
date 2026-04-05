@@ -1,4 +1,5 @@
 use crate::peer_lifecycle::{EventSchedule, InitialNetworkState, TokenDistributionConfig};
+use ec_rust::ec_peers::PeerManagerConfig;
 
 /// Configuration for the first integrated simulator.
 ///
@@ -12,6 +13,7 @@ pub struct IntegratedSimConfig {
     pub seed: Option<[u8; 32]>,
     pub initial_state: InitialNetworkState,
     pub token_distribution: TokenDistributionConfig,
+    pub peer_config: PeerManagerConfig,
     pub events: EventSchedule,
     pub network: NetworkConfig,
     pub transactions: TransactionFlowConfig,
@@ -38,6 +40,15 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    pub fn perfect() -> Self {
+        Self {
+            base_delay_rounds: 0,
+            jitter_rounds: 0,
+            delay_fraction: 0.0,
+            loss_fraction: 0.0,
+        }
+    }
+
     pub fn same_dc() -> Self {
         Self {
             base_delay_rounds: 0,
@@ -71,6 +82,9 @@ pub struct TransactionFlowConfig {
     pub blocks_per_round: usize,
     pub block_size_range: (usize, usize),
     pub source_policy: TransactionSourcePolicy,
+    /// Fraction of block parts that should try to update an existing known token
+    /// at the submitting node instead of creating a brand-new token.
+    pub existing_token_fraction: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +109,7 @@ impl Default for IntegratedSimConfig {
             seed: None,
             initial_state: InitialNetworkState::default(),
             token_distribution: TokenDistributionConfig::default(),
+            peer_config: PeerManagerConfig::default(),
             events: EventSchedule::default(),
             network: NetworkConfig::default(),
             transactions: TransactionFlowConfig::default(),
@@ -114,6 +129,7 @@ impl Default for TransactionFlowConfig {
             blocks_per_round: 2,
             block_size_range: (1, 3),
             source_policy: TransactionSourcePolicy::ConnectedOnly,
+            existing_token_fraction: 0.0,
         }
     }
 }

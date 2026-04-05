@@ -39,6 +39,7 @@ fn main() {
         blocks_per_round: 2,
         block_size_range: (1, 3),
         source_policy: TransactionSourcePolicy::ConnectedOnly,
+        existing_token_fraction: 0.0,
     };
     config.events.events = vec![
         ScheduledEvent {

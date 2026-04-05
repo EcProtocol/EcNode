@@ -173,6 +173,8 @@ commit-chain sync, and transaction flow.
 **Documentation**
 - See `simulator/INTEGRATED_SIMULATION.md` for the lifecycle sequence, metrics, and realism notes
 - See `simulator/INTEGRATED_LONG_RUN_REPORT.md` for one longer genesis-backed baseline run
+- See `Design/vote_flow_and_batching.md` for the current vote/block flow and batching design notes
+- See `simulator/BATCHING_PHASE_COMPARISON_REPORT.md` for the `off` vs `phase1` vs `phase2` batching benchmark
 
 **Usage**
 ```bash

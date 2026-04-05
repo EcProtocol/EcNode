@@ -265,6 +265,9 @@ pub enum Message {
         target: PeerId, // who wants the result? 0 => me
         ticket: MessageTicket,
     },
+    RequestBatch {
+        items: Vec<BatchRequestItem>,
+    },
     Answer {
         answer: TokenMapping,
         signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
@@ -286,6 +289,108 @@ pub enum Message {
     CommitBlock {
         block: CommitBlock,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum BatchRequestItem {
+    Vote {
+        block_id: BlockId,
+        vote: u8,
+        reply: bool,
+    },
+    QueryBlock {
+        block_id: BlockId,
+        target: PeerId,
+        ticket: MessageTicket,
+    },
+    QueryToken {
+        token_id: TokenId,
+        target: PeerId,
+        ticket: MessageTicket,
+    },
+}
+
+impl BatchRequestItem {
+    pub fn from_message(message: &Message, include_vote_replies: bool) -> Option<Self> {
+        match message {
+            Message::Vote {
+                block_id,
+                vote,
+                reply: true,
+            } => Some(Self::Vote {
+                block_id: *block_id,
+                vote: *vote,
+                reply: true,
+            }),
+            Message::Vote {
+                block_id,
+                vote,
+                reply: false,
+            } if include_vote_replies => Some(Self::Vote {
+                block_id: *block_id,
+                vote: *vote,
+                reply: false,
+            }),
+            Message::QueryBlock {
+                block_id,
+                target,
+                ticket,
+            } => Some(Self::QueryBlock {
+                block_id: *block_id,
+                target: *target,
+                ticket: *ticket,
+            }),
+            Message::QueryToken {
+                token_id,
+                target,
+                ticket,
+            } => Some(Self::QueryToken {
+                token_id: *token_id,
+                target: *target,
+                ticket: *ticket,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn into_message(self) -> Message {
+        match self {
+            Self::Vote {
+                block_id,
+                vote,
+                reply,
+            } => Message::Vote {
+                block_id,
+                vote,
+                reply,
+            },
+            Self::QueryBlock {
+                block_id,
+                target,
+                ticket,
+            } => Message::QueryBlock {
+                block_id,
+                target,
+                ticket,
+            },
+            Self::QueryToken {
+                token_id,
+                target,
+                ticket,
+            } => Message::QueryToken {
+                token_id,
+                target,
+                ticket,
+            },
+        }
+    }
+
+    pub fn ticket(&self) -> MessageTicket {
+        match self {
+            Self::Vote { .. } => 0,
+            Self::QueryBlock { ticket, .. } | Self::QueryToken { ticket, .. } => *ticket,
+        }
+    }
 }
 
 pub enum RequestMessage {

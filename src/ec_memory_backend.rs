@@ -112,6 +112,31 @@ impl MemTokens {
     pub fn into_proof_system(self) -> ProofOfStorage {
         ProofOfStorage::new()
     }
+
+    /// Sample one current token mapping from storage.
+    ///
+    /// This is used by the simulator to build mixed workloads that update
+    /// existing committed tokens instead of always creating brand-new ones.
+    pub fn sample_current_mapping<R: rand::Rng>(
+        &self,
+        rng: &mut R,
+    ) -> Option<(TokenId, TrustedMapping)> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+
+        for _ in 0..self.tokens.len().min(8) {
+            let idx = rng.gen_range(0..self.tokens.len());
+            let (token_id, state) = &self.tokens[idx];
+            if let Some(current) = state.current {
+                return Some((*token_id, current));
+            }
+        }
+
+        self.tokens
+            .iter()
+            .find_map(|(token_id, state)| state.current.map(|current| (*token_id, current)))
+    }
 }
 
 impl Default for MemTokens {

@@ -8,16 +8,18 @@ use rand::seq::SliceRandom;
 use rand::{Rng, RngCore, SeedableRng};
 
 use ec_rust::ec_interface::{
-    Block, BlockId, EcBlocks, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock,
-    TokenId, GENESIS_BLOCK_ID, TOKENS_PER_BLOCK,
+    BatchRequestItem, Block, BlockId, EcBlocks, Message, MessageEnvelope, PeerId,
+    PublicKeyReference, TokenBlock, TokenId, GENESIS_BLOCK_ID, TOKENS_PER_BLOCK,
 };
 use ec_rust::ec_memory_backend::{MemTokens, MemoryBackend};
-use ec_rust::ec_node::EcNode;
+use ec_rust::ec_node::{EcNode, VoteIngressDiagnostics};
 use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 
 use crate::integrated::{
-    DistributionSummary, IntegratedSimConfig, OnboardingSummary, RecoverySummary, RoundMetrics,
-    SimResult, TransactionSourcePolicy,
+    DistributionSummary, FloatDistributionSummary, IntegratedSimConfig, MempoolPressureSummary,
+    MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary, OnboardingSummary,
+    RecoverySummary, RoundMetrics, SimResult, TransactionSourcePolicy, TransactionSpreadSummary,
+    TransactionWorkloadSummary, VoteIngressSummary,
 };
 use crate::peer_lifecycle::{
     BootstrapMethod, GlobalTokenMapping, NetworkEvent, PeerSelection, ScheduledEvent, TopologyMode,
@@ -36,10 +38,14 @@ struct SimPeer {
     restart_count: u64,
 }
 
-#[derive(Clone, Copy)]
 struct TrackedBlock {
     owner: PeerId,
     submitted_round: usize,
+    max_entry_hops: usize,
+    ideal_role_sum_lower_bound_messages: usize,
+    ideal_coalesced_lower_bound_messages: usize,
+    delivered_block_messages: usize,
+    touched_peers: HashSet<PeerId>,
 }
 
 struct ScheduledMessage {
@@ -72,9 +78,51 @@ struct RecoveryWatch {
     recovered_round: Option<usize>,
 }
 
+#[derive(Clone, Default)]
+struct NeighborhoodBucketAccumulator {
+    coverage_sizes: Vec<usize>,
+    vote_eligible_sizes: Vec<usize>,
+    entry_hops: Vec<usize>,
+    commit_latencies: Vec<usize>,
+    committed_blocks: usize,
+}
+
+#[derive(Default)]
+struct TransactionSpreadAccumulator {
+    reachable_vote_peers: Vec<usize>,
+    reachable_vote_edges: Vec<usize>,
+    witness_coverage: Vec<usize>,
+    ideal_role_sum_lower_bound_messages: Vec<usize>,
+    ideal_coalesced_lower_bound_messages: Vec<usize>,
+    settled_peer_spread: Vec<usize>,
+    settled_block_messages: Vec<usize>,
+    actual_to_role_sum_ratio: Vec<f64>,
+    actual_to_coalesced_ratio: Vec<f64>,
+    total_actual_block_messages: usize,
+    total_ideal_role_sum_lower_bound_messages: usize,
+    total_ideal_coalesced_lower_bound_messages: usize,
+}
+
+const LOCAL_ENTRY_MAX_HOPS: usize = 4;
+const NEAR_ENTRY_MAX_HOPS: usize = 16;
+const MID_ENTRY_MAX_HOPS: usize = 64;
+const NEIGHBORHOOD_BUCKET_LABELS: [&str; 4] = [
+    "local (<=4 hops)",
+    "near (5-16 hops)",
+    "mid (17-64 hops)",
+    "far (65+ hops)",
+];
+
 enum TokenSpace {
     Random(GlobalTokenMapping),
     Genesis(GenesisTokenSet),
+}
+
+fn message_logical_count(message: &Message) -> usize {
+    match message {
+        Message::RequestBatch { items } => items.len(),
+        _ => 1,
+    }
 }
 
 pub struct IntegratedRunner {
@@ -97,13 +145,32 @@ pub struct IntegratedRunner {
     skipped_submissions: usize,
     committed_blocks: usize,
     total_messages_delivered: usize,
+    total_wire_messages_delivered: usize,
+    peak_in_flight_messages: usize,
     peak_active_traces: usize,
     peak_active_elections: usize,
+    scheduled_message_types: MessageTypeBreakdown,
+    delivered_message_types: MessageTypeBreakdown,
+    scheduled_wire_message_types: MessageTypeBreakdown,
+    delivered_wire_message_types: MessageTypeBreakdown,
+    last_vote_diagnostics: BTreeMap<PeerId, VoteIngressDiagnostics>,
+    cumulative_trusted_votes_recorded: usize,
+    cumulative_untrusted_votes_received: usize,
+    cumulative_vote_block_requests: usize,
     commit_latencies: Vec<usize>,
     network_transit_samples: Vec<usize>,
+    neighborhood_coverage_samples: Vec<usize>,
+    neighborhood_vote_eligible_samples: Vec<usize>,
+    neighborhood_entry_hop_samples: Vec<usize>,
+    local_entry_token_samples: usize,
+    neighborhood_buckets: [NeighborhoodBucketAccumulator; 4],
+    transaction_spread: TransactionSpreadAccumulator,
     round_commits: Vec<usize>,
     round_metrics: Vec<RoundMetrics>,
     recovery_watches: Vec<RecoveryWatch>,
+    existing_token_parts_generated: usize,
+    new_token_parts_generated: usize,
+    blocks_with_existing_tokens: usize,
 }
 
 impl IntegratedRunner {
@@ -154,13 +221,32 @@ impl IntegratedRunner {
             skipped_submissions: 0,
             committed_blocks: 0,
             total_messages_delivered: 0,
+            total_wire_messages_delivered: 0,
+            peak_in_flight_messages: 0,
             peak_active_traces: 0,
             peak_active_elections: 0,
+            scheduled_message_types: MessageTypeBreakdown::default(),
+            delivered_message_types: MessageTypeBreakdown::default(),
+            scheduled_wire_message_types: MessageTypeBreakdown::default(),
+            delivered_wire_message_types: MessageTypeBreakdown::default(),
+            last_vote_diagnostics: BTreeMap::new(),
+            cumulative_trusted_votes_recorded: 0,
+            cumulative_untrusted_votes_received: 0,
+            cumulative_vote_block_requests: 0,
             commit_latencies: Vec::new(),
             network_transit_samples: Vec::new(),
+            neighborhood_coverage_samples: Vec::new(),
+            neighborhood_vote_eligible_samples: Vec::new(),
+            neighborhood_entry_hop_samples: Vec::new(),
+            local_entry_token_samples: 0,
+            neighborhood_buckets: std::array::from_fn(|_| NeighborhoodBucketAccumulator::default()),
+            transaction_spread: TransactionSpreadAccumulator::default(),
             round_commits: Vec::new(),
             round_metrics: Vec::new(),
             recovery_watches: Vec::new(),
+            existing_token_parts_generated: 0,
+            new_token_parts_generated: 0,
+            blocks_with_existing_tokens: 0,
         }
     }
 
@@ -323,7 +409,14 @@ impl IntegratedRunner {
         node_seed[16..].copy_from_slice(&self.seed_used[16..]);
         let node_rng = StdRng::from_seed(node_seed);
 
-        EcNode::new(backend, peer_id, 0, token_storage, node_rng)
+        EcNode::new_with_peer_config(
+            backend,
+            peer_id,
+            0,
+            token_storage,
+            self.config.peer_config.clone(),
+            node_rng,
+        )
     }
 
     fn create_peer(
@@ -340,6 +433,7 @@ impl IntegratedRunner {
         let token_storage = self.build_token_storage(peer_id, coverage_fraction);
         let mut node = self.build_node(peer_id, backend.clone(), token_storage.clone(), 0);
         self.seed_genesis_samples(&mut node);
+        self.last_vote_diagnostics.insert(peer_id, VoteIngressDiagnostics::default());
 
         SimPeer {
             backend,
@@ -592,6 +686,8 @@ impl IntegratedRunner {
                 peer.active = true;
                 peer.restart_count = restart_count;
             }
+            self.last_vote_diagnostics
+                .insert(peer_id, VoteIngressDiagnostics::default());
 
             let idx = self.rejoin_progress.len();
             self.rejoin_progress.push(RejoinProgress {
@@ -688,8 +784,40 @@ impl IntegratedRunner {
 
         for block_id in &committed {
             if let Some(tracked) = self.tracked_blocks.remove(block_id) {
-                self.commit_latencies
-                    .push(self.current_round.saturating_sub(tracked.submitted_round));
+                let latency = self.current_round.saturating_sub(tracked.submitted_round);
+                self.commit_latencies.push(latency);
+                let bucket = Self::entry_hop_bucket(tracked.max_entry_hops);
+                self.neighborhood_buckets[bucket].commit_latencies.push(latency);
+                self.neighborhood_buckets[bucket].committed_blocks += 1;
+                self.transaction_spread
+                    .settled_peer_spread
+                    .push(tracked.touched_peers.len());
+                self.transaction_spread
+                    .settled_block_messages
+                    .push(tracked.delivered_block_messages);
+                self.transaction_spread
+                    .ideal_role_sum_lower_bound_messages
+                    .push(tracked.ideal_role_sum_lower_bound_messages);
+                self.transaction_spread
+                    .ideal_coalesced_lower_bound_messages
+                    .push(tracked.ideal_coalesced_lower_bound_messages);
+                self.transaction_spread.total_actual_block_messages += tracked.delivered_block_messages;
+                self.transaction_spread.total_ideal_role_sum_lower_bound_messages +=
+                    tracked.ideal_role_sum_lower_bound_messages;
+                self.transaction_spread.total_ideal_coalesced_lower_bound_messages +=
+                    tracked.ideal_coalesced_lower_bound_messages;
+                if tracked.ideal_role_sum_lower_bound_messages > 0 {
+                    self.transaction_spread.actual_to_role_sum_ratio.push(
+                        tracked.delivered_block_messages as f64
+                            / tracked.ideal_role_sum_lower_bound_messages as f64,
+                    );
+                }
+                if tracked.ideal_coalesced_lower_bound_messages > 0 {
+                    self.transaction_spread.actual_to_coalesced_ratio.push(
+                        tracked.delivered_block_messages as f64
+                            / tracked.ideal_coalesced_lower_bound_messages as f64,
+                    );
+                }
                 self.committed_blocks += 1;
             }
         }
@@ -712,6 +840,168 @@ impl IntegratedRunner {
         sources
     }
 
+    fn entry_hop_bucket(entry_hops: usize) -> usize {
+        if entry_hops <= LOCAL_ENTRY_MAX_HOPS {
+            0
+        } else if entry_hops <= NEAR_ENTRY_MAX_HOPS {
+            1
+        } else if entry_hops <= MID_ENTRY_MAX_HOPS {
+            2
+        } else {
+            3
+        }
+    }
+
+    fn collect_covering_peers(&self, token: TokenId) -> Vec<PeerId> {
+        self.peers
+            .values()
+            .filter_map(|peer| {
+                if peer.active && peer.node.local_scope_contains(token) {
+                    Some(peer.node.get_peer_id())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn count_covering_peers(&self, token: TokenId) -> usize {
+        self.collect_covering_peers(token).len()
+    }
+
+    fn role_sum_lower_bound_messages(
+        &self,
+        token_neighborhoods: &[Vec<PeerId>],
+        witness_neighborhood: &[PeerId],
+    ) -> usize {
+        token_neighborhoods
+            .iter()
+            .map(|peers| peers.len().saturating_mul(2))
+            .sum::<usize>()
+            + witness_neighborhood.len().saturating_mul(2)
+    }
+
+    fn coalesced_lower_bound_messages(
+        &self,
+        token_neighborhoods: &[Vec<PeerId>],
+        witness_neighborhood: &[PeerId],
+    ) -> usize {
+        let mut union = HashSet::new();
+        for peers in token_neighborhoods {
+            union.extend(peers.iter().copied());
+        }
+        union.extend(witness_neighborhood.iter().copied());
+        union.len().saturating_mul(2)
+    }
+
+    fn sample_existing_mapping(&mut self, peer_id: PeerId) -> Option<(TokenId, BlockId)> {
+        let peer = self.peers.get(&peer_id)?;
+        let backend = peer.backend.borrow();
+        backend
+            .tokens()
+            .sample_current_mapping(&mut self.rng)
+            .map(|(token_id, mapping)| (token_id, mapping.block))
+    }
+
+    fn record_neighborhood_sample(
+        &mut self,
+        coverage_size: usize,
+        vote_eligible_size: usize,
+        entry_hops: usize,
+        entry_is_local: bool,
+    ) {
+        self.neighborhood_coverage_samples.push(coverage_size);
+        self.neighborhood_vote_eligible_samples
+            .push(vote_eligible_size);
+        self.neighborhood_entry_hop_samples.push(entry_hops);
+        if entry_is_local {
+            self.local_entry_token_samples += 1;
+        }
+
+        let bucket = Self::entry_hop_bucket(entry_hops);
+        self.neighborhood_buckets[bucket]
+            .coverage_sizes
+            .push(coverage_size);
+        self.neighborhood_buckets[bucket]
+            .vote_eligible_sizes
+            .push(vote_eligible_size);
+        self.neighborhood_buckets[bucket]
+            .entry_hops
+            .push(entry_hops);
+    }
+
+    fn extend_vote_graph(
+        &self,
+        origin: PeerId,
+        token: TokenId,
+        time: u64,
+        reachable_peers: &mut HashSet<PeerId>,
+        reachable_edges: &mut HashSet<(PeerId, PeerId)>,
+    ) {
+        let mut frontier = vec![origin];
+
+        while let Some(peer_id) = frontier.pop() {
+            if !reachable_peers.insert(peer_id) {
+                continue;
+            }
+
+            let Some(peer) = self.peers.get(&peer_id) else {
+                continue;
+            };
+            if !peer.active {
+                continue;
+            }
+
+            for target in peer.node.vote_targets_for_token_at(token, time) {
+                if target == 0 {
+                    continue;
+                }
+                if !self.peers.get(&target).is_some_and(|candidate| candidate.active) {
+                    continue;
+                }
+
+                reachable_edges.insert((peer_id, target));
+                if !reachable_peers.contains(&target) {
+                    frontier.push(target);
+                }
+            }
+        }
+    }
+
+    fn block_ids_for_message(message: &Message) -> Vec<BlockId> {
+        match message {
+            Message::Vote { block_id, .. } => vec![*block_id],
+            Message::QueryBlock { block_id, .. } => vec![*block_id],
+            Message::Block { block } => vec![block.id],
+            Message::RequestBatch { items } => items
+                .iter()
+                .filter_map(|item| match item {
+                    BatchRequestItem::Vote { block_id, .. } => Some(*block_id),
+                    BatchRequestItem::QueryBlock { block_id, .. } => Some(*block_id),
+                    BatchRequestItem::QueryToken { .. } => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn track_delivered_block_message(&mut self, envelope: &MessageEnvelope) {
+        let block_ids = Self::block_ids_for_message(&envelope.message);
+        if block_ids.is_empty() {
+            return;
+        }
+
+        for block_id in block_ids {
+            let Some(tracked) = self.tracked_blocks.get_mut(&block_id) else {
+                continue;
+            };
+
+            tracked.delivered_block_messages += 1;
+            tracked.touched_peers.insert(envelope.sender);
+            tracked.touched_peers.insert(envelope.receiver);
+        }
+    }
+
     fn inject_blocks(&mut self) {
         let eligible_peers = self.eligible_transaction_sources();
         if eligible_peers.is_empty() {
@@ -726,6 +1016,9 @@ impl IntegratedRunner {
                 self.config.transactions.block_size_range.0
                     ..=self.config.transactions.block_size_range.1,
             );
+            let target = *eligible_peers
+                .choose(&mut self.rng)
+                .expect("eligible peers should not be empty");
             let mut block = Block {
                 id: self.rng.next_u64(),
                 time: self.current_round as u64,
@@ -733,24 +1026,134 @@ impl IntegratedRunner {
                 parts: [TokenBlock::default(); TOKENS_PER_BLOCK],
                 signatures: [None; TOKENS_PER_BLOCK],
             };
+            let mut seen_tokens = HashSet::new();
+            let mut existing_parts_in_block = 0;
 
             for idx in 0..block.used as usize {
-                block.parts[idx].token = self.rng.next_u64();
-                block.parts[idx].last = 0;
+                let prefer_existing = self.rng.gen_bool(
+                    self.config
+                        .transactions
+                        .existing_token_fraction
+                        .clamp(0.0, 1.0),
+                );
+                let mut existing_mapping = None;
+
+                if prefer_existing {
+                    for _ in 0..4 {
+                        let Some((token_id, last_block)) = self.sample_existing_mapping(target) else {
+                            break;
+                        };
+                        if seen_tokens.insert(token_id) {
+                            existing_mapping = Some((token_id, last_block));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((token_id, last_block)) = existing_mapping {
+                    block.parts[idx].token = token_id;
+                    block.parts[idx].last = last_block;
+                    existing_parts_in_block += 1;
+                    self.existing_token_parts_generated += 1;
+                } else {
+                    let token_id = loop {
+                        let candidate = self.rng.next_u64();
+                        if seen_tokens.insert(candidate) {
+                            break candidate;
+                        }
+                    };
+                    block.parts[idx].token = token_id;
+                    block.parts[idx].last = 0;
+                    self.new_token_parts_generated += 1;
+                }
                 block.parts[idx].key = self.rng.next_u64();
                 block.signatures[idx] = Some(PublicKeyReference::default());
             }
+            if existing_parts_in_block > 0 {
+                self.blocks_with_existing_tokens += 1;
+            }
 
-            let target = *eligible_peers
-                .choose(&mut self.rng)
-                .expect("eligible peers should not be empty");
+            let graph_time = self.current_round as u64 + 1;
+            let Some(origin_peer) = self.peers.get(&target) else {
+                continue;
+            };
+
+            let mut token_samples = Vec::new();
+            let mut token_neighborhoods = Vec::new();
+            let mut reachable_vote_peers = HashSet::new();
+            let mut reachable_vote_edges = HashSet::new();
+
+            for idx in 0..block.used as usize {
+                let token = block.parts[idx].token;
+                let covering_peers = self.collect_covering_peers(token);
+                let coverage_size = covering_peers.len();
+                let vote_eligible_size = origin_peer.node.vote_eligible_peer_count(token);
+                let entry_hops = origin_peer
+                    .node
+                    .active_hop_distance_to_token(token)
+                    .unwrap_or(0);
+                let entry_is_local = origin_peer.node.local_scope_contains(token);
+
+                token_samples.push((
+                    coverage_size,
+                    vote_eligible_size,
+                    entry_hops,
+                    entry_is_local,
+                ));
+                token_neighborhoods.push(covering_peers);
+                self.extend_vote_graph(
+                    target,
+                    token,
+                    graph_time,
+                    &mut reachable_vote_peers,
+                    &mut reachable_vote_edges,
+                );
+            }
+
+            let max_entry_hops = token_samples
+                .iter()
+                .map(|(_, _, entry_hops, _)| *entry_hops)
+                .max()
+                .unwrap_or(0);
+            let witness_neighborhood = self.collect_covering_peers(block.id);
+            let witness_coverage = witness_neighborhood.len();
+            let ideal_role_sum_lower_bound_messages =
+                self.role_sum_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
+            let ideal_coalesced_lower_bound_messages = self
+                .coalesced_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
+            for (coverage_size, vote_eligible_size, entry_hops, entry_is_local) in token_samples {
+                self.record_neighborhood_sample(
+                    coverage_size,
+                    vote_eligible_size,
+                    entry_hops,
+                    entry_is_local,
+                );
+            }
+
+            self.transaction_spread
+                .reachable_vote_peers
+                .push(reachable_vote_peers.len());
+            self.transaction_spread
+                .reachable_vote_edges
+                .push(reachable_vote_edges.len());
+            self.transaction_spread
+                .witness_coverage
+                .push(witness_coverage);
+
             if let Some(peer) = self.peers.get_mut(&target) {
                 peer.node.block(&block);
+                let mut touched_peers = HashSet::new();
+                touched_peers.insert(target);
                 self.tracked_blocks.insert(
                     block.id,
                     TrackedBlock {
                         owner: target,
                         submitted_round: self.current_round,
+                        max_entry_hops,
+                        ideal_role_sum_lower_bound_messages,
+                        ideal_coalesced_lower_bound_messages,
+                        delivered_block_messages: 0,
+                        touched_peers,
                     },
                 );
                 self.submitted_blocks += 1;
@@ -783,11 +1186,17 @@ impl IntegratedRunner {
             let additional_delay = self.sample_additional_network_delay();
             let transit_rounds = 1 + additional_delay;
             self.network_transit_samples.push(transit_rounds);
+            self.scheduled_wire_message_types.record_wire(&envelope.message);
+            self.scheduled_message_types.record_logical(&envelope.message);
             self.in_flight_messages.push(ScheduledMessage {
                 deliver_round: self.current_round + additional_delay,
                 envelope,
             });
         }
+
+        self.peak_in_flight_messages = self
+            .peak_in_flight_messages
+            .max(self.in_flight_messages.len());
     }
 
     fn deliver_messages(&mut self) {
@@ -815,7 +1224,11 @@ impl IntegratedRunner {
                 continue;
             }
 
-            self.total_messages_delivered += 1;
+            self.total_wire_messages_delivered += 1;
+            self.delivered_wire_message_types.record_wire(&message.message);
+            self.total_messages_delivered += message_logical_count(&message.message);
+            self.delivered_message_types.record_logical(&message.message);
+            self.track_delivered_block_message(&message);
             if let Some(peer) = self.peers.get_mut(&message.receiver) {
                 peer.node.handle_message(&message, &mut self.outbound_messages);
             }
@@ -869,6 +1282,30 @@ impl IntegratedRunner {
                     rejoin.sync_trace_round = Some(self.current_round);
                 }
             }
+        }
+
+        self.capture_vote_diagnostics();
+    }
+
+    fn capture_vote_diagnostics(&mut self) {
+        for (&peer_id, peer) in &self.peers {
+            let current = peer.node.vote_ingress_diagnostics();
+            let previous = self
+                .last_vote_diagnostics
+                .entry(peer_id)
+                .or_insert_with(VoteIngressDiagnostics::default);
+
+            self.cumulative_trusted_votes_recorded += current
+                .trusted_votes_recorded
+                .saturating_sub(previous.trusted_votes_recorded);
+            self.cumulative_untrusted_votes_received += current
+                .untrusted_votes_received
+                .saturating_sub(previous.untrusted_votes_received);
+            self.cumulative_vote_block_requests += current
+                .block_requests_triggered
+                .saturating_sub(previous.block_requests_triggered);
+
+            *previous = current;
         }
     }
 
@@ -984,6 +1421,27 @@ impl IntegratedRunner {
             .map(|peer| peer.node.num_active_elections())
             .sum();
 
+        let mut pending_without_block = 0;
+        let mut pending_no_trusted_votes = 0;
+        let mut pending_waiting_validation = 0;
+        let mut pending_waiting_token_votes = 0;
+        let mut pending_waiting_witness = 0;
+        let mut pending_age_50_plus = 0;
+        let mut pending_age_200_plus = 0;
+
+        for peer_id in &active_peers {
+            if let Some(peer) = self.peers.get(peer_id) {
+                let diagnostics = peer.node.mempool_diagnostics();
+                pending_without_block += diagnostics.pending_without_block;
+                pending_no_trusted_votes += diagnostics.pending_no_trusted_votes;
+                pending_waiting_validation += diagnostics.pending_waiting_validation;
+                pending_waiting_token_votes += diagnostics.pending_waiting_token_votes;
+                pending_waiting_witness += diagnostics.pending_waiting_witness;
+                pending_age_50_plus += diagnostics.pending_age_50_plus;
+                pending_age_200_plus += diagnostics.pending_age_200_plus;
+            }
+        }
+
         RoundMetrics {
             round: self.current_round,
             active_peers: active_count,
@@ -999,10 +1457,20 @@ impl IntegratedRunner {
             submitted_blocks: self.submitted_blocks,
             committed_blocks: self.committed_blocks,
             pending_blocks: self.tracked_blocks.len(),
+            pending_without_block,
+            pending_no_trusted_votes,
+            pending_waiting_validation,
+            pending_waiting_token_votes,
+            pending_waiting_witness,
+            pending_age_50_plus,
+            pending_age_200_plus,
             total_messages_delivered: self.total_messages_delivered,
             commits_this_round,
             recent_commit_rate: self.recent_average_commits(),
             skipped_submissions: self.skipped_submissions,
+            trusted_votes_recorded: self.cumulative_trusted_votes_recorded,
+            untrusted_votes_received: self.cumulative_untrusted_votes_received,
+            block_requests_triggered_by_votes: self.cumulative_vote_block_requests,
         }
     }
 
@@ -1011,7 +1479,7 @@ impl IntegratedRunner {
         let latency = DistributionSummary::from_samples(&self.commit_latencies);
 
         println!(
-            "[round {}] {}: active peers {}, eligible tx sources {}, in-flight {}, avg known {:.1}, avg connected {:.1}, heads {:.1}, committed {}, pending {}, skipped {}, traces {}, elections {}, recent rate {:.2}/round{}",
+            "[round {}] {}: active peers {}, eligible tx sources {}, in-flight {}, avg known {:.1}, avg connected {:.1}, heads {:.1}, committed {}, pending {}, no-trusted-votes {}, wait-token-votes {}, wait-witness {}, skipped {}, traces {}, elections {}, recent rate {:.2}/round{}",
             self.current_round,
             label,
             snapshot.active_peers,
@@ -1022,6 +1490,9 @@ impl IntegratedRunner {
             snapshot.avg_known_heads,
             snapshot.committed_blocks,
             snapshot.pending_blocks,
+            snapshot.pending_no_trusted_votes,
+            snapshot.pending_waiting_token_votes,
+            snapshot.pending_waiting_witness,
             snapshot.skipped_submissions,
             snapshot.active_traces,
             snapshot.active_elections,
@@ -1179,6 +1650,24 @@ impl IntegratedRunner {
             .last()
             .cloned()
             .unwrap_or_else(|| self.current_snapshot(0));
+        let average_of = |selector: fn(&RoundMetrics) -> usize| -> f64 {
+            if self.round_metrics.is_empty() {
+                selector(&final_snapshot) as f64
+            } else {
+                self.round_metrics
+                    .iter()
+                    .map(|round| selector(round) as f64)
+                    .sum::<f64>()
+                    / self.round_metrics.len() as f64
+            }
+        };
+        let peak_of = |selector: fn(&RoundMetrics) -> usize| -> usize {
+            self.round_metrics
+                .iter()
+                .map(selector)
+                .max()
+                .unwrap_or_else(|| selector(&final_snapshot))
+        };
         let avg_eligible_transaction_sources = if self.round_metrics.is_empty() {
             final_snapshot.eligible_transaction_sources as f64
         } else {
@@ -1188,6 +1677,29 @@ impl IntegratedRunner {
                 .sum::<f64>()
                 / self.round_metrics.len() as f64
         };
+        let neighborhood_buckets = self
+            .neighborhood_buckets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, bucket)| {
+                let token_samples = bucket.entry_hops.len();
+                if token_samples == 0 && bucket.committed_blocks == 0 {
+                    return None;
+                }
+
+                Some(NeighborhoodBucketSummary {
+                    label: NEIGHBORHOOD_BUCKET_LABELS[idx].to_string(),
+                    token_samples,
+                    committed_blocks: bucket.committed_blocks,
+                    coverage_size: DistributionSummary::from_samples(&bucket.coverage_sizes),
+                    vote_eligible_size: DistributionSummary::from_samples(
+                        &bucket.vote_eligible_sizes,
+                    ),
+                    entry_hops: DistributionSummary::from_samples(&bucket.entry_hops),
+                    commit_latency: DistributionSummary::from_samples(&bucket.commit_latencies),
+                })
+            })
+            .collect();
 
         SimResult {
             seed_used: self.seed_used,
@@ -1201,6 +1713,8 @@ impl IntegratedRunner {
             committed_blocks: self.committed_blocks,
             pending_blocks: self.tracked_blocks.len(),
             total_messages_delivered: self.total_messages_delivered,
+            total_wire_messages_delivered: self.total_wire_messages_delivered,
+            peak_in_flight_messages: self.peak_in_flight_messages,
             peak_active_traces: self.peak_active_traces,
             peak_active_elections: self.peak_active_elections,
             final_network_base_delay_rounds: self.config.network.base_delay_rounds,
@@ -1214,6 +1728,89 @@ impl IntegratedRunner {
             final_recent_commit_rate: final_snapshot.recent_commit_rate,
             commit_latency: DistributionSummary::from_samples(&self.commit_latencies),
             network_transit_delay: DistributionSummary::from_samples(&self.network_transit_samples),
+            scheduled_message_types: self.scheduled_message_types.clone(),
+            delivered_message_types: self.delivered_message_types.clone(),
+            scheduled_wire_message_types: self.scheduled_wire_message_types.clone(),
+            delivered_wire_message_types: self.delivered_wire_message_types.clone(),
+            mempool_pressure: MempoolPressureSummary {
+                avg_pending_without_block: average_of(|round| round.pending_without_block),
+                peak_pending_without_block: peak_of(|round| round.pending_without_block),
+                avg_pending_no_trusted_votes: average_of(|round| round.pending_no_trusted_votes),
+                peak_pending_no_trusted_votes: peak_of(|round| round.pending_no_trusted_votes),
+                avg_pending_waiting_validation: average_of(|round| round.pending_waiting_validation),
+                peak_pending_waiting_validation: peak_of(|round| round.pending_waiting_validation),
+                avg_pending_waiting_token_votes: average_of(|round| round.pending_waiting_token_votes),
+                peak_pending_waiting_token_votes: peak_of(|round| round.pending_waiting_token_votes),
+                avg_pending_waiting_witness: average_of(|round| round.pending_waiting_witness),
+                peak_pending_waiting_witness: peak_of(|round| round.pending_waiting_witness),
+                avg_pending_age_50_plus: average_of(|round| round.pending_age_50_plus),
+                peak_pending_age_50_plus: peak_of(|round| round.pending_age_50_plus),
+                avg_pending_age_200_plus: average_of(|round| round.pending_age_200_plus),
+                peak_pending_age_200_plus: peak_of(|round| round.pending_age_200_plus),
+            },
+            vote_ingress: VoteIngressSummary {
+                trusted_votes_recorded: self.cumulative_trusted_votes_recorded,
+                untrusted_votes_received: self.cumulative_untrusted_votes_received,
+                block_requests_triggered_by_votes: self.cumulative_vote_block_requests,
+            },
+            neighborhoods: NeighborhoodSummary {
+                token_samples: self.neighborhood_entry_hop_samples.len(),
+                local_token_samples: self.local_entry_token_samples,
+                coverage_size: DistributionSummary::from_samples(
+                    &self.neighborhood_coverage_samples,
+                ),
+                vote_eligible_size: DistributionSummary::from_samples(
+                    &self.neighborhood_vote_eligible_samples,
+                ),
+                entry_hops: DistributionSummary::from_samples(
+                    &self.neighborhood_entry_hop_samples,
+                ),
+                buckets: neighborhood_buckets,
+            },
+            transaction_workload: TransactionWorkloadSummary {
+                configured_existing_token_fraction: self.config.transactions.existing_token_fraction,
+                existing_token_parts: self.existing_token_parts_generated,
+                new_token_parts: self.new_token_parts_generated,
+                blocks_with_existing_tokens: self.blocks_with_existing_tokens,
+            },
+            transaction_spread: TransactionSpreadSummary {
+                submitted_blocks: self.transaction_spread.reachable_vote_peers.len(),
+                committed_blocks: self.transaction_spread.settled_block_messages.len(),
+                reachable_vote_peers: DistributionSummary::from_samples(
+                    &self.transaction_spread.reachable_vote_peers,
+                ),
+                reachable_vote_edges: DistributionSummary::from_samples(
+                    &self.transaction_spread.reachable_vote_edges,
+                ),
+                witness_coverage: DistributionSummary::from_samples(
+                    &self.transaction_spread.witness_coverage,
+                ),
+                ideal_role_sum_lower_bound_messages: DistributionSummary::from_samples(
+                    &self.transaction_spread.ideal_role_sum_lower_bound_messages,
+                ),
+                ideal_coalesced_lower_bound_messages: DistributionSummary::from_samples(
+                    &self.transaction_spread.ideal_coalesced_lower_bound_messages,
+                ),
+                settled_peer_spread: DistributionSummary::from_samples(
+                    &self.transaction_spread.settled_peer_spread,
+                ),
+                settled_block_messages: DistributionSummary::from_samples(
+                    &self.transaction_spread.settled_block_messages,
+                ),
+                actual_to_role_sum_ratio: FloatDistributionSummary::from_samples(
+                    &self.transaction_spread.actual_to_role_sum_ratio,
+                ),
+                actual_to_coalesced_ratio: FloatDistributionSummary::from_samples(
+                    &self.transaction_spread.actual_to_coalesced_ratio,
+                ),
+                total_actual_block_messages: self.transaction_spread.total_actual_block_messages,
+                total_ideal_role_sum_lower_bound_messages: self
+                    .transaction_spread
+                    .total_ideal_role_sum_lower_bound_messages,
+                total_ideal_coalesced_lower_bound_messages: self
+                    .transaction_spread
+                    .total_ideal_coalesced_lower_bound_messages,
+            },
             late_joiner_onboarding: self.build_onboarding_summary(),
             rejoin_onboarding: self.build_rejoin_summary(),
             recoveries: self

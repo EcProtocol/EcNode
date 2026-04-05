@@ -77,6 +77,13 @@ That means new transactions are only injected at nodes that currently consider t
 
 This is an operator policy, not a protocol guarantee.
 
+The transaction generator can also mix:
+
+- brand-new tokens
+- updates to tokens already known at the submitting node
+
+This is controlled through `TransactionFlowConfig.existing_token_fraction`.
+
 ## Reported Metrics
 
 The simulator reports:
@@ -88,6 +95,18 @@ The simulator reports:
 - sampled network transit delay
   - avg, p50, p95, min, max
 - total messages delivered
+- organic neighborhood geometry
+  - external token coverage size
+  - vote-eligible set size at the submission entry node
+  - entry-point distance to the token neighborhood in connected-peer hops
+- transaction spread
+  - static reachable vote graph size and edge count
+  - witness neighborhood size
+  - actual unique peer spread before commit
+  - block-related messages delivered before commit
+  - role-sum lower bound for block-message load
+  - coalesced per-peer lower bound for block-message load
+  - actual / ideal message-load factors
 - active commit traces
   - current and peak
 - active elections
@@ -158,6 +177,7 @@ The safest way to interpret results is:
 
 The integrated config exposes named starting points:
 
+- `NetworkConfig::perfect()`
 - `NetworkConfig::same_dc()`
 - `NetworkConfig::cross_dc_normal()`
 - `NetworkConfig::cross_dc_stressed()`

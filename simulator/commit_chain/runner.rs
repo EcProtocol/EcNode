@@ -4,9 +4,9 @@ use super::config::CommitChainSimConfig;
 use super::stats::{CommitStats, MessageCounts, MessageStats, SimResult, SyncStats};
 use ec_rust::ec_commit_chain::TickMessage;
 use ec_rust::ec_interface::{
-    Block, BlockId, CommitBlock, EcBlocks, EcCommitChainAccess, EcCommitChainBackend, EcTime,
-    EcTokens, Message, MessageTicket, PeerId, PublicKeyReference, TokenBlock, TokenId,
-    GENESIS_BLOCK_ID, TOKENS_PER_BLOCK,
+    BatchRequestItem, Block, BlockId, CommitBlock, EcBlocks, EcCommitChainAccess,
+    EcCommitChainBackend, EcTime, EcTokens, Message, MessageTicket, PeerId,
+    PublicKeyReference, TokenBlock, TokenId, GENESIS_BLOCK_ID, TOKENS_PER_BLOCK,
 };
 use ec_rust::ec_memory_backend::MemoryBackend;
 use ec_rust::ec_peers::PeerRange;
@@ -301,6 +301,18 @@ impl CommitChainRunner {
             Message::QueryBlock { block_id, ticket, .. } => {
                 // Route to peer responsible for block-id
                 self.handle_query_block(envelope.to, envelope.from, block_id, ticket);
+            }
+            Message::RequestBatch { items } => {
+                for item in items {
+                    if let BatchRequestItem::QueryBlock {
+                        block_id,
+                        ticket,
+                        ..
+                    } = item
+                    {
+                        self.handle_query_block(envelope.to, envelope.from, block_id, ticket);
+                    }
+                }
             }
             Message::Block { block } => {
                 // Deliver block to requester

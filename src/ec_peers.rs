@@ -12,6 +12,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Configuration for the peer management system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveNeighborhoodConfig {
+    /// Reduced width to use for tokens far from this node's address.
+    pub far_width: usize,
+
+    /// Active-ring hop distance beyond which `far_width` applies.
+    pub far_hop_threshold: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerManagerConfig {
     // ===== Capacity Limits =====
     /// Maximum number of Connected peers (default: 200)
@@ -43,6 +52,23 @@ pub struct PeerManagerConfig {
     /// Protection time for recently connected peers from pruning (in ticks, default: 600 = 10 min)
     pub prune_protection_time: u64,
 
+    /// Number of connected peers to include on each side when estimating a local neighborhood.
+    pub neighborhood_width: usize,
+
+    /// Number of peers to target when requesting votes for a token or witness.
+    pub vote_target_count: usize,
+
+    /// Optional adaptive narrowing for far-away tokens.
+    pub adaptive_neighborhood: Option<AdaptiveNeighborhoodConfig>,
+
+    /// Whether the node should coalesce request-like messages into `RequestBatch`
+    /// envelopes before they leave the local outbox.
+    pub enable_request_batching: bool,
+
+    /// Whether direct vote replies (`reply = false`) may also be packed into
+    /// request batches. This extends Phase 1 batching to the fast-reply path.
+    pub batch_vote_replies: bool,
+
     // ===== Election Configuration =====
     /// Configuration for PeerElection
     pub election_config: ElectionConfig,
@@ -65,6 +91,11 @@ impl Default for PeerManagerConfig {
             pending_timeout: 10,
             connection_timeout: 300,
             prune_protection_time: 600,
+            neighborhood_width: 4,
+            vote_target_count: 2,
+            adaptive_neighborhood: None,
+            enable_request_batching: true,
+            batch_vote_replies: false,
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -742,8 +773,22 @@ impl EcPeers {
 
     /// Get two peers responsible for a token
     pub(crate) fn peers_for(&self, key: &TokenId, time: EcTime) -> [PeerId; 2] {
-        if self.active.is_empty() {
+        let targets = self.vote_target_peers_for(key, time);
+        if targets.len() < 2 {
             return [0, 0];
+        }
+
+        [targets[0], targets[1]]
+    }
+
+    fn collect_vote_targets(
+        &self,
+        key: &TokenId,
+        time: EcTime,
+        desired_count: usize,
+    ) -> Vec<PeerId> {
+        if self.active.is_empty() {
+            return Vec::new();
         }
 
         let idx = match self.active.binary_search(key) {
@@ -752,11 +797,31 @@ impl EcPeers {
         };
 
         let adj = (((key ^ self.peer_id) + time) & 0x3) as isize + 1;
+        let target_count = desired_count.max(1).min(self.active.len());
+        let mut targets = Vec::with_capacity(target_count);
 
-        [
-            *self.active.get(self.idx_adj(idx, -adj)).unwrap(),
-            *self.active.get(self.idx_adj(idx, adj)).unwrap(),
-        ]
+        for step in 0..target_count.saturating_mul(2) {
+            let signed_step = adj + (step / 2) as isize;
+            let offset = if step % 2 == 0 {
+                -signed_step
+            } else {
+                signed_step
+            };
+            let candidate = self.active[self.idx_adj(idx, offset)];
+            if !targets.contains(&candidate) {
+                targets.push(candidate);
+                if targets.len() == target_count {
+                    break;
+                }
+            }
+        }
+
+        targets
+    }
+
+    /// Get the configured vote targets for a token.
+    pub(crate) fn vote_target_peers_for(&self, key: &TokenId, time: EcTime) -> Vec<PeerId> {
+        self.collect_vote_targets(key, time, self.config.vote_target_count)
     }
 
     /// Get a single peer responsible for a token
@@ -778,6 +843,61 @@ impl EcPeers {
     /// Get peer ID by index in active list
     pub fn for_index(&self, idx: usize) -> Option<PeerId> {
         self.active.get(idx).copied()
+    }
+
+    fn insertion_index(&self, key: &TokenId) -> Option<usize> {
+        if self.active.is_empty() {
+            return None;
+        }
+
+        Some(match self.active.binary_search(key) {
+            Ok(i) | Err(i) => i % self.active.len(),
+        })
+    }
+
+    fn effective_neighborhood_width(&self, key: TokenId) -> usize {
+        let base = self.config.neighborhood_width.max(1);
+        let Some(adaptive) = &self.config.adaptive_neighborhood else {
+            return base;
+        };
+
+        let Some(distance) = self.active_hop_distance(self.peer_id, key) else {
+            return base;
+        };
+
+        if distance > adaptive.far_hop_threshold {
+            adaptive.far_width.max(1).min(base)
+        } else {
+            base
+        }
+    }
+
+    pub fn local_scope_contains(&self, token: TokenId) -> bool {
+        self.peer_range(&self.peer_id).in_range(&token)
+    }
+
+    pub fn vote_eligible_peer_count(&self, token: TokenId) -> usize {
+        if self.active.is_empty() {
+            return 0;
+        }
+
+        let range = self.peer_range(&token);
+        self.active
+            .iter()
+            .filter(|peer_id| range.in_range(peer_id))
+            .count()
+    }
+
+    pub fn active_hop_distance(&self, from: TokenId, to: TokenId) -> Option<usize> {
+        let len = self.active.len();
+        if len == 0 {
+            return None;
+        }
+
+        let from_idx = self.insertion_index(&from)?;
+        let to_idx = self.insertion_index(&to)?;
+        let direct = from_idx.abs_diff(to_idx);
+        Some(direct.min(len - direct))
     }
 
     // ========================================================================
@@ -1115,7 +1235,8 @@ impl EcPeers {
 
     /// Get peer range for a key (for Referral messages)
     pub(crate) fn peer_range(&self, key: &PeerId) -> PeerRange {
-        if self.active.len() <= 10 {
+        let width = self.effective_neighborhood_width(*key);
+        if self.active.len() <= width.saturating_mul(2).saturating_add(2) {
             return PeerRange {
                 low: PeerId::MIN,
                 high: PeerId::MAX,
@@ -1126,8 +1247,8 @@ impl EcPeers {
             Ok(idx) | Err(idx) => {
                 let idx = idx % self.active.len();
                 PeerRange {
-                    low: self.active[self.idx_adj(idx, -4)],
-                    high: self.active[self.idx_adj(idx, 4)],
+                    low: self.active[self.idx_adj(idx, -(width as isize))],
+                    high: self.active[self.idx_adj(idx, width as isize)],
                 }
             }
         }
@@ -1805,6 +1926,77 @@ mod tests {
     }
 
     #[test]
+    fn test_vote_eligible_count_and_hop_distance() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut peers = EcPeers::with_config_and_rng(55, PeerManagerConfig::default(), rng);
+        for peer_id in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        // The current interval implementation is inclusive on both ends, so some
+        // insertion positions expand to 9 connected peers instead of 8.
+        assert_eq!(peers.vote_eligible_peer_count(65), 9);
+        assert_eq!(peers.active_hop_distance(55, 65), Some(1));
+        assert_eq!(peers.active_hop_distance(55, 5), Some(5));
+    }
+
+    #[test]
+    fn test_local_scope_contains_tracks_peer_interval() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut peers = EcPeers::with_config_and_rng(55, PeerManagerConfig::default(), rng);
+        for peer_id in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        assert!(peers.local_scope_contains(65));
+        assert!(peers.local_scope_contains(25));
+        assert!(!peers.local_scope_contains(115));
+    }
+
+    #[test]
+    fn test_adaptive_neighborhood_width_narrows_far_tokens_only() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(13);
+        let mut config = PeerManagerConfig::default();
+        config.neighborhood_width = 6;
+        config.adaptive_neighborhood = Some(AdaptiveNeighborhoodConfig {
+            far_width: 2,
+            far_hop_threshold: 3,
+        });
+
+        let mut peers = EcPeers::with_config_and_rng(55, config, rng);
+        for peer_id in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        assert_eq!(peers.vote_eligible_peer_count(65), 12);
+        assert_eq!(peers.vote_eligible_peer_count(5), 5);
+    }
+
+    #[test]
+    fn test_vote_target_count_expands_unique_targets() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(17);
+        let mut config = PeerManagerConfig::default();
+        config.vote_target_count = 3;
+
+        let mut peers = EcPeers::with_config_and_rng(55, config, rng);
+        for peer_id in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        let targets = peers.vote_target_peers_for(&65, 0);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.iter().copied().collect::<HashSet<_>>().len(), 3);
+    }
+
+    #[test]
     fn test_config_defaults() {
         let config = PeerManagerConfig::default();
 
@@ -1817,5 +2009,10 @@ mod tests {
         assert_eq!(config.pending_timeout, 10);
         assert_eq!(config.connection_timeout, 300);
         assert_eq!(config.prune_protection_time, 600);
+        assert_eq!(config.neighborhood_width, 4);
+        assert_eq!(config.vote_target_count, 2);
+        assert!(config.adaptive_neighborhood.is_none());
+        assert!(config.enable_request_batching);
+        assert!(!config.batch_vote_replies);
     }
 }

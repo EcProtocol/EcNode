@@ -11,8 +11,8 @@ use rand::{Rng, RngCore, SeedableRng};
 
 use ec_rust::ec_memory_backend::MemoryBackend;
 use ec_rust::ec_interface::{
-    Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference, TokenBlock, TokenId,
-    TOKENS_PER_BLOCK,
+    BatchRequestItem, Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference,
+    TokenBlock, TokenId, TOKENS_PER_BLOCK,
 };
 use ec_rust::ec_node::EcNode;
 
@@ -290,6 +290,15 @@ impl SimRunner {
                     Message::QueryBlock { .. } => self.message_counters.0 += 1,
                     Message::QueryToken { .. } => self.message_counters.0 += 1,
                     Message::Vote { .. } => self.message_counters.1 += 1,
+                    Message::RequestBatch { ref items } => {
+                        for item in items {
+                            match item {
+                                BatchRequestItem::Vote { .. } => self.message_counters.1 += 1,
+                                BatchRequestItem::QueryBlock { .. }
+                                | BatchRequestItem::QueryToken { .. } => self.message_counters.0 += 1,
+                            }
+                        }
+                    }
                     Message::Block { .. } => self.message_counters.2 += 1,
                     Message::Answer { .. } => self.message_counters.3 += 1,
                     Message::Referral { .. } => (),
