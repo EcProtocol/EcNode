@@ -14,6 +14,8 @@ use crate::ec_ticket_manager::TicketManager;
 
 use crate::ec_mempool::MessageRequest;
 
+const CONFLICT_SIGNAL_RESEND_COOLDOWN: EcTime = 16;
+
 pub struct EcNode<
     B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static,
     T: TokenStorageBackend,
@@ -30,6 +32,7 @@ pub struct EcNode<
     vote_diagnostics: VoteIngressDiagnostics,
     enable_request_batching: bool,
     batch_vote_replies: bool,
+    recent_conflict_signals: HashMap<(PeerId, BlockId), EcTime>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -105,8 +108,9 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
     ) -> Self {
         let enable_request_batching = peer_config.enable_request_batching;
         let batch_vote_replies = peer_config.batch_vote_replies;
+        let vote_balance_threshold = peer_config.vote_balance_threshold;
         Self {
-            mem_pool: EcMemPool::new(),
+            mem_pool: EcMemPool::with_vote_balance_threshold(vote_balance_threshold),
             backend,
             token_storage,
             peers: EcPeers::with_config(id, peer_config),
@@ -118,6 +122,7 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
             vote_diagnostics: VoteIngressDiagnostics::default(),
             enable_request_batching,
             batch_vote_replies,
+            recent_conflict_signals: HashMap::new(),
         }
     }
 
@@ -169,6 +174,11 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         EcBlocks::lookup(&*self.backend.borrow(), block_id)
     }
 
+    pub fn knows_block(&self, block_id: &BlockId) -> bool {
+        let backend = self.backend.borrow();
+        self.mem_pool.status(block_id, &*backend).is_some()
+    }
+
     pub fn mempool_diagnostics(&self) -> MempoolDiagnostics {
         self.mem_pool.diagnostics(self.time)
     }
@@ -214,6 +224,10 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         let mut local_responses = Vec::new();
         let responses = &mut local_responses;
 
+        self.recent_conflict_signals.retain(|_, last_sent| {
+            self.time.saturating_sub(*last_sent) < CONFLICT_SIGNAL_RESEND_COOLDOWN
+        });
+
         // Rotate ticket secrets if needed
         self.ticket_manager.tick(self.time);
 
@@ -221,6 +235,7 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         let mut messages = {
             // Phase 0: Cleanup expired blocks
             self.mem_pool.cleanup_expired(self.time);
+            self.mem_pool.block_known_higher_conflicts();
 
             // Phase 1: Evaluate pending blocks (immutable borrow)
             // This checks token chains and generates parent requests for reorg/skip scenarios
@@ -274,10 +289,17 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         for request in &messages {
             match request {
                 MessageRequest::Vote(block_id, token_id, vote, _) => {
-                    let vote = if previous_token == Some(*token_id) {
+                    let primary_for_token = previous_token != Some(*token_id);
+                    let vote = if !primary_for_token {
                         0
                     } else {
                         *vote
+                    };
+                    let blocked_conflict_signal = if primary_for_token {
+                        self.mem_pool
+                            .blocked_direct_conflict_signal_for(block_id, token_id)
+                    } else {
+                        None
                     };
                     previous_token = Some(*token_id);
 
@@ -292,7 +314,23 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
                                 vote,
                                 reply: true,
                             },
-                        })
+                        });
+
+                        if let Some(conflict_block_id) = blocked_conflict_signal {
+                            if self.should_send_conflict_signal(&peer_id, conflict_block_id) {
+                                responses.push(MessageEnvelope {
+                                    sender: self.peer_id,
+                                    receiver: peer_id,
+                                    ticket: 0,
+                                    time: self.time,
+                                    message: Message::Vote {
+                                        block_id: conflict_block_id,
+                                        vote: 0,
+                                        reply: true,
+                                    },
+                                });
+                            }
+                        }
                     }
                 }
                 MessageRequest::Parent(block_id, parent_id) => {
@@ -883,6 +921,26 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         *responses = coalesced;
     }
 
+    fn should_send_conflict_signal(
+        &mut self,
+        target: &PeerId,
+        conflict_block_id: BlockId,
+    ) -> bool {
+        let key = (*target, conflict_block_id);
+        if self
+            .recent_conflict_signals
+            .get(&key)
+            .is_some_and(|last_sent| {
+                self.time.saturating_sub(*last_sent) < CONFLICT_SIGNAL_RESEND_COOLDOWN
+            })
+        {
+            return false;
+        }
+
+        self.recent_conflict_signals.insert(key, self.time);
+        true
+    }
+
     fn local_vote_for_block(&self, block_id: &BlockId, blocks: &dyn EcBlocks, tokens: &dyn EcTokensV2) -> Option<u8> {
         self.mem_pool.query(block_id, blocks).map(|block| {
             let mut vote = 0;
@@ -1321,6 +1379,195 @@ mod tests {
         assert_eq!(responses.len(), original.len());
         assert!(matches!(responses[0].message, Message::Vote { .. }));
         assert!(matches!(responses[1].message, Message::QueryBlock { .. }));
+    }
+
+    #[test]
+    fn tick_propagates_blocked_direct_conflict_with_primary_vote() {
+        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
+        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
+
+        let mut config = PeerManagerConfig::default();
+        config.elections_per_tick = 0;
+        config.enable_request_batching = false;
+
+        let rng = rand::rngs::StdRng::from_seed([15u8; 32]);
+        let mut node = EcNode::new_with_peer_config(backend.clone(), 1, 0, MemTokens::new(), config, rng);
+        node.seed_peer(&2);
+
+        let lower_block = crate::ec_interface::Block {
+            id: 101,
+            time: 1,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token: 11,
+                    last: 100,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
+        };
+        let higher_block = crate::ec_interface::Block {
+            id: 202,
+            time: 1,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token: 11,
+                    last: 100,
+                    key: 2,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
+        };
+
+        node.block(&lower_block);
+        node.block(&higher_block);
+
+        let mut outbound = Vec::new();
+        node.tick(&mut outbound);
+
+        let vote_messages: Vec<_> = outbound
+            .iter()
+            .filter_map(|envelope| match &envelope.message {
+                Message::Vote { block_id, vote, .. } if envelope.receiver == 2 => {
+                    Some((*block_id, *vote))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            vote_messages
+                .iter()
+                .any(|(block_id, vote)| *block_id == higher_block.id && *vote == 0b0000_0001),
+            "expected primary vote for higher conflict candidate"
+        );
+        assert!(
+            vote_messages
+                .iter()
+                .any(|(block_id, vote)| *block_id == lower_block.id && *vote == 0),
+            "expected forced blocker propagation for lower direct conflict"
+        );
+    }
+
+    #[test]
+    fn tick_rate_limits_repeated_conflict_signal_to_same_peer() {
+        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
+        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
+
+        let mut config = PeerManagerConfig::default();
+        config.elections_per_tick = 0;
+        config.enable_request_batching = false;
+
+        let rng = rand::rngs::StdRng::from_seed([16u8; 32]);
+        let mut node =
+            EcNode::new_with_peer_config(backend.clone(), 1, 0, MemTokens::new(), config, rng);
+        node.seed_peer(&2);
+
+        let lower_block = crate::ec_interface::Block {
+            id: 101,
+            time: 1,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token: 11,
+                    last: 100,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
+        };
+        let higher_block = crate::ec_interface::Block {
+            id: 202,
+            time: 1,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token: 11,
+                    last: 100,
+                    key: 2,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
+        };
+
+        node.block(&lower_block);
+        node.block(&higher_block);
+
+        let mut outbound = Vec::new();
+        node.tick(&mut outbound);
+        let first_tick_conflicts = outbound
+            .iter()
+            .filter(|envelope| {
+                matches!(
+                    envelope.message,
+                    Message::Vote {
+                        block_id,
+                        vote: 0,
+                        ..
+                    } if block_id == lower_block.id && envelope.receiver == 2
+                )
+            })
+            .count();
+        assert_eq!(first_tick_conflicts, 1);
+
+        outbound.clear();
+        node.tick(&mut outbound);
+        let second_tick_conflicts = outbound
+            .iter()
+            .filter(|envelope| {
+                matches!(
+                    envelope.message,
+                    Message::Vote {
+                        block_id,
+                        vote: 0,
+                        ..
+                    } if block_id == lower_block.id && envelope.receiver == 2
+                )
+            })
+            .count();
+        assert_eq!(second_tick_conflicts, 0);
+
+        for _ in 0..(super::CONFLICT_SIGNAL_RESEND_COOLDOWN - 1) {
+            outbound.clear();
+            node.tick(&mut outbound);
+        }
+
+        let cooldown_expired_conflicts = outbound
+            .iter()
+            .filter(|envelope| {
+                matches!(
+                    envelope.message,
+                    Message::Vote {
+                        block_id,
+                        vote: 0,
+                        ..
+                    } if block_id == lower_block.id && envelope.receiver == 2
+                )
+            })
+            .count();
+        assert_eq!(cooldown_expired_conflicts, 1);
     }
 
 }

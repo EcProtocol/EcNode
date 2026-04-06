@@ -10,11 +10,14 @@ pub mod config;
 pub mod runner;
 pub mod stats;
 
-pub use config::{IntegratedSimConfig, NetworkConfig, TransactionFlowConfig, TransactionSourcePolicy};
+pub use config::{
+    ConflictWorkloadConfig, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
+    TransactionSourcePolicy,
+};
 pub use runner::IntegratedRunner;
 pub use stats::{
-    DistributionSummary, FloatDistributionSummary, MempoolPressureSummary, MessageTypeBreakdown,
-    NeighborhoodBucketSummary, NeighborhoodSummary, OnboardingSummary, RecoverySummary,
-    RoundMetrics, SimResult, TransactionSpreadSummary, TransactionWorkloadSummary,
-    VoteIngressSummary,
+    ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary,
+    MempoolPressureSummary, MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary,
+    OnboardingSummary, RecoverySummary, RoundMetrics, SimResult, TransactionSpreadSummary,
+    TransactionWorkloadSummary, VoteIngressSummary,
 };

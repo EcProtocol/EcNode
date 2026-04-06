@@ -277,6 +277,32 @@ impl TransactionWorkloadSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConflictWorkloadSummary {
+    pub configured_family_fraction: f64,
+    pub configured_contenders: usize,
+    pub families_created: usize,
+    pub candidate_blocks_submitted: usize,
+    pub owner_committed_candidates: usize,
+    pub families_with_highest_majority: usize,
+    pub families_with_any_majority: usize,
+    pub families_stalled_without_majority: usize,
+    pub families_without_visible_candidate: usize,
+    pub families_with_single_visible_candidate: usize,
+    pub families_split_across_candidates: usize,
+    pub families_unanimous_highest_candidate: usize,
+    pub families_with_any_lower_candidate_visible: usize,
+    pub families_with_lower_owner_commit: usize,
+    pub families_with_multiple_owner_commits: usize,
+    pub visible_candidates_per_family: Option<DistributionSummary>,
+    pub covering_peers_per_family: Option<DistributionSummary>,
+    pub participant_peers_per_family: Option<DistributionSummary>,
+    pub signaled_participant_peers_per_family: Option<DistributionSummary>,
+    pub candidate_coverers_per_family: Option<DistributionSummary>,
+    pub highest_candidate_coverer_share: Option<FloatDistributionSummary>,
+    pub signal_coverage_among_participants: Option<FloatDistributionSummary>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SimResult {
     pub seed_used: [u8; 32],
     pub rounds_completed: usize,
@@ -312,6 +338,7 @@ pub struct SimResult {
     pub vote_ingress: VoteIngressSummary,
     pub neighborhoods: NeighborhoodSummary,
     pub transaction_workload: TransactionWorkloadSummary,
+    pub conflict_workload: ConflictWorkloadSummary,
     pub transaction_spread: TransactionSpreadSummary,
     pub late_joiner_onboarding: OnboardingSummary,
     pub rejoin_onboarding: OnboardingSummary,
@@ -348,6 +375,71 @@ impl SimResult {
             self.transaction_workload.new_token_parts,
             self.transaction_workload.blocks_with_existing_tokens,
         );
+        println!(
+            "Conflict workload: {:.0}% slot target, {} contenders, {} families, {} candidate blocks, {} owner commits",
+            self.conflict_workload.configured_family_fraction * 100.0,
+            self.conflict_workload.configured_contenders,
+            self.conflict_workload.families_created,
+            self.conflict_workload.candidate_blocks_submitted,
+            self.conflict_workload.owner_committed_candidates,
+        );
+        if self.conflict_workload.families_created > 0 {
+            println!(
+                "Conflict outcomes: {} no-visible, {} single-visible, {} split, {} unanimous-highest, {} highest-majority, {} any-majority, {} stalled-no-majority, {} any-lower-visible, {} lower-owner-commits, {} multi-owner-commits",
+                self.conflict_workload.families_without_visible_candidate,
+                self.conflict_workload.families_with_single_visible_candidate,
+                self.conflict_workload.families_split_across_candidates,
+                self.conflict_workload.families_unanimous_highest_candidate,
+                self.conflict_workload.families_with_highest_majority,
+                self.conflict_workload.families_with_any_majority,
+                self.conflict_workload.families_stalled_without_majority,
+                self.conflict_workload.families_with_any_lower_candidate_visible,
+                self.conflict_workload.families_with_lower_owner_commit,
+                self.conflict_workload.families_with_multiple_owner_commits,
+            );
+            if let Some(summary) = &self.conflict_workload.visible_candidates_per_family {
+                println!(
+                    "Conflict visible candidates/family: avg {:.2}, p50 {}, p95 {}, min {}, max {}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+            if let Some(summary) = &self.conflict_workload.covering_peers_per_family {
+                println!(
+                    "Conflict covering peers/family: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+            if let Some(summary) = &self.conflict_workload.participant_peers_per_family {
+                println!(
+                    "Conflict participant peers/family: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+            if let Some(summary) = &self.conflict_workload.signaled_participant_peers_per_family {
+                println!(
+                    "Conflict signaled participants/family: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+            if let Some(summary) = &self.conflict_workload.candidate_coverers_per_family {
+                println!(
+                    "Conflict coverers on candidate states/family: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+            if let Some(summary) = &self.conflict_workload.highest_candidate_coverer_share {
+                println!(
+                    "Conflict highest-candidate coverer share: avg {:.2}, p50 {:.2}, p95 {:.2}, min {:.2}, max {:.2}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+            if let Some(summary) = &self.conflict_workload.signal_coverage_among_participants {
+                println!(
+                    "Conflict signal coverage among participants: avg {:.2}, p50 {:.2}, p95 {:.2}, min {:.2}, max {:.2}",
+                    summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+        }
         println!(
             "Blocks: {} attempts, {} submitted, {} skipped, {} committed, {} pending",
             self.submission_attempts,

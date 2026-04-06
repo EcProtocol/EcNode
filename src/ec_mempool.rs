@@ -9,7 +9,7 @@ use crate::ec_interface::{
 use crate::ec_mempool::BlockState::Pending;
 use crate::ec_peers::{EcPeers, PeerRange};
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum BlockState {
     Pending,
     Commit,
@@ -124,6 +124,7 @@ pub struct BlockEvaluation {
 
 pub struct EcMemPool {
     pool: HashMap<BlockId, PoolBlockState>,
+    vote_balance_threshold: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,8 +172,13 @@ fn validate_with_parent(parent: &Block, block: &Block, i: usize) -> bool {
 
 impl EcMemPool {
     pub fn new() -> Self {
+        Self::with_vote_balance_threshold(VOTE_THRESHOLD)
+    }
+
+    pub fn with_vote_balance_threshold(vote_balance_threshold: i64) -> Self {
         Self {
             pool: HashMap::new(),
+            vote_balance_threshold,
         }
     }
 
@@ -233,6 +239,59 @@ impl EcMemPool {
         // TODO: Make timeout configurable? Currently 200 ticks
         self.pool
             .retain(|_, state| time.saturating_sub(state.time) < 200);
+    }
+
+    /// Persistently blocks lower direct conflicts before any commit decisions are made.
+    ///
+    /// A direct conflict is another known block that updates the same token from the same
+    /// parent mapping. If we know a higher block ID for any part of a pending block, the
+    /// lower block must never commit locally.
+    pub(crate) fn block_known_higher_conflicts(&mut self) {
+        let mut highest_by_conflict = HashMap::new();
+
+        for (block_id, state) in self
+            .pool
+            .iter()
+            .filter(|(_, state)| state.state != BlockState::Blocked)
+        {
+            let Some(block) = state.block else {
+                continue;
+            };
+
+            for i in 0..block.used as usize {
+                let key = (block.parts[i].token, block.parts[i].last);
+                highest_by_conflict
+                    .entry(key)
+                    .and_modify(|highest: &mut BlockId| {
+                        if *highest < *block_id {
+                            *highest = *block_id;
+                        }
+                    })
+                    .or_insert(*block_id);
+            }
+        }
+
+        for (block_id, state) in self
+            .pool
+            .iter_mut()
+            .filter(|(_, state)| state.state == BlockState::Pending)
+        {
+            let Some(block) = state.block else {
+                continue;
+            };
+
+            let has_higher_conflict = (0..block.used as usize).any(|i| {
+                let key = (block.parts[i].token, block.parts[i].last);
+                highest_by_conflict
+                    .get(&key)
+                    .is_some_and(|highest| *highest > *block_id)
+            });
+
+            if has_higher_conflict {
+                state.state = BlockState::Blocked;
+                state.updated = false;
+            }
+        }
     }
 
     /// Evaluate all pending blocks and determine which can proceed to commit
@@ -343,6 +402,39 @@ impl EcMemPool {
             .unwrap_or_default()
     }
 
+    pub(crate) fn blocked_direct_conflict_signal_for(
+        &self,
+        block_id: &BlockId,
+        token_id: &TokenId,
+    ) -> Option<BlockId> {
+        let Some(parent) = self
+            .pool
+            .get(block_id)
+            .and_then(|state| state.block)
+            .and_then(|block| {
+                (0..block.used as usize)
+                    .find(|idx| block.parts[*idx].token == *token_id)
+                    .map(|idx| block.parts[idx].last)
+            })
+        else {
+            return None;
+        };
+
+        self.pool
+            .iter()
+            .filter_map(|(candidate_id, state)| {
+                if *candidate_id == *block_id || state.state != BlockState::Blocked {
+                    return None;
+                }
+                let block = state.block?;
+                let direct_conflict = (0..block.used as usize).any(|idx| {
+                    block.parts[idx].token == *token_id && block.parts[idx].last == parent
+                });
+                direct_conflict.then_some(*candidate_id)
+            })
+            .max()
+    }
+
     /// Validates a block in the memory pool against its parent block.
     ///
     /// This function is called when a parent block becomes available, allowing for
@@ -444,14 +536,14 @@ impl EcMemPool {
                     }
                 }
 
-                block_state.remaining = if witness_balance <= VOTE_THRESHOLD {
+                block_state.remaining = if witness_balance <= self.vote_balance_threshold {
                     1 << TOKENS_PER_BLOCK
                 } else {
                     0
                 };
 
                 for i in 0..ranges.len() {
-                    if balance[i] <= VOTE_THRESHOLD {
+                    if balance[i] <= self.vote_balance_threshold {
                         block_state.remaining |= 1 << i
                     }
                 }
@@ -525,8 +617,89 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::ec_interface::{
+        EcTokens, EcTokensV2, NoOpSink, StorageBatch, TokenBlock, TokenState, TrustedMapping,
+        TrustSource,
+    };
+    use crate::ec_peers::EcPeers;
+    use rand::SeedableRng;
+
     struct MockEcBlocks {
         blocks: hashbrown::HashMap<BlockId, Block>,
+    }
+
+    #[derive(Default)]
+    struct MockTokens {
+        tokens: hashbrown::HashMap<TokenId, TokenState>,
+    }
+
+    impl EcTokensV2 for MockTokens {
+        fn lookup_state(&self, token: &TokenId) -> Option<TokenState> {
+            self.tokens.get(token).cloned()
+        }
+
+        fn lookup_current(&self, token: &TokenId) -> Option<TrustedMapping> {
+            self.tokens.get(token).and_then(|state| state.current)
+        }
+
+        fn is_local(&self, token: &TokenId) -> bool {
+            self.tokens
+                .get(token)
+                .is_some_and(|state| state.is_local())
+        }
+    }
+
+    impl EcTokens for MockTokens {
+        fn lookup(&self, _token: &TokenId) -> Option<&crate::ec_interface::BlockTime> {
+            unimplemented!("legacy EcTokens lookup is not used in mempool tests")
+        }
+
+        fn set(&mut self, _token: &TokenId, _block: &BlockId, _parent: &BlockId, _time: EcTime) {
+            unimplemented!("legacy EcTokens set is not used in mempool tests")
+        }
+
+        fn tokens_signature(
+            &self,
+            _token: &TokenId,
+            _peer: &PeerId,
+        ) -> Option<crate::ec_interface::TokenSignature> {
+            None
+        }
+    }
+
+    #[derive(Default)]
+    struct TestBatch {
+        saved_blocks: Vec<BlockId>,
+        updated_tokens: Vec<(TokenId, BlockId, BlockId, EcTime)>,
+    }
+
+    impl StorageBatch for TestBatch {
+        fn save_block(&mut self, block: &Block) {
+            self.saved_blocks.push(block.id);
+        }
+
+        fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+            self.updated_tokens.push((*token, *block, *parent, time));
+        }
+
+        fn update_token_sync(
+            &mut self,
+            _token: &TokenId,
+            _block: &BlockId,
+            _parent: &BlockId,
+            _time: EcTime,
+            _source_peer: PeerId,
+        ) {
+            panic!("sync updates are not used in mempool tests");
+        }
+
+        fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
+        }
+
+        fn block_count(&self) -> usize {
+            self.saved_blocks.len()
+        }
     }
 
     impl EcBlocks for MockEcBlocks {
@@ -592,5 +765,141 @@ mod tests {
             .collect();
 
         assert_eq!(ordered, vec![(15, 66), (30, 77), (20, 77), (10, 77)]);
+    }
+
+    #[test]
+    fn higher_direct_conflict_blocks_lower_before_commit() {
+        let token = 42;
+        let parent = 7;
+        let lower_block = Block {
+            id: 100,
+            time: 10,
+            used: 1,
+            parts: [TokenBlock {
+                token,
+                last: parent,
+                key: 1,
+            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+        let higher_block = Block {
+            id: 200,
+            time: 10,
+            used: 1,
+            parts: [TokenBlock {
+                token,
+                last: parent,
+                key: 2,
+            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+
+        let mut mem_pool = EcMemPool::new();
+        assert!(mem_pool.block(&lower_block, 10));
+        assert!(mem_pool.block(&higher_block, 10));
+
+        for peer_id in [11, 12, 13] {
+            mem_pool.vote(&lower_block.id, 0b0000_0001, &peer_id, 10);
+            mem_pool.vote(&higher_block.id, 0b0000_0001, &peer_id, 10);
+        }
+
+        mem_pool.block_known_higher_conflicts();
+
+        let mut tokens = MockTokens::default();
+        tokens.tokens.insert(
+            token,
+            TokenState {
+                current: Some(TrustedMapping {
+                    block: parent,
+                    parent: 0,
+                    time: 0,
+                    source: TrustSource::Confirmed,
+                }),
+                pending: None,
+            },
+        );
+
+        let mut sink = NoOpSink;
+        let (evaluations, _messages) =
+            mem_pool.evaluate_pending_blocks(&tokens, 10, 55, &mut sink);
+
+        assert!(matches!(
+            mem_pool.status(&lower_block.id, &MockEcBlocks::default_blocks()),
+            Some(BlockState::Blocked)
+        ));
+        assert_eq!(evaluations.len(), 1);
+        assert_eq!(evaluations[0].block_id, higher_block.id);
+
+        let peers = EcPeers::with_config_and_rng(
+            55,
+            crate::ec_peers::PeerManagerConfig::default(),
+            rand::rngs::StdRng::from_seed([7u8; 32]),
+        );
+        let mut batch = TestBatch::default();
+        let mut sink = NoOpSink;
+        mem_pool.tick_with_evaluations(
+            &peers,
+            10,
+            55,
+            &mut sink,
+            &evaluations,
+            &mut batch,
+        );
+
+        assert_eq!(batch.saved_blocks, vec![higher_block.id]);
+        assert!(matches!(
+            mem_pool.status(&higher_block.id, &MockEcBlocks::default_blocks()),
+            Some(BlockState::Commit)
+        ));
+        assert!(matches!(
+            mem_pool.status(&lower_block.id, &MockEcBlocks::default_blocks()),
+            Some(BlockState::Blocked)
+        ));
+    }
+
+    #[test]
+    fn blocked_direct_conflict_signal_reports_one_blocker_for_primary_candidate() {
+        let token = 42;
+        let parent = 7;
+        let lower_block = Block {
+            id: 100,
+            time: 10,
+            used: 1,
+            parts: [TokenBlock {
+                token,
+                last: parent,
+                key: 1,
+            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+        let higher_block = Block {
+            id: 200,
+            time: 10,
+            used: 1,
+            parts: [TokenBlock {
+                token,
+                last: parent,
+                key: 2,
+            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+
+        let mut mem_pool = EcMemPool::new();
+        assert!(mem_pool.block(&lower_block, 10));
+        assert!(mem_pool.block(&higher_block, 10));
+        mem_pool.block_known_higher_conflicts();
+
+        assert_eq!(
+            mem_pool.blocked_direct_conflict_signal_for(&higher_block.id, &token),
+            Some(lower_block.id)
+        );
+    }
+
+    impl MockEcBlocks {
+        fn default_blocks() -> Self {
+            Self {
+                blocks: hashbrown::HashMap::new(),
+            }
+        }
     }
 }

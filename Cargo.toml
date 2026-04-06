@@ -88,6 +88,10 @@ path = "simulator/integrated_genesis_simulation.rs"
 name = "integrated_long_run"
 path = "simulator/integrated_long_run.rs"
 
+[[example]]
+name = "integrated_steady_state"
+path = "simulator/integrated_steady_state.rs"
+
 [dependencies]
 log = "0.4.20"
 rand = "0.8.5"

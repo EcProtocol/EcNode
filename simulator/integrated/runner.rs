@@ -16,10 +16,10 @@ use ec_rust::ec_node::{EcNode, VoteIngressDiagnostics};
 use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 
 use crate::integrated::{
-    DistributionSummary, FloatDistributionSummary, IntegratedSimConfig, MempoolPressureSummary,
-    MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary, OnboardingSummary,
-    RecoverySummary, RoundMetrics, SimResult, TransactionSourcePolicy, TransactionSpreadSummary,
-    TransactionWorkloadSummary, VoteIngressSummary,
+    ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary, IntegratedSimConfig,
+    MempoolPressureSummary, MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary,
+    OnboardingSummary, RecoverySummary, RoundMetrics, SimResult, TransactionSourcePolicy,
+    TransactionSpreadSummary, TransactionWorkloadSummary, VoteIngressSummary,
 };
 use crate::peer_lifecycle::{
     BootstrapMethod, GlobalTokenMapping, NetworkEvent, PeerSelection, ScheduledEvent, TopologyMode,
@@ -46,6 +46,16 @@ struct TrackedBlock {
     ideal_coalesced_lower_bound_messages: usize,
     delivered_block_messages: usize,
     touched_peers: HashSet<PeerId>,
+}
+
+struct ConflictFamily {
+    token: TokenId,
+    parent_block: BlockId,
+    candidate_block_ids: Vec<BlockId>,
+    highest_candidate: BlockId,
+    created_round: usize,
+    owner_committed_candidates: HashSet<BlockId>,
+    conflict_signal_receivers: HashSet<PeerId>,
 }
 
 struct ScheduledMessage {
@@ -140,6 +150,8 @@ pub struct IntegratedRunner {
     outbound_messages: Vec<MessageEnvelope>,
     in_flight_messages: Vec<ScheduledMessage>,
     tracked_blocks: BTreeMap<BlockId, TrackedBlock>,
+    conflict_families: Vec<ConflictFamily>,
+    conflict_block_to_family: BTreeMap<BlockId, usize>,
     submission_attempts: usize,
     submitted_blocks: usize,
     skipped_submissions: usize,
@@ -216,6 +228,8 @@ impl IntegratedRunner {
             outbound_messages: Vec::new(),
             in_flight_messages: Vec::new(),
             tracked_blocks: BTreeMap::new(),
+            conflict_families: Vec::new(),
+            conflict_block_to_family: BTreeMap::new(),
             submission_attempts: 0,
             submitted_blocks: 0,
             skipped_submissions: 0,
@@ -784,6 +798,11 @@ impl IntegratedRunner {
 
         for block_id in &committed {
             if let Some(tracked) = self.tracked_blocks.remove(block_id) {
+                if let Some(family_idx) = self.conflict_block_to_family.get(block_id).copied() {
+                    if let Some(family) = self.conflict_families.get_mut(family_idx) {
+                        family.owner_committed_candidates.insert(*block_id);
+                    }
+                }
                 let latency = self.current_round.saturating_sub(tracked.submitted_round);
                 self.commit_latencies.push(latency);
                 let bucket = Self::entry_hop_bucket(tracked.max_entry_hops);
@@ -1002,6 +1021,41 @@ impl IntegratedRunner {
         }
     }
 
+    fn record_conflict_signal_delivery(&mut self, envelope: &MessageEnvelope) {
+        let mut lower_signal_blocks = Vec::new();
+
+        match &envelope.message {
+            Message::Vote { block_id, vote, .. } => {
+                if *vote == 0 {
+                    lower_signal_blocks.push(*block_id);
+                }
+            }
+            Message::RequestBatch { items } => {
+                for item in items {
+                    if let BatchRequestItem::Vote { block_id, vote, .. } = item {
+                        if *vote == 0 {
+                            lower_signal_blocks.push(*block_id);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for block_id in lower_signal_blocks {
+            let Some(family_idx) = self.conflict_block_to_family.get(&block_id).copied() else {
+                continue;
+            };
+            let Some(family) = self.conflict_families.get_mut(family_idx) else {
+                continue;
+            };
+            if block_id == family.highest_candidate {
+                continue;
+            }
+            family.conflict_signal_receivers.insert(envelope.receiver);
+        }
+    }
+
     fn inject_blocks(&mut self) {
         let eligible_peers = self.eligible_transaction_sources();
         if eligible_peers.is_empty() {
@@ -1012,152 +1066,252 @@ impl IntegratedRunner {
 
         for _ in 0..self.config.transactions.blocks_per_round {
             self.submission_attempts += 1;
-            let used = self.rng.gen_range(
-                self.config.transactions.block_size_range.0
-                    ..=self.config.transactions.block_size_range.1,
-            );
+            let should_inject_conflict = self.config.transactions.conflicts.family_fraction > 0.0
+                && self.rng.gen_bool(
+                    self.config
+                        .transactions
+                        .conflicts
+                        .family_fraction
+                        .clamp(0.0, 1.0),
+                );
+            if should_inject_conflict && self.inject_conflict_family(&eligible_peers) {
+                continue;
+            }
+
             let target = *eligible_peers
                 .choose(&mut self.rng)
                 .expect("eligible peers should not be empty");
+            let block = self.build_regular_block(target);
+            self.submit_block(target, block);
+        }
+    }
+
+    fn build_regular_block(&mut self, target: PeerId) -> Block {
+        let used = self.rng.gen_range(
+            self.config.transactions.block_size_range.0..=self.config.transactions.block_size_range.1,
+        );
+        let mut block = Block {
+            id: self.rng.next_u64(),
+            time: self.current_round as u64,
+            used: min(used, TOKENS_PER_BLOCK) as u8,
+            parts: [TokenBlock::default(); TOKENS_PER_BLOCK],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+        let mut seen_tokens = HashSet::new();
+        let mut existing_parts_in_block = 0;
+
+        for idx in 0..block.used as usize {
+            let prefer_existing = self.rng.gen_bool(
+                self.config
+                    .transactions
+                    .existing_token_fraction
+                    .clamp(0.0, 1.0),
+            );
+            let mut existing_mapping = None;
+
+            if prefer_existing {
+                for _ in 0..4 {
+                    let Some((token_id, last_block)) = self.sample_existing_mapping(target) else {
+                        break;
+                    };
+                    if seen_tokens.insert(token_id) {
+                        existing_mapping = Some((token_id, last_block));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((token_id, last_block)) = existing_mapping {
+                block.parts[idx].token = token_id;
+                block.parts[idx].last = last_block;
+                existing_parts_in_block += 1;
+                self.existing_token_parts_generated += 1;
+            } else {
+                let token_id = loop {
+                    let candidate = self.rng.next_u64();
+                    if seen_tokens.insert(candidate) {
+                        break candidate;
+                    }
+                };
+                block.parts[idx].token = token_id;
+                block.parts[idx].last = 0;
+                self.new_token_parts_generated += 1;
+            }
+            block.parts[idx].key = self.rng.next_u64();
+            block.signatures[idx] = Some(PublicKeyReference::default());
+        }
+        if existing_parts_in_block > 0 {
+            self.blocks_with_existing_tokens += 1;
+        }
+
+        block
+    }
+
+    fn inject_conflict_family(&mut self, eligible_peers: &[PeerId]) -> bool {
+        let contenders = self
+            .config
+            .transactions
+            .conflicts
+            .contenders
+            .min(eligible_peers.len());
+        if contenders < 2 {
+            return false;
+        }
+
+        let targets: Vec<PeerId> = eligible_peers
+            .choose_multiple(&mut self.rng, contenders)
+            .copied()
+            .collect();
+        if targets.len() < 2 {
+            return false;
+        }
+
+        let mut existing_mapping = None;
+        for peer_id in &targets {
+            if let Some(mapping) = self.sample_existing_mapping(*peer_id) {
+                existing_mapping = Some(mapping);
+                break;
+            }
+        }
+        if existing_mapping.is_none() {
+            for _ in 0..6 {
+                let candidate = *eligible_peers
+                    .choose(&mut self.rng)
+                    .expect("eligible peers should not be empty");
+                if let Some(mapping) = self.sample_existing_mapping(candidate) {
+                    existing_mapping = Some(mapping);
+                    break;
+                }
+            }
+        }
+
+        let Some((token_id, parent_block)) = existing_mapping else {
+            return false;
+        };
+
+        let mut candidate_block_ids = Vec::with_capacity(targets.len());
+        for target in targets {
             let mut block = Block {
                 id: self.rng.next_u64(),
                 time: self.current_round as u64,
-                used: min(used, TOKENS_PER_BLOCK) as u8,
+                used: 1,
                 parts: [TokenBlock::default(); TOKENS_PER_BLOCK],
                 signatures: [None; TOKENS_PER_BLOCK],
             };
-            let mut seen_tokens = HashSet::new();
-            let mut existing_parts_in_block = 0;
-
-            for idx in 0..block.used as usize {
-                let prefer_existing = self.rng.gen_bool(
-                    self.config
-                        .transactions
-                        .existing_token_fraction
-                        .clamp(0.0, 1.0),
-                );
-                let mut existing_mapping = None;
-
-                if prefer_existing {
-                    for _ in 0..4 {
-                        let Some((token_id, last_block)) = self.sample_existing_mapping(target) else {
-                            break;
-                        };
-                        if seen_tokens.insert(token_id) {
-                            existing_mapping = Some((token_id, last_block));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some((token_id, last_block)) = existing_mapping {
-                    block.parts[idx].token = token_id;
-                    block.parts[idx].last = last_block;
-                    existing_parts_in_block += 1;
-                    self.existing_token_parts_generated += 1;
-                } else {
-                    let token_id = loop {
-                        let candidate = self.rng.next_u64();
-                        if seen_tokens.insert(candidate) {
-                            break candidate;
-                        }
-                    };
-                    block.parts[idx].token = token_id;
-                    block.parts[idx].last = 0;
-                    self.new_token_parts_generated += 1;
-                }
-                block.parts[idx].key = self.rng.next_u64();
-                block.signatures[idx] = Some(PublicKeyReference::default());
-            }
-            if existing_parts_in_block > 0 {
-                self.blocks_with_existing_tokens += 1;
-            }
-
-            let graph_time = self.current_round as u64 + 1;
-            let Some(origin_peer) = self.peers.get(&target) else {
-                continue;
+            block.parts[0] = TokenBlock {
+                token: token_id,
+                last: parent_block,
+                key: self.rng.next_u64(),
             };
+            block.signatures[0] = Some(PublicKeyReference::default());
 
-            let mut token_samples = Vec::new();
-            let mut token_neighborhoods = Vec::new();
-            let mut reachable_vote_peers = HashSet::new();
-            let mut reachable_vote_edges = HashSet::new();
+            self.existing_token_parts_generated += 1;
+            self.blocks_with_existing_tokens += 1;
+            candidate_block_ids.push(block.id);
+            self.submit_block(target, block);
+        }
 
-            for idx in 0..block.used as usize {
-                let token = block.parts[idx].token;
-                let covering_peers = self.collect_covering_peers(token);
-                let coverage_size = covering_peers.len();
-                let vote_eligible_size = origin_peer.node.vote_eligible_peer_count(token);
-                let entry_hops = origin_peer
-                    .node
-                    .active_hop_distance_to_token(token)
-                    .unwrap_or(0);
-                let entry_is_local = origin_peer.node.local_scope_contains(token);
+        let highest_candidate = *candidate_block_ids
+            .iter()
+            .max()
+            .expect("conflict family should contain at least one candidate");
+        let family_idx = self.conflict_families.len();
+        self.conflict_families.push(ConflictFamily {
+            token: token_id,
+            parent_block,
+            candidate_block_ids: candidate_block_ids.clone(),
+            highest_candidate,
+            created_round: self.current_round,
+            owner_committed_candidates: HashSet::new(),
+            conflict_signal_receivers: HashSet::new(),
+        });
+        for block_id in candidate_block_ids {
+            self.conflict_block_to_family.insert(block_id, family_idx);
+        }
 
-                token_samples.push((
-                    coverage_size,
-                    vote_eligible_size,
-                    entry_hops,
-                    entry_is_local,
-                ));
-                token_neighborhoods.push(covering_peers);
-                self.extend_vote_graph(
-                    target,
-                    token,
-                    graph_time,
-                    &mut reachable_vote_peers,
-                    &mut reachable_vote_edges,
-                );
-            }
+        true
+    }
 
-            let max_entry_hops = token_samples
-                .iter()
-                .map(|(_, _, entry_hops, _)| *entry_hops)
-                .max()
+    fn submit_block(&mut self, target: PeerId, block: Block) {
+        let graph_time = self.current_round as u64 + 1;
+        let Some(origin_peer) = self.peers.get(&target) else {
+            return;
+        };
+
+        let mut token_samples = Vec::new();
+        let mut token_neighborhoods = Vec::new();
+        let mut reachable_vote_peers = HashSet::new();
+        let mut reachable_vote_edges = HashSet::new();
+
+        for idx in 0..block.used as usize {
+            let token = block.parts[idx].token;
+            let covering_peers = self.collect_covering_peers(token);
+            let coverage_size = covering_peers.len();
+            let vote_eligible_size = origin_peer.node.vote_eligible_peer_count(token);
+            let entry_hops = origin_peer
+                .node
+                .active_hop_distance_to_token(token)
                 .unwrap_or(0);
-            let witness_neighborhood = self.collect_covering_peers(block.id);
-            let witness_coverage = witness_neighborhood.len();
-            let ideal_role_sum_lower_bound_messages =
-                self.role_sum_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
-            let ideal_coalesced_lower_bound_messages = self
-                .coalesced_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
-            for (coverage_size, vote_eligible_size, entry_hops, entry_is_local) in token_samples {
-                self.record_neighborhood_sample(
-                    coverage_size,
-                    vote_eligible_size,
-                    entry_hops,
-                    entry_is_local,
-                );
-            }
+            let entry_is_local = origin_peer.node.local_scope_contains(token);
 
-            self.transaction_spread
-                .reachable_vote_peers
-                .push(reachable_vote_peers.len());
-            self.transaction_spread
-                .reachable_vote_edges
-                .push(reachable_vote_edges.len());
-            self.transaction_spread
-                .witness_coverage
-                .push(witness_coverage);
+            token_samples.push((coverage_size, vote_eligible_size, entry_hops, entry_is_local));
+            token_neighborhoods.push(covering_peers);
+            self.extend_vote_graph(
+                target,
+                token,
+                graph_time,
+                &mut reachable_vote_peers,
+                &mut reachable_vote_edges,
+            );
+        }
 
-            if let Some(peer) = self.peers.get_mut(&target) {
-                peer.node.block(&block);
-                let mut touched_peers = HashSet::new();
-                touched_peers.insert(target);
-                self.tracked_blocks.insert(
-                    block.id,
-                    TrackedBlock {
-                        owner: target,
-                        submitted_round: self.current_round,
-                        max_entry_hops,
-                        ideal_role_sum_lower_bound_messages,
-                        ideal_coalesced_lower_bound_messages,
-                        delivered_block_messages: 0,
-                        touched_peers,
-                    },
-                );
-                self.submitted_blocks += 1;
-            }
+        let max_entry_hops = token_samples
+            .iter()
+            .map(|(_, _, entry_hops, _)| *entry_hops)
+            .max()
+            .unwrap_or(0);
+        let witness_neighborhood = self.collect_covering_peers(block.id);
+        let witness_coverage = witness_neighborhood.len();
+        let ideal_role_sum_lower_bound_messages =
+            self.role_sum_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
+        let ideal_coalesced_lower_bound_messages = self
+            .coalesced_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
+        for (coverage_size, vote_eligible_size, entry_hops, entry_is_local) in token_samples {
+            self.record_neighborhood_sample(
+                coverage_size,
+                vote_eligible_size,
+                entry_hops,
+                entry_is_local,
+            );
+        }
+
+        self.transaction_spread
+            .reachable_vote_peers
+            .push(reachable_vote_peers.len());
+        self.transaction_spread
+            .reachable_vote_edges
+            .push(reachable_vote_edges.len());
+        self.transaction_spread
+            .witness_coverage
+            .push(witness_coverage);
+
+        if let Some(peer) = self.peers.get_mut(&target) {
+            peer.node.block(&block);
+            let mut touched_peers = HashSet::new();
+            touched_peers.insert(target);
+            self.tracked_blocks.insert(
+                block.id,
+                TrackedBlock {
+                    owner: target,
+                    submitted_round: self.current_round,
+                    max_entry_hops,
+                    ideal_role_sum_lower_bound_messages,
+                    ideal_coalesced_lower_bound_messages,
+                    delivered_block_messages: 0,
+                    touched_peers,
+                },
+            );
+            self.submitted_blocks += 1;
         }
     }
 
@@ -1229,6 +1383,7 @@ impl IntegratedRunner {
             self.total_messages_delivered += message_logical_count(&message.message);
             self.delivered_message_types.record_logical(&message.message);
             self.track_delivered_block_message(&message);
+            self.record_conflict_signal_delivery(&message);
             if let Some(peer) = self.peers.get_mut(&message.receiver) {
                 peer.node.handle_message(&message, &mut self.outbound_messages);
             }
@@ -1700,6 +1855,111 @@ impl IntegratedRunner {
                 })
             })
             .collect();
+        let mut families_without_visible_candidate = 0;
+        let mut families_with_single_visible_candidate = 0;
+        let mut families_split_across_candidates = 0;
+        let mut families_unanimous_highest_candidate = 0;
+        let mut families_with_highest_majority = 0;
+        let mut families_with_any_majority = 0;
+        let mut families_stalled_without_majority = 0;
+        let mut families_with_any_lower_candidate_visible = 0;
+        let mut families_with_lower_owner_commit = 0;
+        let mut families_with_multiple_owner_commits = 0;
+        let mut owner_committed_candidates = 0;
+        let mut visible_candidates_per_family = Vec::new();
+        let mut covering_peers_per_family = Vec::new();
+        let mut participant_peers_per_family = Vec::new();
+        let mut signaled_participant_peers_per_family = Vec::new();
+        let mut candidate_coverers_per_family = Vec::new();
+        let mut highest_candidate_coverer_share = Vec::new();
+        let mut signal_coverage_among_participants = Vec::new();
+
+        for family in &self.conflict_families {
+            let covering_peers = self.collect_covering_peers(family.token);
+            let mut candidate_counts: BTreeMap<BlockId, usize> = BTreeMap::new();
+
+            for peer_id in &covering_peers {
+                let Some(peer) = self.peers.get(peer_id) else {
+                    continue;
+                };
+                let backend = peer.backend.borrow();
+                let Some(mapping) = TokenStorageBackend::lookup(&*backend, &family.token) else {
+                    continue;
+                };
+                if family.candidate_block_ids.contains(&mapping.block()) {
+                    *candidate_counts.entry(mapping.block()).or_insert(0) += 1;
+                }
+            }
+
+            let visible_candidates = candidate_counts.len();
+            let candidate_coverers = candidate_counts.values().sum::<usize>();
+            let highest_coverers = *candidate_counts.get(&family.highest_candidate).unwrap_or(&0);
+            let majority_coverers = candidate_counts.values().copied().max().unwrap_or(0);
+            let participant_peers = self
+                .peers
+                .values()
+                .filter(|peer| {
+                    peer.active
+                        && family
+                            .candidate_block_ids
+                            .iter()
+                            .any(|block_id| peer.node.knows_block(block_id))
+                })
+                .map(|peer| peer.node.get_peer_id())
+                .collect::<HashSet<_>>();
+            let signaled_participants = participant_peers
+                .iter()
+                .filter(|peer_id| family.conflict_signal_receivers.contains(peer_id))
+                .count();
+
+            visible_candidates_per_family.push(visible_candidates);
+            covering_peers_per_family.push(covering_peers.len());
+            participant_peers_per_family.push(participant_peers.len());
+            signaled_participant_peers_per_family.push(signaled_participants);
+            candidate_coverers_per_family.push(candidate_coverers);
+            if !covering_peers.is_empty() {
+                highest_candidate_coverer_share
+                    .push(highest_coverers as f64 / covering_peers.len() as f64);
+            }
+            if !participant_peers.is_empty() {
+                signal_coverage_among_participants
+                    .push(signaled_participants as f64 / participant_peers.len() as f64);
+            }
+
+            match visible_candidates {
+                0 => families_without_visible_candidate += 1,
+                1 => families_with_single_visible_candidate += 1,
+                _ => families_split_across_candidates += 1,
+            }
+            if majority_coverers * 2 > covering_peers.len() {
+                families_with_any_majority += 1;
+                if highest_coverers * 2 > covering_peers.len() {
+                    families_with_highest_majority += 1;
+                }
+            } else {
+                families_stalled_without_majority += 1;
+            }
+            if visible_candidates > 0
+                && candidate_counts.keys().any(|block_id| *block_id != family.highest_candidate)
+            {
+                families_with_any_lower_candidate_visible += 1;
+            }
+            if visible_candidates == 1 && highest_coverers == covering_peers.len() {
+                families_unanimous_highest_candidate += 1;
+            }
+
+            owner_committed_candidates += family.owner_committed_candidates.len();
+            if family
+                .owner_committed_candidates
+                .iter()
+                .any(|block_id| *block_id != family.highest_candidate)
+            {
+                families_with_lower_owner_commit += 1;
+            }
+            if family.owner_committed_candidates.len() > 1 {
+                families_with_multiple_owner_commits += 1;
+            }
+        }
 
         SimResult {
             seed_used: self.seed_used,
@@ -1772,6 +2032,48 @@ impl IntegratedRunner {
                 existing_token_parts: self.existing_token_parts_generated,
                 new_token_parts: self.new_token_parts_generated,
                 blocks_with_existing_tokens: self.blocks_with_existing_tokens,
+            },
+            conflict_workload: ConflictWorkloadSummary {
+                configured_family_fraction: self.config.transactions.conflicts.family_fraction,
+                configured_contenders: self.config.transactions.conflicts.contenders,
+                families_created: self.conflict_families.len(),
+                candidate_blocks_submitted: self
+                    .conflict_families
+                    .iter()
+                    .map(|family| family.candidate_block_ids.len())
+                    .sum(),
+                owner_committed_candidates,
+                families_with_highest_majority,
+                families_with_any_majority,
+                families_stalled_without_majority,
+                families_without_visible_candidate,
+                families_with_single_visible_candidate,
+                families_split_across_candidates,
+                families_unanimous_highest_candidate,
+                families_with_any_lower_candidate_visible,
+                families_with_lower_owner_commit,
+                families_with_multiple_owner_commits,
+                visible_candidates_per_family: DistributionSummary::from_samples(
+                    &visible_candidates_per_family,
+                ),
+                covering_peers_per_family: DistributionSummary::from_samples(
+                    &covering_peers_per_family,
+                ),
+                participant_peers_per_family: DistributionSummary::from_samples(
+                    &participant_peers_per_family,
+                ),
+                signaled_participant_peers_per_family: DistributionSummary::from_samples(
+                    &signaled_participant_peers_per_family,
+                ),
+                candidate_coverers_per_family: DistributionSummary::from_samples(
+                    &candidate_coverers_per_family,
+                ),
+                highest_candidate_coverer_share: FloatDistributionSummary::from_samples(
+                    &highest_candidate_coverer_share,
+                ),
+                signal_coverage_among_participants: FloatDistributionSummary::from_samples(
+                    &signal_coverage_among_participants,
+                ),
             },
             transaction_spread: TransactionSpreadSummary {
                 submitted_blocks: self.transaction_spread.reachable_vote_peers.len(),

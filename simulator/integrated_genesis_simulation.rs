@@ -6,7 +6,7 @@ mod peer_lifecycle;
 use ec_rust::ec_genesis::GenesisConfig;
 
 use integrated::{
-    IntegratedRunner, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
+    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
     TransactionSourcePolicy,
 };
 use peer_lifecycle::{
@@ -43,6 +43,7 @@ fn main() {
         block_size_range: (1, 3),
         source_policy: TransactionSourcePolicy::ConnectedOnly,
         existing_token_fraction: 0.0,
+        conflicts: ConflictWorkloadConfig::default(),
     };
     config.events.events = vec![
         ScheduledEvent {

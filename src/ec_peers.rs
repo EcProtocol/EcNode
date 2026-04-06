@@ -1,6 +1,6 @@
 use crate::ec_interface::{
     CommitBlockId, EcTime, Message, MessageEnvelope, MessageTicket, PeerId, TokenId, TokenMapping,
-    TOKENS_SIGNATURE_SIZE,
+    TOKENS_SIGNATURE_SIZE, VOTE_THRESHOLD,
 };
 use crate::ec_proof_of_storage::{ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend};
 use serde::{Serialize, Deserialize};
@@ -69,6 +69,10 @@ pub struct PeerManagerConfig {
     /// request batches. This extends Phase 1 batching to the fast-reply path.
     pub batch_vote_replies: bool,
 
+    /// Positive vote balance required before a token or witness is considered
+    /// settled enough to stop soliciting more votes.
+    pub vote_balance_threshold: i64,
+
     // ===== Election Configuration =====
     /// Configuration for PeerElection
     pub election_config: ElectionConfig,
@@ -96,6 +100,7 @@ impl Default for PeerManagerConfig {
             adaptive_neighborhood: None,
             enable_request_batching: true,
             batch_vote_replies: false,
+            vote_balance_threshold: VOTE_THRESHOLD,
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -2014,5 +2019,6 @@ mod tests {
         assert!(config.adaptive_neighborhood.is_none());
         assert!(config.enable_request_batching);
         assert!(!config.batch_vote_replies);
+        assert_eq!(config.vote_balance_threshold, VOTE_THRESHOLD);
     }
 }

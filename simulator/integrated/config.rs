@@ -85,6 +85,18 @@ pub struct TransactionFlowConfig {
     /// Fraction of block parts that should try to update an existing known token
     /// at the submitting node instead of creating a brand-new token.
     pub existing_token_fraction: f64,
+    /// Adversarial conflict workload injected alongside normal traffic.
+    pub conflicts: ConflictWorkloadConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictWorkloadConfig {
+    /// Fraction of transaction slots that should be replaced by conflict families.
+    ///
+    /// Each selected slot injects `contenders` competing blocks for the same token state.
+    pub family_fraction: f64,
+    /// Number of competing blocks submitted per conflict family.
+    pub contenders: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +142,16 @@ impl Default for TransactionFlowConfig {
             block_size_range: (1, 3),
             source_policy: TransactionSourcePolicy::ConnectedOnly,
             existing_token_fraction: 0.0,
+            conflicts: ConflictWorkloadConfig::default(),
+        }
+    }
+}
+
+impl Default for ConflictWorkloadConfig {
+    fn default() -> Self {
+        Self {
+            family_fraction: 0.0,
+            contenders: 2,
         }
     }
 }
