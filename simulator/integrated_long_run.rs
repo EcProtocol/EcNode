@@ -78,7 +78,12 @@ fn main() {
     let vote_target_count = env_usize("EC_LONG_RUN_VOTE_TARGETS", 2);
     let adaptive_far_width = env_usize("EC_LONG_RUN_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_LONG_RUN_ADAPTIVE_HOP_THRESHOLD", 0);
+    let blocks_per_round = env_usize("EC_LONG_RUN_BLOCKS_PER_ROUND", 3);
+    let block_size_min = env_usize("EC_LONG_RUN_BLOCK_SIZE_MIN", 1);
+    let block_size_max = env_usize("EC_LONG_RUN_BLOCK_SIZE_MAX", 3);
     let existing_token_fraction = env_f64("EC_LONG_RUN_EXISTING_TOKEN_FRACTION", 0.0);
+    let conflict_family_fraction = env_f64("EC_LONG_RUN_CONFLICT_FAMILY_FRACTION", 0.0);
+    let conflict_contenders = env_usize("EC_LONG_RUN_CONFLICT_CONTENDERS", 2);
     let enable_batching = env_bool("EC_LONG_RUN_BATCHING", true);
     let batch_vote_replies = env_bool("EC_LONG_RUN_BATCH_VOTE_REPLIES", false);
 
@@ -99,6 +104,13 @@ fn main() {
         "Existing-token workload target: {:.0}%",
         existing_token_fraction * 100.0
     );
+    if conflict_family_fraction > 0.0 {
+        println!(
+            "Conflict families: {:.0}% of slots, {} contenders",
+            conflict_family_fraction * 100.0,
+            conflict_contenders
+        );
+    }
     if adaptive_far_width > 0 {
         println!(
             "Adaptive far width: {} beyond {} hops",
@@ -143,11 +155,14 @@ fn main() {
         _ => NetworkConfig::cross_dc_normal(),
     };
     config.transactions = TransactionFlowConfig {
-        blocks_per_round: 3,
-        block_size_range: (1, 3),
+        blocks_per_round,
+        block_size_range: (block_size_min, block_size_max.max(block_size_min)),
         source_policy: TransactionSourcePolicy::ConnectedOnly,
         existing_token_fraction,
-        conflicts: ConflictWorkloadConfig::default(),
+        conflicts: ConflictWorkloadConfig {
+            family_fraction: conflict_family_fraction,
+            contenders: conflict_contenders,
+        },
     };
 
     let report_a = rounds / 6;

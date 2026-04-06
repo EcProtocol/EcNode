@@ -122,6 +122,12 @@ pub struct BlockEvaluation {
     pub vote_mask: u8,  // Pre-calculated vote bits (1 = can verify, 0 = cannot verify)
 }
 
+pub struct BlockedConflictTransition {
+    pub blocked_block_id: BlockId,
+    pub higher_block_id: BlockId,
+    pub voters: Vec<PeerId>,
+}
+
 pub struct EcMemPool {
     pool: HashMap<BlockId, PoolBlockState>,
     vote_balance_threshold: i64,
@@ -246,8 +252,9 @@ impl EcMemPool {
     /// A direct conflict is another known block that updates the same token from the same
     /// parent mapping. If we know a higher block ID for any part of a pending block, the
     /// lower block must never commit locally.
-    pub(crate) fn block_known_higher_conflicts(&mut self) {
+    pub(crate) fn block_known_higher_conflicts(&mut self) -> Vec<BlockedConflictTransition> {
         let mut highest_by_conflict = HashMap::new();
+        let mut transitions = Vec::new();
 
         for (block_id, state) in self
             .pool
@@ -280,18 +287,26 @@ impl EcMemPool {
                 continue;
             };
 
-            let has_higher_conflict = (0..block.used as usize).any(|i| {
-                let key = (block.parts[i].token, block.parts[i].last);
-                highest_by_conflict
-                    .get(&key)
-                    .is_some_and(|highest| *highest > *block_id)
-            });
+            let higher_conflict = (0..block.used as usize)
+                .filter_map(|i| {
+                    let key = (block.parts[i].token, block.parts[i].last);
+                    highest_by_conflict.get(&key).copied()
+                })
+                .filter(|highest| *highest > *block_id)
+                .max();
 
-            if has_higher_conflict {
+            if let Some(higher_block_id) = higher_conflict {
                 state.state = BlockState::Blocked;
                 state.updated = false;
+                transitions.push(BlockedConflictTransition {
+                    blocked_block_id: *block_id,
+                    higher_block_id,
+                    voters: state.votes.keys().copied().collect(),
+                });
             }
         }
+
+        transitions
     }
 
     /// Evaluate all pending blocks and determine which can proceed to commit

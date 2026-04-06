@@ -377,6 +377,238 @@ It does **not** yet fully solve settlement convergence. But it does move the mec
 - they can prompt a user or higher-level client to query multiple peers and elect the majority outcome
 - if the system does not form a clear majority, the next acceptable result is stalled settlement rather than blind trust in a single peer
 
+## After Raising The Vote Threshold On Known Conflicts
+
+I then tested the next idea:
+
+- keep the single-signal + cooldown path
+- but if a node knows a direct conflict exists for a token, raise the required token vote balance by `+1`
+
+So:
+
+- base `+1` becomes effective `+2` on the conflicted token
+- base `+2` becomes effective `+3` on the conflicted token
+
+This does **not** change witness thresholding. It only tightens the token-side settlement requirement when the node knows that token family is contested.
+
+### Threshold-Bump Results
+
+| Case | Families | Lower Owner Commit | Multi Owner Commits | Split | Unanimous Highest | Highest Majority | Any Majority | Stalled No Majority | Any Lower Visible | Signal Coverage | Wire Messages | Avg Latency | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `+1`, single signal + cooldown | `348` | `128` | `11` | `25` | `19` | `43` | `91` | `257` | `106` | `0.72` | `12.27M` | `10.5` | `13` |
+| `+1`, cooldown + threshold bump | `383` | `147` | `11` | `7` | `27` | `45` | `109` | `274` | `105` | `0.72` | `11.86M` | `10.1` | `13` |
+| `+2`, single signal + cooldown | `349` | `121` | `5` | `7` | `20` | `53` | `113` | `236` | `97` | `0.76` | `12.03M` | `11.2` | `14` |
+| `+2`, cooldown + threshold bump | `341` | `117` | `5` | `9` | `13` | `53` | `100` | `241` | `80` | `0.76` | `11.73M` | `11.1` | `14` |
+
+### Reading The Threshold-Bump Trial
+
+This is not a strong win.
+
+What it does seem to help:
+
+- wire traffic drops a little:
+  - `+1`: `12.27M -> 11.86M`
+  - `+2`: `12.03M -> 11.73M`
+- at `+2`, lower-candidate visibility improves a bit:
+  - `any-lower-visible`: `97 -> 80`
+  - `lower-owner-commit`: `121 -> 117`
+- signal coverage is unchanged, so the warning behavior survives
+
+What it does **not** clearly improve:
+
+- `+1` still does not become safer:
+  - lower-owner commits actually regress: `128 -> 147`
+  - highest-majority is only marginally changed
+- `+2` does not show a convincing settlement gain:
+  - highest-majority stays flat: `53 -> 53`
+  - any-majority gets worse: `113 -> 100`
+  - stalled-no-majority gets slightly worse: `236 -> 241`
+  - unanimous-highest drops: `20 -> 13`
+
+So the bump is mostly acting like extra caution without a strong convergence benefit. It trims some activity, but it does not clearly move the system toward “majority forms on highest contender” often enough to stand out.
+
+### Assessment Of This Idea
+
+This experiment does **not** make `+1` look safe.
+
+For the `+2 -> +3` path, the result is more neutral:
+
+- it does no obvious harm to latency
+- it slightly reduces lower-candidate persistence
+- but it does not produce a cleaner majority outcome
+
+So I would treat this as an interesting optional policy, not the next default direction. The more promising line still looks like:
+
+- keep the single-signal + cooldown warning path
+- improve how majority around the highest contender forms
+- do that without simply demanding more votes and stalling longer
+
+## After A Soft Family Vote Reset
+
+I then tried a softer local reset mechanism:
+
+- when a new highest direct sibling for a `(token, parent)` family is learned
+- older recorded votes for that family are ignored by local tallying
+- this does **not** clear blocks or wipe the whole token state; it only soft-expires older family votes
+
+This version was kept purely as an experiment and later reverted.
+
+### Soft-Reset Results
+
+| Case | Families | Lower Owner Commit | Multi Owner Commits | Split | Unanimous Highest | Highest Majority | Any Majority | Stalled No Majority | Any Lower Visible | Signal Coverage | Wire Messages | Avg Latency | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `+1`, single signal + cooldown | `348` | `128` | `11` | `25` | `19` | `43` | `91` | `257` | `106` | `0.72` | `12.27M` | `10.5` | `13` |
+| `+1`, soft family reset | `359` | `131` | `9` | `10` | `29` | `54` | `107` | `252` | `104` | `0.74` | `11.85M` | `10.6` | `13` |
+| `+2`, single signal + cooldown | `349` | `121` | `5` | `7` | `20` | `53` | `113` | `236` | `97` | `0.76` | `12.03M` | `11.2` | `14` |
+| `+2`, soft family reset | `383` | `128` | `7` | `13` | `23` | `57` | `104` | `279` | `96` | `0.73` | `12.47M` | `10.5` | `13` |
+
+### Reading The Soft Reset
+
+This one is mixed.
+
+At `+1`, it helps the conflict-shape more than the baseline:
+
+- fewer split families: `25 -> 10`
+- more unanimous-highest: `19 -> 29`
+- more highest-majority: `43 -> 54`
+- slightly lower wire load
+
+But it does **not** clearly improve the core safety metric:
+
+- lower-owner commits got slightly worse: `128 -> 131`
+
+At `+2`, it looks worse overall:
+
+- lower-owner commits regressed: `121 -> 128`
+- split outcomes worsened: `7 -> 13`
+- stalled-no-majority worsened: `236 -> 279`
+
+So the soft family reset is interesting as a local anti-stall idea, but not strong enough to keep in its current form.
+
+## After Adding A Piggyback Highest-Contender Reply
+
+I then tried the follow-up idea:
+
+- keep the soft family reset above
+- when replying to a vote request for a lower contender, also piggyback a vote for the highest known direct sibling
+- the requested lower block still receives `vote = 0`
+- the highest sibling travels as a second non-recursive vote reply
+
+This was also reverted after the experiment.
+
+### Piggyback Reply Results
+
+| Case | Families | Lower Owner Commit | Multi Owner Commits | Split | Unanimous Highest | Highest Majority | Any Majority | Stalled No Majority | Any Lower Visible | Signal Coverage | Wire Messages | Avg Latency | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `+1`, soft family reset | `359` | `131` | `9` | `10` | `29` | `54` | `107` | `252` | `104` | `0.74` | `11.85M` | `10.6` | `13` |
+| `+1`, soft reset + piggyback reply | `397` | `128` | `9` | `13` | `30` | `48` | `93` | `304` | `101` | `0.74` | `13.14M` | `9.5` | `12` |
+| `+2`, soft family reset | `383` | `128` | `7` | `13` | `23` | `57` | `104` | `279` | `96` | `0.73` | `12.47M` | `10.5` | `13` |
+| `+2`, soft reset + piggyback reply | `376` | `121` | `4` | `8` | `25` | `74` | `113` | `263` | `86` | `0.72` | `14.19M` | `11.5` | `14` |
+
+### Reading The Piggyback Trial
+
+This is more nuanced than the earlier rejected “replace the reply with the highest sibling” version.
+
+What it improves:
+
+- at `+2`, conflict outcomes get better across several measures:
+  - lower-owner commits: `128 -> 121`
+  - split: `13 -> 8`
+  - highest-majority: `57 -> 74`
+  - any-lower-visible: `96 -> 86`
+- at `+1`, latency improves a little
+
+What it costs:
+
+- more wire traffic in both thresholds:
+  - `+1`: `11.85M -> 13.14M`
+  - `+2`: `12.47M -> 14.19M`
+- more pending work / weaker throughput posture at the end of the run
+- `+1` still does not look like a safer or cleaner settlement regime:
+  - stalled-no-majority gets much worse: `252 -> 304`
+  - highest-majority drops: `54 -> 48`
+
+So this piggyback reply is not a bad idea, but it is not yet a clean enough win to justify keeping:
+
+- `+1` remains unattractive
+- `+2` gets a nicer conflict-majority picture, but pays for it with more traffic and a weaker steady-state throughput result
+
+That makes it a plausible direction for future conflict-handling work, but not the next default behavior.
+
+## After Sending A Transition-Time Conflict Update Batch
+
+I then tried a narrower version of conflict propagation:
+
+- keep the current single lower-sibling signal + cooldown path
+- when a lower contender is newly moved to `Blocked` because a higher sibling is known
+- send one explicit two-vote batch to the peers that had already voted on the blocked contender
+- that batch contains:
+  - `vote = 0` for the blocked contender
+  - our current vote on the higher-ranked direct sibling
+
+This is much narrower than the earlier piggyback-reply experiment:
+
+- it only fires once per local transition to `Blocked`
+- it only targets peers already registered as voters on that lower contender
+- it does not depend on someone asking us again
+
+### Transition-Time Batch Results
+
+| Case | Families | Lower Owner Commit | Multi Owner Commits | Split | Unanimous Highest | Highest Majority | Any Majority | Stalled No Majority | Any Lower Visible | Signal Coverage | Wire Messages | Avg Latency | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `+1`, single signal + cooldown | `348` | `128` | `11` | `25` | `19` | `43` | `91` | `257` | `106` | `0.72` | `12.27M` | `10.5` | `13` |
+| `+1`, blocked-transition batch | `378` | `122` | `5` | `20` | `26` | `64` | `114` | `264` | `97` | `0.78` | `12.25M` | `9.5` | `12` |
+| `+2`, single signal + cooldown | `349` | `121` | `5` | `7` | `20` | `53` | `113` | `236` | `97` | `0.76` | `12.03M` | `11.2` | `14` |
+| `+2`, blocked-transition batch | `362` | `124` | `2` | `11` | `30` | `63` | `122` | `240` | `111` | `0.75` | `12.07M` | `10.9` | `13` |
+
+### Reading The Transition-Time Batch
+
+This is the first conflict-follow-up mechanism in this series that looks cheap enough to be genuinely interesting.
+
+What stands out:
+
+- wire traffic stayed essentially flat:
+  - `+1`: `12.27M -> 12.25M`
+  - `+2`: `12.03M -> 12.07M`
+- queue pressure stayed in the same band or improved slightly
+- latency improved in both thresholds:
+  - `+1`: `10.5 -> 9.5`
+  - `+2`: `11.2 -> 10.9`
+
+At `+1`, the conflict picture improved across most useful metrics:
+
+- lower-owner commits: `128 -> 122`
+- multi-owner commits: `11 -> 5`
+- split: `25 -> 20`
+- unanimous-highest: `19 -> 26`
+- highest-majority: `43 -> 64`
+- any-lower-visible: `106 -> 97`
+- signal coverage: `0.72 -> 0.78`
+
+At `+2`, the picture is more mixed:
+
+- better:
+  - multi-owner commits: `5 -> 2`
+  - unanimous-highest: `20 -> 30`
+  - highest-majority: `53 -> 63`
+  - any-majority: `113 -> 122`
+  - latency improved
+- worse:
+  - lower-owner commits: `121 -> 124`
+  - split: `7 -> 11`
+  - any-lower-visible: `97 -> 111`
+
+### Practical Reading
+
+This mechanism is promising because it spends very little extra on the wire while still improving how fast prior voters hear “that contender lost; this is the higher one.”
+
+It is **not** yet a complete win:
+
+- `+1` still is not established as safe under adversarial conflict
+- `+2` shows a genuine tradeoff rather than a clean improvement
+
+But unlike the broader piggyback ideas, this one looks cheap enough that it may be worth keeping around while we continue testing conflict formation and majority behavior.
+
 ## Assessment
 
 These adversarial results still do **not** support adopting `+1` as “safe enough” yet.

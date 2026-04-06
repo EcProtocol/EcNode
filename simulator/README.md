@@ -173,6 +173,7 @@ commit-chain sync, and transaction flow.
 **Documentation**
 - See `simulator/INTEGRATED_SIMULATION.md` for the lifecycle sequence, metrics, and realism notes
 - See `simulator/INTEGRATED_LONG_RUN_REPORT.md` for one longer genesis-backed baseline run
+- See `simulator/INTEGRATED_CHURN_CONFLICT_REPORT.md` for the current churn-path comparison with and without injected conflicts
 - See `simulator/STEADY_STATE_REPORT.md` for a fixed connected steady-state benchmark
 - See `simulator/SPARSE_STEADY_STATE_REPORT.md` for the corrected sparse fixed-graph steady-state benchmark
 - See `simulator/STEADY_STATE_TUNING_REPORT.md` for batching and vote-target comparisons on the fixed steady-state benchmark
