@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod stats;
+pub mod topology;
 pub mod token_allocation;
 pub mod runner;
 pub mod scenarios;

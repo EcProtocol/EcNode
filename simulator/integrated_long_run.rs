@@ -86,7 +86,10 @@ fn main() {
     let conflict_contenders = env_usize("EC_LONG_RUN_CONFLICT_CONTENDERS", 2);
     let enable_batching = env_bool("EC_LONG_RUN_BATCHING", true);
     let batch_vote_replies = env_bool("EC_LONG_RUN_BATCH_VOTE_REPLIES", false);
-
+    let prune_protection_time = env_u64("EC_LONG_RUN_PRUNE_PROTECTION_TIME", 600);
+    let connected_target = env_usize("EC_LONG_RUN_CONNECTED_TARGET", 0);
+    let connected_hysteresis = env_usize("EC_LONG_RUN_CONNECTED_HYSTERESIS", 0);
+    let elections_when_over_target = env_usize("EC_LONG_RUN_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
     println!("╔════════════════════════════════════════════════════════╗");
     println!("║  Integrated Long-Run Simulator                        ║");
     println!("╚════════════════════════════════════════════════════════╝");
@@ -95,6 +98,8 @@ fn main() {
     println!("Network profile: {}", network_profile);
     println!("Neighborhood width: {}", neighborhood_width);
     println!("Vote targets per request: {}", vote_target_count);
+    println!("Vote request pattern: deterministic outward pairs, 4 rounds on / 1 round skip");
+    println!("Prune protection time: {}", prune_protection_time);
     println!(
         "Batching: {}, vote replies: {}",
         if enable_batching { "on" } else { "off" },
@@ -115,6 +120,17 @@ fn main() {
         println!(
             "Adaptive far width: {} beyond {} hops",
             adaptive_far_width, adaptive_hop_threshold
+        );
+    }
+    if connected_target > 0 {
+        let elections_label = if elections_when_over_target == usize::MAX {
+            "default".to_string()
+        } else {
+            elections_when_over_target.to_string()
+        };
+        println!(
+            "Connected target band: {} ± {}, elections above high band: {}",
+            connected_target, connected_hysteresis, elections_label
         );
     }
 
@@ -140,6 +156,14 @@ fn main() {
     config.peer_config.vote_target_count = vote_target_count;
     config.peer_config.enable_request_batching = enable_batching;
     config.peer_config.batch_vote_replies = batch_vote_replies;
+    config.peer_config.prune_protection_time = prune_protection_time;
+    if connected_target > 0 {
+        config.peer_config.connected_target = Some(connected_target);
+        config.peer_config.connected_target_hysteresis = connected_hysteresis;
+        if elections_when_over_target != usize::MAX {
+            config.peer_config.elections_per_tick_above_target = Some(elections_when_over_target);
+        }
+    }
     config.peer_config.adaptive_neighborhood = if adaptive_far_width > 0 {
         Some(AdaptiveNeighborhoodConfig {
             far_width: adaptive_far_width,

@@ -69,6 +69,8 @@ fn main() {
     let ring_neighbors = env_usize("EC_STEADY_STATE_RING_NEIGHBORS", 8);
     let neighborhood_width = env_usize("EC_STEADY_STATE_NEIGHBORHOOD_WIDTH", 6);
     let vote_target_count = env_usize("EC_STEADY_STATE_VOTE_TARGETS", 2);
+    let vote_active_rounds = env_usize("EC_STEADY_STATE_VOTE_ACTIVE_ROUNDS", 4)
+        .min(u8::MAX as usize) as u8;
     let adaptive_far_width = env_usize("EC_STEADY_STATE_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_STEADY_STATE_ADAPTIVE_HOP_THRESHOLD", 0);
     let blocks_per_round = env_usize("EC_STEADY_STATE_BLOCKS_PER_ROUND", 3);
@@ -81,6 +83,11 @@ fn main() {
         .parse::<i64>()
         .unwrap_or(2);
     let elections_per_tick = env_usize("EC_STEADY_STATE_ELECTIONS_PER_TICK", 0);
+    let prune_protection_time = env_u64("EC_STEADY_STATE_PRUNE_PROTECTION_TIME", 600);
+    let connected_target = env_usize("EC_STEADY_STATE_CONNECTED_TARGET", 0);
+    let connected_hysteresis = env_usize("EC_STEADY_STATE_CONNECTED_HYSTERESIS", 0);
+    let elections_when_over_target =
+        env_usize("EC_STEADY_STATE_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
     let connection_timeout = env_u64(
         "EC_STEADY_STATE_CONNECTION_TIMEOUT",
         rounds as u64 + 10_000,
@@ -95,12 +102,20 @@ fn main() {
     println!("Network profile: {}", network_profile);
     println!("Topology: {}", topology);
     if topology == "ring" {
-        println!("Ring neighbors on each side: {}", ring_neighbors);
+        println!("Guaranteed ring neighbors on each side: {}", ring_neighbors);
+        println!("Ring tail: linear fade to zero by ±{}", ring_neighbors * 2);
+    } else if topology == "ring_probabilistic" {
+        println!("Ring topology: pairwise probabilistic closeness on the 64-bit ring");
     }
     println!("Neighborhood width: {}", neighborhood_width);
     println!("Vote targets per request: {}", vote_target_count);
+    println!(
+        "Vote request pattern: deterministic outward pairs, {} rounds on / 1 round skip",
+        vote_active_rounds
+    );
     println!("Vote balance threshold: {}", vote_balance_threshold);
     println!("Elections per tick: {}", elections_per_tick);
+    println!("Prune protection time: {}", prune_protection_time);
     println!("Connection timeout: {}", connection_timeout);
     println!(
         "Batching: {}, vote replies: {}",
@@ -122,6 +137,17 @@ fn main() {
             adaptive_far_width, adaptive_hop_threshold
         );
     }
+    if connected_target > 0 {
+        let elections_label = if elections_when_over_target == usize::MAX {
+            "default".to_string()
+        } else {
+            elections_when_over_target.to_string()
+        };
+        println!(
+            "Connected target band: {} ± {}, elections above high band: {}",
+            connected_target, connected_hysteresis, elections_label
+        );
+    }
 
     let mut config = IntegratedSimConfig::default();
     config.seed = Some(fixed_seed(seed_variant));
@@ -132,6 +158,7 @@ fn main() {
             "fully_known" => TopologyMode::FullyKnown {
                 connected_fraction: 1.0,
             },
+            "ring_probabilistic" => TopologyMode::RingProbabilistic,
             _ => TopologyMode::Ring {
                 neighbors: ring_neighbors,
             },
@@ -147,11 +174,20 @@ fn main() {
     };
     config.peer_config.neighborhood_width = neighborhood_width;
     config.peer_config.vote_target_count = vote_target_count;
+    config.peer_config.vote_request_active_rounds = vote_active_rounds;
     config.peer_config.vote_balance_threshold = vote_balance_threshold;
     config.peer_config.elections_per_tick = elections_per_tick;
+    config.peer_config.prune_protection_time = prune_protection_time;
     config.peer_config.connection_timeout = connection_timeout;
     config.peer_config.enable_request_batching = enable_batching;
     config.peer_config.batch_vote_replies = batch_vote_replies;
+    if connected_target > 0 {
+        config.peer_config.connected_target = Some(connected_target);
+        config.peer_config.connected_target_hysteresis = connected_hysteresis;
+        if elections_when_over_target != usize::MAX {
+            config.peer_config.elections_per_tick_above_target = Some(elections_when_over_target);
+        }
+    }
     config.peer_config.adaptive_neighborhood = if adaptive_far_width > 0 {
         Some(AdaptiveNeighborhoodConfig {
             far_width: adaptive_far_width,

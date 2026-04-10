@@ -168,6 +168,14 @@ pub struct RoundMetrics {
     pub in_flight_messages: usize,
     pub avg_known_peers: f64,
     pub avg_connected_peers: f64,
+    pub avg_gradient_locality: f64,
+    pub avg_active_connected_peers: f64,
+    pub avg_gradient_target_fit: f64,
+    pub avg_gradient_core_coverage: f64,
+    pub avg_gradient_fade_coverage: f64,
+    pub avg_gradient_fade_target: f64,
+    pub avg_gradient_far_coverage: f64,
+    pub avg_gradient_expected_active_degree: f64,
     pub avg_identified_peers: f64,
     pub avg_pending_peers: f64,
     pub avg_known_heads: f64,
@@ -325,11 +333,28 @@ pub struct SimResult {
     pub final_network_loss_fraction: f64,
     pub final_avg_known_peers: f64,
     pub final_avg_connected_peers: f64,
+    pub final_avg_gradient_locality: f64,
+    pub avg_gradient_locality_over_time: f64,
+    pub min_avg_gradient_locality: f64,
+    pub final_avg_active_connected_peers: f64,
+    pub final_avg_gradient_target_fit: f64,
+    pub avg_gradient_target_fit_over_time: f64,
+    pub min_avg_gradient_target_fit: f64,
+    pub final_avg_gradient_core_coverage: f64,
+    pub avg_gradient_core_coverage_over_time: f64,
+    pub final_avg_gradient_fade_coverage: f64,
+    pub avg_gradient_fade_coverage_over_time: f64,
+    pub final_avg_gradient_fade_target: f64,
+    pub final_avg_gradient_far_coverage: f64,
+    pub avg_gradient_far_coverage_over_time: f64,
+    pub final_avg_gradient_expected_active_degree: f64,
     pub final_eligible_transaction_sources: usize,
     pub avg_eligible_transaction_sources: f64,
     pub final_recent_commit_rate: f64,
     pub commit_latency: Option<DistributionSummary>,
     pub network_transit_delay: Option<DistributionSummary>,
+    pub active_connected_distribution: Option<DistributionSummary>,
+    pub gradient_target_fit_distribution: Option<FloatDistributionSummary>,
     pub scheduled_message_types: MessageTypeBreakdown,
     pub delivered_message_types: MessageTypeBreakdown,
     pub scheduled_wire_message_types: MessageTypeBreakdown,
@@ -455,16 +480,46 @@ impl SimResult {
             self.peak_in_flight_messages
         );
         println!(
-            "Connectivity: avg known {:.1}, avg connected {:.1}, peak traces {}, peak elections {}",
+            "Connectivity: avg known {:.1}, avg connected {:.1} (active {:.1}, ideal {:.1}), gradient locality final/avg/min {:.3}/{:.3}/{:.3}, target fit final/avg/min {:.3}/{:.3}/{:.3}, peak traces {}, peak elections {}",
             self.final_avg_known_peers,
             self.final_avg_connected_peers,
+            self.final_avg_active_connected_peers,
+            self.final_avg_gradient_expected_active_degree,
+            self.final_avg_gradient_locality,
+            self.avg_gradient_locality_over_time,
+            self.min_avg_gradient_locality,
+            self.final_avg_gradient_target_fit,
+            self.avg_gradient_target_fit_over_time,
+            self.min_avg_gradient_target_fit,
             self.peak_active_traces,
             self.peak_active_elections,
+        );
+        println!(
+            "Gradient shape vs corrected ring target: core {:.3}/{:.3}, fade actual/avg/target {:.3}/{:.3}/{:.3}, far leakage {:.3}/{:.3}",
+            self.final_avg_gradient_core_coverage,
+            self.avg_gradient_core_coverage_over_time,
+            self.final_avg_gradient_fade_coverage,
+            self.avg_gradient_fade_coverage_over_time,
+            self.final_avg_gradient_fade_target,
+            self.final_avg_gradient_far_coverage,
+            self.avg_gradient_far_coverage_over_time,
         );
         println!(
             "Recent throughput: {:.2} commits/round",
             self.final_recent_commit_rate
         );
+        if let Some(summary) = &self.active_connected_distribution {
+            println!(
+                "Active connected peers/node: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+            );
+        }
+        if let Some(summary) = &self.gradient_target_fit_distribution {
+            println!(
+                "Gradient target-fit distribution: avg {:.3}, p50 {:.3}, p95 {:.3}, min {:.3}, max {:.3}",
+                summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+            );
+        }
         println!(
             "Scheduled logical messages by type: total {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
             self.scheduled_message_types.total(),

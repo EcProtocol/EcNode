@@ -74,8 +74,16 @@ pub enum TopologyMode {
         connected_fraction: f64,       // What % of known peers are Connected
     },
 
-    /// Ring topology with N neighbors on each side, all Connected
+    /// Symmetric ring-gradient topology.
+    /// The closest ±neighbors are always connected and the next ±neighbors
+    /// fade out linearly, giving a dense local neighborhood with sparse tail overlap.
     Ring { neighbors: usize },
+
+    /// Symmetric probabilistic ring-gradient topology.
+    /// Every pair is considered once, and closer peers on the 64-bit ring
+    /// are more likely to connect. This produces a fully probabilistic local gradient
+    /// instead of guaranteed close neighbors.
+    RingProbabilistic,
 
     /// Bootstrap scenario: Each peer starts with N randomly selected peers in Identified state
     /// This simulates a bootstrap scenario where peers discover the network gradually

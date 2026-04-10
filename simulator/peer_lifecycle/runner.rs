@@ -1,7 +1,10 @@
 // Peer Lifecycle Simulator Runner
 
-use super::config::{PeerLifecycleConfig, BootstrapMethod};
+use super::config::{BootstrapMethod, PeerLifecycleConfig};
 use super::stats::*;
+use super::topology::{
+    build_probabilistic_ring_gradient_topology, build_ring_gradient_topology,
+};
 use super::token_allocation::GlobalTokenMapping;
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
@@ -407,20 +410,26 @@ impl PeerLifecycleRunner {
             }
 
             TopologyMode::Ring { neighbors } => {
-                // Ring topology - all neighbors are Connected
-                let mut sorted_peers: Vec<_> = peer_ids.iter().copied().collect();
-                sorted_peers.sort(); // Sort by ID for consistent ring
+                let adjacency =
+                    build_ring_gradient_topology(&peer_ids, *neighbors, &mut self.rng);
 
-                for (i, peer_id) in sorted_peers.iter().enumerate() {
-                    if let Some(peer) = self.peers.get_mut(peer_id) {
-                        for offset in 1..=*neighbors {
-                            // Forward neighbor
-                            let forward_idx = (i + offset) % sorted_peers.len();
-                            peer.peer_manager.add_identified_peer(sorted_peers[forward_idx], 0);
+                for (peer_id, connected_peers) in adjacency {
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        for other_id in connected_peers {
+                            peer.peer_manager.update_peer(&other_id, 0);
+                        }
+                    }
+                }
+            }
 
-                            // Backward neighbor
-                            let backward_idx = (i + sorted_peers.len() - offset) % sorted_peers.len();
-                            peer.peer_manager.add_identified_peer(sorted_peers[backward_idx], 0);
+            TopologyMode::RingProbabilistic => {
+                let adjacency =
+                    build_probabilistic_ring_gradient_topology(&peer_ids, &mut self.rng);
+
+                for (peer_id, connected_peers) in adjacency {
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        for other_id in connected_peers {
+                            peer.peer_manager.update_peer(&other_id, 0);
                         }
                     }
                 }
@@ -512,7 +521,7 @@ impl PeerLifecycleRunner {
                 println!("         Using Isolated instead (peers will discover via elections)");
             }
 
-            TopologyMode::Ring { .. } => {
+            TopologyMode::Ring { .. } | TopologyMode::RingProbabilistic => {
                 println!("WARNING: Ring topology not realistic for genesis mode");
                 println!("         (peers don't know ring positions at genesis)");
                 println!("         Using Isolated instead (peers will discover via elections)");

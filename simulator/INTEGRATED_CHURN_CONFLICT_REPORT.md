@@ -1,14 +1,12 @@
-# Integrated Churn Conflict Report
+# Integrated Churn Gradient Report
 
-This report compares two integrated lifecycle runs on the current code path:
+This report reruns the integrated lifecycle scenario on the current simplified
+response-driven protocol and adds a clearer read on peer-set shape under churn.
 
-- the vote-based peer update shortcut in `ec_node.rs` is disabled
-- the current blocked-transition conflict update batch is enabled
+The goal for this round was twofold:
 
-The goal is to check two things at once:
-
-1. whether the churn/lifecycle simulator still behaves reasonably without the earlier optimistic shortcut
-2. what the current conflict-handling path looks like under real joins, crashes, returns, sync, and transaction flow
+1. check how the latest protocol behaves under joins, crashes, returns, sync, and transaction flow
+2. quantify how close the live peer graph stays to the corrected ring-gradient target over time
 
 ## Scenario
 
@@ -57,136 +55,191 @@ EC_LONG_RUN_CONFLICT_CONTENDERS=2 \
 cargo run --release --quiet --example integrated_long_run
 ```
 
-## Summary
+## Gradient Metrics
+
+The churn runner now reports two kinds of graph-shape metrics:
+
+- `gradient locality`: the older scalar that asks whether connected peers are numerically near the node on the ring
+- `target fit`: a stricter comparison against the corrected ring-gradient target on the same active peer set
+
+The target-fit view also breaks the live graph into three distance bands:
+
+- `core`: the guaranteed local band of the corrected ring target
+- `fade`: the linear fade-out band just outside the core
+- `far`: everything beyond the target fade band
+
+For this scenario the corrected ring target implies an expected active degree of about `23.0`
+peers per node once the active set is large enough.
+
+The ideal shape would look roughly like:
+
+- core coverage close to `1.0`
+- fade coverage close to the target `0.50`
+- far leakage close to `0.0`
+
+## Final Summary
 
 | Case | Submitted | Committed | Pending | Wire Messages | Peak In-Flight | Avg Latency | p50 | p95 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| no-conflict churn | `1800` | `1226` | `574` | `8.18M` | `45,273` | `24.4` | `16` | `47` |
-| conflict churn | `2286` | `1284` | `1002` | `15.73M` | `99,730` | `22.6` | `14` | `47` |
+| no-conflict churn | `1800` | `1091` | `709` | `7.81M` | `43,978` | `22.1` | `14` | `42` |
+| conflict churn | `2246` | `1255` | `991` | `8.08M` | `41,510` | `21.6` | `15` | `43` |
 
 Important context:
+
 - the conflict run submits more blocks because each conflict family injects multiple contenders
-- so the raw committed count is not enough by itself; pending load and queue depth matter more here
+- recovery is now much healthier than in earlier churn runs, so end-of-run pending load matters more than simple crash-recovery time
+
+## Gradient Shape Over Time
+
+### No-conflict churn
+
+| Stage | Active | Avg Connected | Active Connected | Ideal | Target Fit | Core | Fade | Far |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| round `100` early baseline | `96` | `37.2` | `37.2` | `23.0` | `0.598` | `0.49` | `0.43` | `0.358` |
+| round `200` post-growth-1 | `120` | `46.1` | `46.1` | `23.0` | `0.599` | `0.47` | `0.45` | `0.362` |
+| round `540` late-stage | `122` | `68.1` | `61.4` | `23.0` | `0.524` | `0.59` | `0.57` | `0.484` |
+| final snapshot | `122` | `69.3` | `64.2` | `23.0` | `0.517` | `0.627` | `0.617` | `0.501` |
+
+Time-averaged shape values available from the run:
+
+- average core coverage: `0.491`
+- average far leakage: `0.393`
+
+### Conflict churn
+
+| Stage | Active | Avg Connected | Active Connected | Ideal | Target Fit | Core | Fade | Far |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| round `100` early baseline | `96` | `37.0` | `37.0` | `23.0` | `0.595` | `0.48` | `0.44` | `0.356` |
+| round `200` post-growth-1 | `120` | `46.7` | `46.7` | `23.0` | `0.599` | `0.48` | `0.47` | `0.365` |
+| round `540` late-stage | `122` | `69.7` | `63.3` | `23.0` | `0.520` | `0.62` | `0.59` | `0.496` |
+| final snapshot | `122` | `70.5` | `66.0` | `23.0` | `0.511` | `0.653` | `0.631` | `0.513` |
+
+Time-averaged shape values available from the run:
+
+- average core coverage: `0.495`
+- average far leakage: `0.395`
+
+## Reading The Gradient Results
+
+This is the clearest result from the round.
+
+The churn path is not failing to connect. It is staying too broad.
+
+Across both runs:
+
+- average connected degree stays around `3x` the corrected ring target
+- far leakage climbs to about `0.50` by the final snapshot
+- target fit falls from about `0.60` early to about `0.52` late
+
+So the live graph under churn is flattening instead of settling into the intended steep local shape.
+
+That is good news in one sense:
+
+- we are not struggling because the graph is too sparse or too fragmented
+- dropping or spacing elections in over-dense regions is a much easier problem than trying to invent missing connectivity
+
+It also gives us a concrete next lever:
+
+- make the election / retention / pruning rules preserve liveness without keeping so many far-away connections alive
 
 ## Churn Behavior
 
-### No-conflict baseline
+### No-conflict churn
 
 - `136` total peers created, `122` active at end
-- late-join time to connected: `26.9` rounds avg, `p95 35`
-- rejoin time to connected: `20.5` rounds avg, `p95 22`
+- late-join time to connected: `27.0` rounds avg, `p95 35`
+- rejoin time to connected: `18.5` rounds avg, `p95 21`
 - recovery watches:
-  - crash at round `300`: recovered in `2` rounds
+  - crash at round `300`: recovered in `1` round
   - crash at round `500`: recovered in `1` round
 
 ### Conflict churn
 
 - `136` total peers created, `122` active at end
-- late-join time to connected: `26.5` rounds avg, `p95 33`
-- rejoin time to connected: `16.2` rounds avg, `p95 19`
+- late-join time to connected: `26.2` rounds avg, `p95 33`
+- rejoin time to connected: `20.8` rounds avg, `p95 24`
 - recovery watches:
-  - crash at round `300`: recovered in `14` rounds
-  - crash at round `500`: recovered in `64` rounds
+  - crash at round `300`: recovered in `1` round
+  - crash at round `500`: recovered in `1` round
 
 ### Reading The Churn Path
 
-The important positive result is:
+This is a real improvement over the earlier churn runs.
 
-- both runs stayed alive through the full lifecycle scenario
-- joiners and returners still integrated
+What looks good now:
+
+- the network still forms and heals through joins, crashes, and returns
+- both crash waves recovered quickly
 - commit-chain sync stayed active
-- transactions kept committing throughout the run
+- the conflict workload did not blow the run up
 
-The important negative result is:
+What is still weak:
 
-- conflict load makes recovery substantially slower
-- the network heals, but it does not settle back toward the no-conflict operating region quickly enough
+- the network heals by staying over-connected
+- latency under churn is still about `2x` the corrected steady-state ring
+- pending load still builds late in the run as the graph broadens
 
-So the current lifecycle path is robust in the liveness sense, but still too “draggy” in the recovery sense.
+So the latest protocol looks much healthier operationally, but the graph-maintenance policy is still leaving efficiency on the table.
 
 ## Conflict Outcomes
 
-The conflict run created `486` conflict families.
+The conflict run created `446` conflict families.
 
 Outcome metrics:
 
-- `51` no-visible
-- `389` single-visible
-- `46` split
-- `3` unanimous-highest
-- `254` highest-majority
-- `283` any-majority
-- `203` stalled-no-majority
-- `116` any-lower-visible
-- `114` lower-owner-commit
-- `52` multi-owner-commits
+- `49` no-visible
+- `354` single-visible
+- `43` split
+- `1` unanimous-highest
+- `241` highest-majority
+- `274` any-majority
+- `172` stalled-no-majority
+- `93` any-lower-visible
+- `53` lower-owner-commit
+- `12` multi-owner-commits
 
 Signal metrics:
 
-- average participant peers per family: `66.5`
-- average signaled participants per family: `44.5`
-- average signal coverage among participants: `0.60`
+- average participant peers per family: `60.2`
+- average signaled participants per family: `38.0`
+- average signal coverage among participants: `0.56`
 
 ### Reading The Conflict Path Under Churn
 
-This is weaker than the sparse steady-state conflict picture, which is expected.
+This is still not “strong convergence”, but it is a workable liveness profile.
 
-What still looks good:
+What looks good:
 
-- many families do get a majority on the highest contender: `254`
-- conflict information is still reaching a substantial share of participants
-- the system does not collapse into runaway traffic or complete deadlock
+- highest-majority families: `241`
+- lower-owner commits dropped to `53`
+- multi-owner commits dropped to `12`
+- the system stayed stable under a very heavy conflict workload
 
-What still looks weak:
+What still looks incomplete:
 
-- too many stalled families: `203`
-- too many lower-owner commits: `114`
-- too many multi-owner commits: `52`
-- unanimous-highest is still rare: `3`
+- stalled families remain common: `172`
+- unanimous-highest is still rare: `1`
+- the protocol is damping conflict better than it is steering it to the intended highest contender
 
-So under churn, the current conflict handling is functioning more as:
+So under churn, the current conflict handling is functioning as:
 
-- conflict damping
-- warning propagation
-- partial majority formation
+- conflict warning propagation
+- damping of bad contenders
+- partial highest-majority formation
 
-than as strong convergence on the intended contender.
-
-## Network And Message Cost
-
-No-conflict:
-
-- logical messages delivered: `13.29M`
-- wire messages delivered: `8.18M`
-- delivered vote messages: `10.62M`
-- block-related messages to settle: avg `1958.6`
-
-Conflict:
-
-- logical messages delivered: `25.96M`
-- wire messages delivered: `15.73M`
-- delivered vote messages: `17.19M`
-- block-related messages to settle: avg `1564.7`
-
-The message picture is interesting:
-
-- conflict roughly doubled wire traffic and queue depth
-- but it did not catastrophically explode
-- p95 commit latency stayed flat at `47` rounds across both runs
-
-That suggests the current system is still load-sensitive, but not brittle.
+more than as deterministic convergence on the highest contender.
 
 ## Assessment
 
-This comparison supports three conclusions.
+This round supports three conclusions.
 
-1. Removing the earlier vote-based peer shortcut does not break the integrated lifecycle path.
-   The network still forms and heals through joins, crashes, and returns.
+1. The latest simplified response-driven protocol survives the full churn path well.
+   Recovery after the crash waves is now quick again in both the no-conflict and conflict runs.
 
-2. The current conflict-handling path survives churn.
-   Even under a very heavy conflict workload, the system continues processing transactions and the network remains functional.
+2. The main remaining lifecycle drag is graph shape, not missing connectivity.
+   The churned network stays far broader than the corrected ring-gradient target, especially in the far band.
 
-3. Recovery and convergence are still the limiting problems.
-   Under conflict, the network heals too slowly back toward steady-state behavior, and conflict families still do not converge strongly enough on the intended contender.
+3. Conflict handling is improving in the right direction.
+   The system stays live, lower-owner and multi-owner outcomes are materially better than earlier churn results, but strong highest-id convergence is still not there.
 
-So the current system looks viable in the “does it keep working?” sense, but not yet in the “does it recover and converge cleanly enough?” sense.
+So the next useful work is not to add more raw connectivity. It is to keep the graph steeper under churn by reducing over-dense far links without hurting recovery.

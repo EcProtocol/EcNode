@@ -24,6 +24,10 @@ use crate::integrated::{
 use crate::peer_lifecycle::{
     BootstrapMethod, GlobalTokenMapping, NetworkEvent, PeerSelection, ScheduledEvent, TopologyMode,
 };
+use crate::peer_lifecycle::stats::calculate_gradient_steepness;
+use crate::peer_lifecycle::topology::{
+    build_probabilistic_ring_gradient_topology, build_ring_gradient_topology,
+};
 use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
 
 const RECOVERY_WINDOW: usize = 12;
@@ -133,6 +137,17 @@ fn message_logical_count(message: &Message) -> usize {
         Message::RequestBatch { items } => items.len(),
         _ => 1,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GradientShapeMetrics {
+    avg_active_connected_peers: f64,
+    avg_target_fit: f64,
+    avg_core_coverage: f64,
+    avg_fade_coverage: f64,
+    avg_fade_target: f64,
+    avg_far_coverage: f64,
+    avg_expected_active_degree: f64,
 }
 
 pub struct IntegratedRunner {
@@ -469,6 +484,18 @@ impl IntegratedRunner {
             ids.sort_unstable();
             ids
         };
+        let ring_adjacency = match &self.config.initial_state.initial_topology {
+            TopologyMode::Ring { neighbors } => Some(build_ring_gradient_topology(
+                &sorted_peer_ids,
+                *neighbors,
+                &mut self.rng,
+            )),
+            TopologyMode::RingProbabilistic => Some(build_probabilistic_ring_gradient_topology(
+                &sorted_peer_ids,
+                &mut self.rng,
+            )),
+            _ => None,
+        };
 
         for &peer_id in peer_ids {
             let seeds = match &self.config.initial_state.initial_topology {
@@ -487,21 +514,11 @@ impl IntegratedRunner {
                         .filter(|_| self.rng.gen_bool(*peer_knowledge_fraction))
                         .collect()
                 }
-                TopologyMode::Ring { neighbors } => {
-                    let idx = sorted_peer_ids
-                        .iter()
-                        .position(|candidate| *candidate == peer_id)
-                        .expect("peer_id should exist in sorted list");
-                    let mut ring_seeds = HashSet::new();
-                    for offset in 1..=*neighbors {
-                        ring_seeds.insert(sorted_peer_ids[(idx + offset) % sorted_peer_ids.len()]);
-                        ring_seeds.insert(
-                            sorted_peer_ids
-                                [(idx + sorted_peer_ids.len() - offset) % sorted_peer_ids.len()],
-                        );
-                    }
-                    ring_seeds.into_iter().collect()
-                }
+                TopologyMode::Ring { .. } | TopologyMode::RingProbabilistic => ring_adjacency
+                    .as_ref()
+                    .and_then(|adjacency| adjacency.get(&peer_id))
+                    .cloned()
+                    .unwrap_or_default(),
                 TopologyMode::RandomIdentified { peers_per_node } => peer_ids
                     .iter()
                     .copied()
@@ -1530,17 +1547,241 @@ impl IntegratedRunner {
         self.round_metrics.push(snapshot);
     }
 
+    fn target_gradient_neighbors(&self) -> usize {
+        self.config
+            .token_distribution
+            .neighbor_overlap
+            .max(self.config.peer_config.neighborhood_width)
+            .max(1)
+    }
+
+    fn calculate_gradient_shape_metrics(&self, active_peers: &[PeerId]) -> GradientShapeMetrics {
+        if active_peers.len() < 2 {
+            return GradientShapeMetrics::default();
+        }
+
+        let mut sorted_active_peers = active_peers.to_vec();
+        sorted_active_peers.sort_unstable();
+
+        let index_by_peer = sorted_active_peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer_id)| (*peer_id, idx))
+            .collect::<BTreeMap<_, _>>();
+
+        let max_step = sorted_active_peers.len() / 2;
+        if max_step == 0 {
+            return GradientShapeMetrics::default();
+        }
+
+        let guaranteed_steps = self.target_gradient_neighbors().min(max_step);
+        let fade_steps = (guaranteed_steps * 2).min(max_step.max(guaranteed_steps));
+
+        let mut active_connected_total = 0.0;
+        let mut expected_degree_total = 0.0;
+        let mut target_fit_total = 0.0;
+        let mut core_coverage_total = 0.0;
+        let mut fade_coverage_total = 0.0;
+        let mut fade_target_total = 0.0;
+        let mut far_coverage_total = 0.0;
+
+        for peer_id in &sorted_active_peers {
+            let Some(peer) = self.peers.get(peer_id) else {
+                continue;
+            };
+            let active_connected = peer
+                .node
+                .connected_peer_ids()
+                .iter()
+                .copied()
+                .filter(|candidate| index_by_peer.contains_key(candidate))
+                .collect::<HashSet<_>>();
+
+            let peer_idx = *index_by_peer.get(peer_id).expect("active peer should be indexed");
+            let mut expected_degree = 0.0;
+            let mut absolute_error = 0.0;
+            let mut comparisons = 0usize;
+
+            let mut core_possible = 0usize;
+            let mut core_connected = 0usize;
+            let mut fade_possible = 0usize;
+            let mut fade_connected = 0usize;
+            let mut fade_expected = 0.0;
+            let mut far_possible = 0usize;
+            let mut far_connected = 0usize;
+
+            for (other_peer_id, other_idx) in &index_by_peer {
+                if other_peer_id == peer_id {
+                    continue;
+                }
+
+                let clockwise_steps = peer_idx.abs_diff(*other_idx);
+                let counter_clockwise_steps = sorted_active_peers.len() - clockwise_steps;
+                let rank_distance = clockwise_steps.min(counter_clockwise_steps);
+                let actual = if active_connected.contains(other_peer_id) {
+                    1.0
+                } else {
+                    0.0
+                };
+
+                let target = if rank_distance <= guaranteed_steps {
+                    core_possible += 1;
+                    if actual > 0.0 {
+                        core_connected += 1;
+                    }
+                    1.0
+                } else if rank_distance < fade_steps && fade_steps > guaranteed_steps {
+                    fade_possible += 1;
+                    if actual > 0.0 {
+                        fade_connected += 1;
+                    }
+                    let span = (fade_steps - guaranteed_steps) as f64;
+                    let remaining = (fade_steps - rank_distance) as f64;
+                    let probability = (remaining / span).clamp(0.0, 1.0);
+                    fade_expected += probability;
+                    probability
+                } else {
+                    far_possible += 1;
+                    if actual > 0.0 {
+                        far_connected += 1;
+                    }
+                    0.0
+                };
+
+                expected_degree += target;
+                absolute_error += (actual - target).abs();
+                comparisons += 1;
+            }
+
+            active_connected_total += active_connected.len() as f64;
+            expected_degree_total += expected_degree;
+            if comparisons > 0 {
+                target_fit_total += 1.0 - (absolute_error / comparisons as f64);
+            }
+            core_coverage_total += if core_possible == 0 {
+                1.0
+            } else {
+                core_connected as f64 / core_possible as f64
+            };
+            fade_coverage_total += if fade_possible == 0 {
+                0.0
+            } else {
+                fade_connected as f64 / fade_possible as f64
+            };
+            fade_target_total += if fade_possible == 0 {
+                0.0
+            } else {
+                fade_expected / fade_possible as f64
+            };
+            far_coverage_total += if far_possible == 0 {
+                0.0
+            } else {
+                far_connected as f64 / far_possible as f64
+            };
+        }
+
+        let active_count = sorted_active_peers.len() as f64;
+        GradientShapeMetrics {
+            avg_active_connected_peers: active_connected_total / active_count,
+            avg_target_fit: target_fit_total / active_count,
+            avg_core_coverage: core_coverage_total / active_count,
+            avg_fade_coverage: fade_coverage_total / active_count,
+            avg_fade_target: fade_target_total / active_count,
+            avg_far_coverage: far_coverage_total / active_count,
+            avg_expected_active_degree: expected_degree_total / active_count,
+        }
+    }
+
+    fn collect_gradient_shape_samples(&self, active_peers: &[PeerId]) -> (Vec<usize>, Vec<f64>) {
+        if active_peers.len() < 2 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut sorted_active_peers = active_peers.to_vec();
+        sorted_active_peers.sort_unstable();
+
+        let index_by_peer = sorted_active_peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer_id)| (*peer_id, idx))
+            .collect::<BTreeMap<_, _>>();
+
+        let max_step = sorted_active_peers.len() / 2;
+        if max_step == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let guaranteed_steps = self.target_gradient_neighbors().min(max_step);
+        let fade_steps = (guaranteed_steps * 2).min(max_step.max(guaranteed_steps));
+
+        let mut active_connected_samples = Vec::with_capacity(sorted_active_peers.len());
+        let mut target_fit_samples = Vec::with_capacity(sorted_active_peers.len());
+
+        for peer_id in &sorted_active_peers {
+            let Some(peer) = self.peers.get(peer_id) else {
+                continue;
+            };
+            let active_connected = peer
+                .node
+                .connected_peer_ids()
+                .iter()
+                .copied()
+                .filter(|candidate| index_by_peer.contains_key(candidate))
+                .collect::<HashSet<_>>();
+
+            let peer_idx = *index_by_peer.get(peer_id).expect("active peer should be indexed");
+            let mut absolute_error = 0.0;
+            let mut comparisons = 0usize;
+
+            for (other_peer_id, other_idx) in &index_by_peer {
+                if other_peer_id == peer_id {
+                    continue;
+                }
+
+                let clockwise_steps = peer_idx.abs_diff(*other_idx);
+                let counter_clockwise_steps = sorted_active_peers.len() - clockwise_steps;
+                let rank_distance = clockwise_steps.min(counter_clockwise_steps);
+                let actual = if active_connected.contains(other_peer_id) {
+                    1.0
+                } else {
+                    0.0
+                };
+                let target = if rank_distance <= guaranteed_steps {
+                    1.0
+                } else if rank_distance < fade_steps && fade_steps > guaranteed_steps {
+                    let span = (fade_steps - guaranteed_steps) as f64;
+                    let remaining = (fade_steps - rank_distance) as f64;
+                    (remaining / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+
+                absolute_error += (actual - target).abs();
+                comparisons += 1;
+            }
+
+            active_connected_samples.push(active_connected.len());
+            if comparisons > 0 {
+                target_fit_samples.push(1.0 - (absolute_error / comparisons as f64));
+            }
+        }
+
+        (active_connected_samples, target_fit_samples)
+    }
+
     fn current_snapshot(&self, commits_this_round: usize) -> RoundMetrics {
         let active_peers = self.active_peer_ids();
         let active_count = active_peers.len();
         let eligible_transaction_sources = self.eligible_transaction_sources().len();
+        let gradient_shape = self.calculate_gradient_shape_metrics(&active_peers);
 
-        let (avg_known_peers, avg_connected_peers, avg_identified_peers, avg_pending_peers, avg_known_heads) =
+        let (avg_known_peers, avg_connected_peers, avg_gradient_locality, avg_identified_peers, avg_pending_peers, avg_known_heads) =
             if active_count == 0 {
-                (0.0, 0.0, 0.0, 0.0, 0.0)
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             } else {
                 let mut known_total = 0.0;
                 let mut connected_total = 0.0;
+                let mut gradient_total = 0.0;
                 let mut identified_total = 0.0;
                 let mut pending_total = 0.0;
                 let mut head_total = 0.0;
@@ -1549,6 +1790,10 @@ impl IntegratedRunner {
                     if let Some(peer) = self.peers.get(peer_id) {
                         known_total += peer.node.num_peers() as f64;
                         connected_total += peer.node.num_connected_peers() as f64;
+                        gradient_total += calculate_gradient_steepness(
+                            peer.node.get_peer_id(),
+                            peer.node.connected_peer_ids(),
+                        );
                         identified_total += peer.node.num_identified_peers() as f64;
                         pending_total += peer.node.num_pending_peers() as f64;
                         head_total += peer.node.num_peers_with_commit_chain_heads() as f64;
@@ -1558,6 +1803,7 @@ impl IntegratedRunner {
                 (
                     known_total / active_count as f64,
                     connected_total / active_count as f64,
+                    gradient_total / active_count as f64,
                     identified_total / active_count as f64,
                     pending_total / active_count as f64,
                     head_total / active_count as f64,
@@ -1604,6 +1850,14 @@ impl IntegratedRunner {
             in_flight_messages: self.in_flight_messages.len(),
             avg_known_peers,
             avg_connected_peers,
+            avg_gradient_locality,
+            avg_active_connected_peers: gradient_shape.avg_active_connected_peers,
+            avg_gradient_target_fit: gradient_shape.avg_target_fit,
+            avg_gradient_core_coverage: gradient_shape.avg_core_coverage,
+            avg_gradient_fade_coverage: gradient_shape.avg_fade_coverage,
+            avg_gradient_fade_target: gradient_shape.avg_fade_target,
+            avg_gradient_far_coverage: gradient_shape.avg_far_coverage,
+            avg_gradient_expected_active_degree: gradient_shape.avg_expected_active_degree,
             avg_identified_peers,
             avg_pending_peers,
             avg_known_heads,
@@ -1634,7 +1888,7 @@ impl IntegratedRunner {
         let latency = DistributionSummary::from_samples(&self.commit_latencies);
 
         println!(
-            "[round {}] {}: active peers {}, eligible tx sources {}, in-flight {}, avg known {:.1}, avg connected {:.1}, heads {:.1}, committed {}, pending {}, no-trusted-votes {}, wait-token-votes {}, wait-witness {}, skipped {}, traces {}, elections {}, recent rate {:.2}/round{}",
+            "[round {}] {}: active peers {}, eligible tx sources {}, in-flight {}, avg known {:.1}, avg connected {:.1} (active {:.1}, ideal {:.1}), gradient {:.3}, fit {:.3}, core/fade/far {:.2}/{:.2}/{:.3} (fade target {:.2}), heads {:.1}, committed {}, pending {}, no-trusted-votes {}, wait-token-votes {}, wait-witness {}, skipped {}, traces {}, elections {}, recent rate {:.2}/round{}",
             self.current_round,
             label,
             snapshot.active_peers,
@@ -1642,6 +1896,14 @@ impl IntegratedRunner {
             snapshot.in_flight_messages,
             snapshot.avg_known_peers,
             snapshot.avg_connected_peers,
+            snapshot.avg_active_connected_peers,
+            snapshot.avg_gradient_expected_active_degree,
+            snapshot.avg_gradient_locality,
+            snapshot.avg_gradient_target_fit,
+            snapshot.avg_gradient_core_coverage,
+            snapshot.avg_gradient_fade_coverage,
+            snapshot.avg_gradient_far_coverage,
+            snapshot.avg_gradient_fade_target,
             snapshot.avg_known_heads,
             snapshot.committed_blocks,
             snapshot.pending_blocks,
@@ -1832,6 +2094,66 @@ impl IntegratedRunner {
                 .sum::<f64>()
                 / self.round_metrics.len() as f64
         };
+        let avg_gradient_locality_over_time = if self.round_metrics.is_empty() {
+            final_snapshot.avg_gradient_locality
+        } else {
+            self.round_metrics
+                .iter()
+                .map(|round| round.avg_gradient_locality)
+                .sum::<f64>()
+                / self.round_metrics.len() as f64
+        };
+        let min_avg_gradient_locality = self
+            .round_metrics
+            .iter()
+            .map(|round| round.avg_gradient_locality)
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(final_snapshot.avg_gradient_locality);
+        let avg_gradient_target_fit_over_time = if self.round_metrics.is_empty() {
+            final_snapshot.avg_gradient_target_fit
+        } else {
+            self.round_metrics
+                .iter()
+                .map(|round| round.avg_gradient_target_fit)
+                .sum::<f64>()
+                / self.round_metrics.len() as f64
+        };
+        let min_avg_gradient_target_fit = self
+            .round_metrics
+            .iter()
+            .map(|round| round.avg_gradient_target_fit)
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(final_snapshot.avg_gradient_target_fit);
+        let active_peer_ids = self.active_peer_ids();
+        let (active_connected_samples, gradient_target_fit_samples) =
+            self.collect_gradient_shape_samples(&active_peer_ids);
+        let avg_gradient_core_coverage_over_time = if self.round_metrics.is_empty() {
+            final_snapshot.avg_gradient_core_coverage
+        } else {
+            self.round_metrics
+                .iter()
+                .map(|round| round.avg_gradient_core_coverage)
+                .sum::<f64>()
+                / self.round_metrics.len() as f64
+        };
+        let avg_gradient_fade_coverage_over_time = if self.round_metrics.is_empty() {
+            final_snapshot.avg_gradient_fade_coverage
+        } else {
+            self.round_metrics
+                .iter()
+                .map(|round| round.avg_gradient_fade_coverage)
+                .sum::<f64>()
+                / self.round_metrics.len() as f64
+        };
+        let avg_gradient_far_coverage_over_time = if self.round_metrics.is_empty() {
+            final_snapshot.avg_gradient_far_coverage
+        } else {
+            self.round_metrics
+                .iter()
+                .map(|round| round.avg_gradient_far_coverage)
+                .sum::<f64>()
+                / self.round_metrics.len() as f64
+        };
         let neighborhood_buckets = self
             .neighborhood_buckets
             .iter()
@@ -1983,11 +2305,33 @@ impl IntegratedRunner {
             final_network_loss_fraction: self.config.network.loss_fraction,
             final_avg_known_peers: final_snapshot.avg_known_peers,
             final_avg_connected_peers: final_snapshot.avg_connected_peers,
+            final_avg_gradient_locality: final_snapshot.avg_gradient_locality,
+            avg_gradient_locality_over_time,
+            min_avg_gradient_locality,
+            final_avg_active_connected_peers: final_snapshot.avg_active_connected_peers,
+            final_avg_gradient_target_fit: final_snapshot.avg_gradient_target_fit,
+            avg_gradient_target_fit_over_time,
+            min_avg_gradient_target_fit,
+            final_avg_gradient_core_coverage: final_snapshot.avg_gradient_core_coverage,
+            avg_gradient_core_coverage_over_time,
+            final_avg_gradient_fade_coverage: final_snapshot.avg_gradient_fade_coverage,
+            avg_gradient_fade_coverage_over_time,
+            final_avg_gradient_fade_target: final_snapshot.avg_gradient_fade_target,
+            final_avg_gradient_far_coverage: final_snapshot.avg_gradient_far_coverage,
+            avg_gradient_far_coverage_over_time,
+            final_avg_gradient_expected_active_degree: final_snapshot
+                .avg_gradient_expected_active_degree,
             final_eligible_transaction_sources: final_snapshot.eligible_transaction_sources,
             avg_eligible_transaction_sources,
             final_recent_commit_rate: final_snapshot.recent_commit_rate,
             commit_latency: DistributionSummary::from_samples(&self.commit_latencies),
             network_transit_delay: DistributionSummary::from_samples(&self.network_transit_samples),
+            active_connected_distribution: DistributionSummary::from_samples(
+                &active_connected_samples,
+            ),
+            gradient_target_fit_distribution: FloatDistributionSummary::from_samples(
+                &gradient_target_fit_samples,
+            ),
             scheduled_message_types: self.scheduled_message_types.clone(),
             delivered_message_types: self.delivered_message_types.clone(),
             scheduled_wire_message_types: self.scheduled_wire_message_types.clone(),

@@ -58,6 +58,10 @@ pub struct PeerManagerConfig {
     /// Number of peers to target when requesting votes for a token or witness.
     pub vote_target_count: usize,
 
+    /// Number of peers to target on the first outbound vote request for a
+    /// token or witness slot before retry cadence takes over.
+    pub first_vote_target_count: usize,
+
     /// Optional adaptive narrowing for far-away tokens.
     pub adaptive_neighborhood: Option<AdaptiveNeighborhoodConfig>,
 
@@ -72,6 +76,30 @@ pub struct PeerManagerConfig {
     /// Positive vote balance required before a token or witness is considered
     /// settled enough to stop soliciting more votes.
     pub vote_balance_threshold: i64,
+
+    /// Minimum ticks between repeated vote requests for the same unresolved
+    /// token or witness slot of a block. `0` means reissue every tick.
+    pub vote_request_resend_cooldown: EcTime,
+
+    /// Number of active outward polling rounds before one skip/reset round.
+    ///
+    /// With the current deterministic pair sweep, `4` means:
+    /// sequence `0,1,2,3`, then one skipped round, then restart at `0`.
+    pub vote_request_active_rounds: u8,
+
+    /// Optional target connected-degree band center. When set, pruning and optional
+    /// election throttling try to keep the live connected set near this size.
+    pub connected_target: Option<usize>,
+
+    /// Hysteresis around `connected_target`.
+    /// A target of `24` with hysteresis `4` means:
+    /// - below `20`: growth is fully allowed
+    /// - above `28`: target-aware pruning and election throttling can activate
+    pub connected_target_hysteresis: usize,
+
+    /// Optional election rate to use while above the high side of the connected target band.
+    /// `Some(0)` means skip self-started elections entirely until back inside the band.
+    pub elections_per_tick_above_target: Option<usize>,
 
     // ===== Election Configuration =====
     /// Configuration for PeerElection
@@ -97,10 +125,16 @@ impl Default for PeerManagerConfig {
             prune_protection_time: 600,
             neighborhood_width: 4,
             vote_target_count: 2,
+            first_vote_target_count: 2,
             adaptive_neighborhood: None,
             enable_request_batching: true,
             batch_vote_replies: false,
             vote_balance_threshold: VOTE_THRESHOLD,
+            vote_request_resend_cooldown: 0,
+            vote_request_active_rounds: 4,
+            connected_target: None,
+            connected_target_hysteresis: 0,
+            elections_per_tick_above_target: None,
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -609,7 +643,12 @@ impl EcPeers {
     }
 
     /// Handle an Invitation (Answer with ticket=0)
-    /// Uses distance-based probability to decide whether to respond
+    ///
+    /// The baseline policy is inverse ring distance: closer peers are more likely
+    /// to trigger a reciprocal election. When the connected set is above the
+    /// configured target band, this becomes locality-aware in active-ring hop
+    /// space so the node keeps refilling its local core while filtering most
+    /// surplus far invitations.
     fn handle_invitation(
         &mut self,
         answer: &TokenMapping,
@@ -649,12 +688,7 @@ impl EcPeers {
         }
         
         if trigger_election {
-            // Calculate distance-based acceptance probability
-            // Closer peers have higher probability of triggering a response
-            let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
-            let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
-            let distance_fraction = distance / ring_size;
-            let accept_prob = 1.0 - distance_fraction; // Inverse: close = high, far = low
+            let accept_prob = self.invitation_acceptance_probability(sender_peer_id);
 
             // Decide whether to respond to this Invitation
             if self.rng.gen_bool(accept_prob) {
@@ -827,6 +861,31 @@ impl EcPeers {
     /// Get the configured vote targets for a token.
     pub(crate) fn vote_target_peers_for(&self, key: &TokenId, time: EcTime) -> Vec<PeerId> {
         self.collect_vote_targets(key, time, self.config.vote_target_count)
+    }
+
+    /// Get one deterministic pair of vote targets for a token, one on each side
+    /// of the target neighborhood, expanding outward with `sequence`.
+    pub(crate) fn vote_target_pair_for_sequence(
+        &self,
+        key: &TokenId,
+        sequence: usize,
+    ) -> Vec<PeerId> {
+        if self.active.is_empty() {
+            return Vec::new();
+        }
+
+        let idx = match self.active.binary_search(key) {
+            Ok(i) | Err(i) => i % self.active.len(),
+        };
+
+        let right = self.active[self.idx_adj(idx, sequence as isize)];
+        let left = self.active[self.idx_adj(idx, -((sequence as isize) + 1))];
+
+        if left == right {
+            vec![left]
+        } else {
+            vec![left, right]
+        }
     }
 
     /// Get a single peer responsible for a token
@@ -1171,6 +1230,54 @@ impl EcPeers {
     /// Closer peers have lower probability of being pruned
     fn prune_connected_by_distance(&mut self, time: EcTime) {
         use rand::Rng;
+        if let Some((_, target, high)) = self.connected_target_bounds() {
+            if self.active.len() <= high {
+                return;
+            }
+
+            let mut candidates = self
+                .peers
+                .iter()
+                .filter_map(|(peer_id, peer)| {
+                    if let PeerState::Connected { connected_since, .. } = peer.state {
+                        self.target_prune_weight(*peer_id, connected_since, time)
+                            .map(|weight| (*peer_id, weight))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut to_demote = Vec::new();
+            let target_prune_count = self.active.len().saturating_sub(target);
+            let prune_count = target_prune_count.min(candidates.len());
+
+            for _ in 0..prune_count {
+                let total_weight = candidates.iter().map(|(_, weight)| *weight).sum::<f64>();
+                if total_weight <= 0.0 {
+                    break;
+                }
+
+                let mut pick = self.rng.gen_range(0.0..total_weight);
+                let mut selected_idx = 0usize;
+                for (idx, (_, weight)) in candidates.iter().enumerate() {
+                    if pick <= *weight {
+                        selected_idx = idx;
+                        break;
+                    }
+                    pick -= *weight;
+                }
+
+                to_demote.push(candidates.swap_remove(selected_idx).0);
+            }
+
+            for peer_id in to_demote {
+                self.demote_from_connected(peer_id, time);
+            }
+
+            return;
+        }
+
         let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
 
         let to_demote: Vec<PeerId> = self.peers
@@ -1204,6 +1311,132 @@ impl EcPeers {
         }
     }
 
+    fn connected_target_bounds(&self) -> Option<(usize, usize, usize)> {
+        let target = self.config.connected_target?;
+        let hysteresis = self.config.connected_target_hysteresis;
+        Some((
+            target.saturating_sub(hysteresis),
+            target,
+            target.saturating_add(hysteresis),
+        ))
+    }
+
+    fn is_above_connected_target(&self) -> bool {
+        self.connected_target_bounds()
+            .map(|(_, _, high)| self.active.len() > high)
+            .unwrap_or(false)
+    }
+
+    fn target_gradient_neighbors(&self) -> usize {
+        self.connected_target_bounds()
+            .map(|(_, target, _)| target.div_ceil(3).max(1))
+            .unwrap_or_else(|| self.config.neighborhood_width.max(1))
+    }
+
+    fn target_gradient_limits(&self) -> (usize, usize) {
+        let neighbors = self.target_gradient_neighbors();
+        let core_limit = neighbors.saturating_mul(2).max(1);
+        let fade_limit = core_limit.saturating_mul(2);
+        (core_limit, fade_limit)
+    }
+
+    fn known_distance_rank(&self, peer_id: PeerId) -> usize {
+        let distance = Self::ring_distance(self.peer_id, peer_id);
+        let mut rank = 1usize;
+
+        for known_peer_id in self.peers.keys() {
+            let known_distance = Self::ring_distance(self.peer_id, *known_peer_id);
+            if known_distance < distance || (known_distance == distance && *known_peer_id < peer_id) {
+                rank += 1;
+            }
+        }
+
+        rank
+    }
+
+    fn connected_core_fill_ratio(&self) -> f64 {
+        let (core_limit, _) = self.target_gradient_limits();
+        let mut closest_known = self
+            .peers
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+
+        closest_known.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+        let core_candidates = closest_known.into_iter().take(core_limit).collect::<Vec<_>>();
+        if core_candidates.is_empty() {
+            return 1.0;
+        }
+
+        let connected = core_candidates
+            .iter()
+            .filter(|peer_id| self.active.binary_search(peer_id).is_ok())
+            .count();
+
+        connected as f64 / core_candidates.len() as f64
+    }
+
+    fn target_prune_weight(
+        &self,
+        peer_id: PeerId,
+        connected_since: EcTime,
+        time: EcTime,
+    ) -> Option<f64> {
+        if time.saturating_sub(connected_since) < self.config.prune_protection_time {
+            return None;
+        }
+
+        let distance = Self::ring_distance(self.peer_id, peer_id) as f64;
+        let ring_size = u64::MAX as f64 / 2.0;
+        let distance_fraction = (distance / ring_size).clamp(0.0, 1.0);
+        let (core_limit, fade_limit) = self.target_gradient_limits();
+        let rank = self.known_distance_rank(peer_id);
+        let core_fill = self.connected_core_fill_ratio().clamp(0.0, 1.0);
+
+        let weight = if rank <= core_limit {
+            if core_fill < 0.95 {
+                return None;
+            }
+            0.05 * distance_fraction.max(0.01)
+        } else if rank <= fade_limit {
+            let fade_weight = (0.25 + 0.75 * distance_fraction).clamp(0.05, 1.0);
+            let preserve_bonus = (1.0 - core_fill) * 0.50;
+            (fade_weight - preserve_bonus).clamp(0.02, 1.0)
+        } else {
+            (1.0 + distance_fraction).clamp(0.10, 2.0)
+        };
+
+        Some(weight.max(0.000_001))
+    }
+
+    fn invitation_acceptance_probability(&self, sender_peer_id: PeerId) -> f64 {
+        let ring_size = u64::MAX as f64 / 2.0;
+        let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
+        let distance_fraction = (distance / ring_size).clamp(0.0, 1.0);
+        let base_accept = (1.0 - distance_fraction).clamp(0.0, 1.0);
+
+        if !self.is_above_connected_target() || self.active.is_empty() {
+            return base_accept;
+        }
+
+        let (core_limit, fade_limit) = self.target_gradient_limits();
+        let rank = self.known_distance_rank(sender_peer_id);
+
+        if rank <= core_limit {
+            return base_accept.max(0.90).clamp(0.0, 1.0);
+        }
+
+        if rank <= fade_limit {
+            let fade_span = fade_limit.saturating_sub(core_limit).max(1);
+            let remaining = fade_limit.saturating_sub(rank).saturating_add(1);
+            let fade_position = remaining as f64 / fade_span as f64;
+            let fade_cap = (fade_position * 0.75).clamp(0.05, 0.75);
+            return base_accept.min(fade_cap).clamp(0.0, 1.0);
+        }
+
+        base_accept.min(0.03).clamp(0.0, 1.0)
+    }
+
     /// Trigger multiple elections per tick (new design)
     /// Picks N tokens from collection and removes them.
     /// If collection is low, uses random tokens to bootstrap discovery.
@@ -1214,13 +1447,25 @@ impl EcPeers {
     ) -> Vec<PeerAction> {
         use rand::Rng;
         let mut actions = Vec::new();
+        let elections_per_tick = if self.is_above_connected_target() {
+            self.config
+                .elections_per_tick_above_target
+                .unwrap_or(self.config.elections_per_tick)
+        } else {
+            self.config.elections_per_tick
+        };
+
+        if elections_per_tick == 0 {
+            return actions;
+        }
 
         // Pick N challenge tokens and remove them from collection
-        let mut challenge_tokens = self.token_samples.pick_and_remove(self.config.elections_per_tick, &mut self.rng);
+        let mut challenge_tokens =
+            self.token_samples.pick_and_remove(elections_per_tick, &mut self.rng);
 
         // If we don't have enough tokens, add random tokens to bootstrap discovery
         // Random tokens won't exist, so we'll get Referrals that populate Identified
-        while challenge_tokens.len() < self.config.elections_per_tick {
+        while challenge_tokens.len() < elections_per_tick {
             let random_token: TokenId = self.rng.gen();
             challenge_tokens.push(random_token);
         }
@@ -1999,6 +2244,130 @@ mod tests {
         let targets = peers.vote_target_peers_for(&65, 0);
         assert_eq!(targets.len(), 3);
         assert_eq!(targets.iter().copied().collect::<HashSet<_>>().len(), 3);
+    }
+
+    #[test]
+    fn test_locality_aware_invitation_acceptance_prefers_core_over_far_when_over_target() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(19);
+        let mut config = PeerManagerConfig::default();
+        config.connected_target = Some(24);
+        config.connected_target_hysteresis = 4;
+
+        let mut peers = EcPeers::with_config_and_rng(205, config, rng);
+        for peer_id in (10..=400).step_by(10) {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        assert!(peers.is_above_connected_target());
+
+        let (core_limit, fade_limit) = peers.target_gradient_limits();
+        let near_rank = peers.known_distance_rank(210);
+        let fade_rank = peers.known_distance_rank(320);
+        let far_rank = peers.known_distance_rank(20);
+
+        assert!(near_rank <= core_limit);
+        assert!(fade_rank > core_limit && fade_rank <= fade_limit);
+        assert!(far_rank > fade_limit);
+
+        let near = peers.invitation_acceptance_probability(210);
+        let fade = peers.invitation_acceptance_probability(320);
+        let far = peers.invitation_acceptance_probability(20);
+
+        assert!(near > fade);
+        assert!(fade > far);
+        assert!(near >= 0.90);
+        assert!(far <= 0.03);
+    }
+
+    #[test]
+    fn test_core_underfill_prevents_pruning_of_core_peers() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(29);
+        let mut config = PeerManagerConfig::default();
+        config.connected_target = Some(24);
+        config.connected_target_hysteresis = 4;
+
+        let connected_far = [
+            10, 20, 30, 40, 50, 60, 70, 80,
+            90, 100, 110, 120, 130, 140, 150, 160,
+            250, 260, 270, 280, 290, 300, 310, 320,
+            330, 340, 350, 360, 370, 380,
+        ];
+        let nearby_known = [180, 190, 200, 210, 220, 230, 240];
+
+        let mut sparse_core = EcPeers::with_config_and_rng(205, config.clone(), rng.clone());
+        for peer_id in connected_far {
+            sparse_core.update_peer(&peer_id, 0);
+        }
+        for peer_id in nearby_known {
+            sparse_core.add_identified_peer(peer_id, 0);
+        }
+
+        let mut fuller_core = EcPeers::with_config_and_rng(205, config, rng);
+        for peer_id in connected_far {
+            fuller_core.update_peer(&peer_id, 0);
+        }
+        for peer_id in nearby_known {
+            fuller_core.update_peer(&peer_id, 0);
+        }
+
+        assert!(sparse_core.is_above_connected_target());
+        assert!(fuller_core.is_above_connected_target());
+        assert!(sparse_core.connected_core_fill_ratio() < fuller_core.connected_core_fill_ratio());
+
+        let sparse_weight = sparse_core.target_prune_weight(220, 0, 1000);
+        let fuller_weight = fuller_core.target_prune_weight(220, 0, 1000);
+
+        assert!(sparse_weight.is_none());
+        assert!(fuller_weight.is_some());
+    }
+
+    #[test]
+    fn test_target_pruning_prefers_far_over_fade_over_core() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(31);
+        let mut config = PeerManagerConfig::default();
+        config.connected_target = Some(24);
+        config.connected_target_hysteresis = 4;
+
+        let mut peers = EcPeers::with_config_and_rng(205, config, rng);
+        for peer_id in (10..=400).step_by(10) {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        let core = peers.target_prune_weight(210, 0, 1000).unwrap();
+        let fade = peers.target_prune_weight(320, 0, 1000).unwrap();
+        let far = peers.target_prune_weight(20, 0, 1000).unwrap();
+
+        assert!(core < fade);
+        assert!(fade < far);
+    }
+
+    #[test]
+    fn test_invitation_acceptance_uses_plain_distance_when_not_above_target() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(23);
+        let mut config = PeerManagerConfig::default();
+        config.connected_target = Some(24);
+        config.connected_target_hysteresis = 4;
+
+        let mut peers = EcPeers::with_config_and_rng(55, config, rng);
+        for peer_id in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        assert!(!peers.is_above_connected_target());
+
+        let ring_size = u64::MAX as f64 / 2.0;
+        let distance = EcPeers::ring_distance(55, 95) as f64;
+        let expected = 1.0 - (distance / ring_size);
+
+        assert_eq!(peers.invitation_acceptance_probability(95), expected);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Sparse Steady-State Report
 
+Historical note: this report predates the ring-topology correction. For the current gradient-shaped `TopologyMode::Ring` baseline, see [RING_TOPOLOGY_CORRECTION_REPORT.md](/workspaces/ecRust/simulator/RING_TOPOLOGY_CORRECTION_REPORT.md).
+
 This report uses the steady-state simulator in a more realistic fixed connected shape:
 
 - `TopologyMode::Ring`

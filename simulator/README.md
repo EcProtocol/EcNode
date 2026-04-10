@@ -84,7 +84,7 @@ cargo run --example peer_lifecycle_sim
 # Adjust configuration in simulator/peer_lifecycle_sim.rs:
 # - peers: 20
 # - rounds: 2000
-# - topology: Ring with 3 neighbors
+# - topology: Ring-gradient with 3 guaranteed neighbors and fading tail
 # - election_config: consensus thresholds, timeouts
 ```
 
@@ -172,14 +172,18 @@ commit-chain sync, and transaction flow.
 
 **Documentation**
 - See `simulator/INTEGRATED_SIMULATION.md` for the lifecycle sequence, metrics, and realism notes
-- See `simulator/INTEGRATED_LONG_RUN_REPORT.md` for one longer genesis-backed baseline run
-- See `simulator/INTEGRATED_CHURN_CONFLICT_REPORT.md` for the current churn-path comparison with and without injected conflicts
-- See `simulator/STEADY_STATE_REPORT.md` for a fixed connected steady-state benchmark
-- See `simulator/SPARSE_STEADY_STATE_REPORT.md` for the corrected sparse fixed-graph steady-state benchmark
-- See `simulator/STEADY_STATE_TUNING_REPORT.md` for batching and vote-target comparisons on the fixed steady-state benchmark
-- See `simulator/ADVERSARIAL_CONFLICT_REPORT.md` for the first sparse steady-state conflict workload and threshold comparison
+- See `simulator/INTEGRATED_LONG_RUN_REPORT.md` for the long genesis-backed lifecycle baseline
+- See `simulator/INTEGRATED_CHURN_CONFLICT_REPORT.md` for the baseline churn-path comparison with and without injected conflicts
+- See `simulator/STEADY_STATE_REPORT.md` for the formed-network steady-state upper-bound benchmark
+- See `simulator/RING_TOPOLOGY_CORRECTION_REPORT.md` for the corrected ring-gradient steady-state benchmark
+- See `simulator/GRADIENT_PROFILE_COMPARISON.md` for the corrected ring target versus integrated churn profile comparison
+- See `simulator/ADVERSARIAL_CONFLICT_REPORT.md` for the current conflict-focused steady-state benchmark
+- See `simulator/CHURN_GRAPH_CONTROL_REPORT.md` for the current graph-shaping and churn-recovery experiments
 - See `Design/vote_flow_and_batching.md` for the current vote/block flow and batching design notes
-- See `simulator/BATCHING_PHASE_COMPARISON_REPORT.md` for the `off` vs `phase1` vs `phase2` batching benchmark
+- See `Design/response_driven_commit_flow.md` for the current commit-path mechanics and timing model
+- See `Design/routing_depth_scaling.md` for the current routing-depth scaling model and large-network asymptotic discussion
+- See `Design/viability_assessment.md` for the current comparative assessment against other distributed-system approaches
+- See `simulator/archive/README.md` for older one-off experiment reports that were retained as historical context
 
 **Usage**
 ```bash
