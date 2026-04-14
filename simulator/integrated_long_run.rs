@@ -90,6 +90,8 @@ fn main() {
     let connected_target = env_usize("EC_LONG_RUN_CONNECTED_TARGET", 0);
     let connected_hysteresis = env_usize("EC_LONG_RUN_CONNECTED_HYSTERESIS", 0);
     let elections_when_over_target = env_usize("EC_LONG_RUN_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
+    let focus_first_crash = env_bool("EC_LONG_RUN_FOCUS_FIRST_CRASH", false);
+    let focus_report_delta = env_usize("EC_LONG_RUN_FOCUS_REPORT_DELTA", 12);
     println!("╔════════════════════════════════════════════════════════╗");
     println!("║  Integrated Long-Run Simulator                        ║");
     println!("╚════════════════════════════════════════════════════════╝");
@@ -257,6 +259,33 @@ fn main() {
             },
         },
     ];
+
+    if focus_first_crash {
+        let before_crash_round = crash_round.saturating_sub(focus_report_delta);
+        let after_crash_round = (crash_round + focus_report_delta).min(rounds.saturating_sub(1));
+        let after_return_round = (return_round + focus_report_delta).min(rounds.saturating_sub(1));
+        config.events.events.extend([
+            ScheduledEvent {
+                round: before_crash_round,
+                event: NetworkEvent::ReportStats {
+                    label: Some("pre-crash-focus".to_string()),
+                },
+            },
+            ScheduledEvent {
+                round: after_crash_round,
+                event: NetworkEvent::ReportStats {
+                    label: Some("post-crash-focus".to_string()),
+                },
+            },
+            ScheduledEvent {
+                round: after_return_round,
+                event: NetworkEvent::ReportStats {
+                    label: Some("post-return-focus".to_string()),
+                },
+            },
+        ]);
+        config.events.events.sort_by_key(|scheduled| scheduled.round);
+    }
 
     let runner = IntegratedRunner::new(config);
     let result = runner.run();

@@ -67,6 +67,7 @@ fn main() {
     let network_profile = env_string("EC_STEADY_STATE_NETWORK_PROFILE", "cross_dc_normal");
     let topology = env_string("EC_STEADY_STATE_TOPOLOGY", "ring");
     let ring_neighbors = env_usize("EC_STEADY_STATE_RING_NEIGHBORS", 8);
+    let ring_tail_peers_per_side = env_usize("EC_STEADY_STATE_RING_TAIL_PEERS_PER_SIDE", 4);
     let neighborhood_width = env_usize("EC_STEADY_STATE_NEIGHBORHOOD_WIDTH", 6);
     let vote_target_count = env_usize("EC_STEADY_STATE_VOTE_TARGETS", 2);
     let vote_active_rounds = env_usize("EC_STEADY_STATE_VOTE_ACTIVE_ROUNDS", 4)
@@ -104,6 +105,13 @@ fn main() {
     if topology == "ring" {
         println!("Guaranteed ring neighbors on each side: {}", ring_neighbors);
         println!("Ring tail: linear fade to zero by ±{}", ring_neighbors * 2);
+    } else if topology == "ring_core_tail" {
+        println!("Guaranteed ring neighbors on each side: {}", ring_neighbors);
+        println!("Ring fade tail: linear fade to zero by ±{}", ring_neighbors * 2);
+        println!(
+            "Long-range tail peers per side: {} (evenly spaced beyond the fade band)",
+            ring_tail_peers_per_side
+        );
     } else if topology == "ring_probabilistic" {
         println!("Ring topology: pairwise probabilistic closeness on the 64-bit ring");
     }
@@ -159,6 +167,10 @@ fn main() {
                 connected_fraction: 1.0,
             },
             "ring_probabilistic" => TopologyMode::RingProbabilistic,
+            "ring_core_tail" => TopologyMode::RingCoreTail {
+                neighbors: ring_neighbors,
+                tail_peers_per_side: ring_tail_peers_per_side,
+            },
             _ => TopologyMode::Ring {
                 neighbors: ring_neighbors,
             },

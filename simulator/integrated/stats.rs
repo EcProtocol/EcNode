@@ -254,6 +254,7 @@ pub struct TransactionSpreadSummary {
     pub reachable_vote_peers: Option<DistributionSummary>,
     pub reachable_vote_edges: Option<DistributionSummary>,
     pub witness_coverage: Option<DistributionSummary>,
+    pub max_role_route_hops: Option<DistributionSummary>,
     pub ideal_role_sum_lower_bound_messages: Option<DistributionSummary>,
     pub ideal_coalesced_lower_bound_messages: Option<DistributionSummary>,
     pub settled_peer_spread: Option<DistributionSummary>,
@@ -662,6 +663,12 @@ impl SimResult {
             println!(
                 "Witness neighborhood: avg {:.1} peers, p50 {}, p95 {}, min {}, max {}",
                 witness.avg, witness.p50, witness.p95, witness.min, witness.max,
+            );
+        }
+        if let Some(hops) = &self.transaction_spread.max_role_route_hops {
+            println!(
+                "Max connected-graph hops to a role coverer: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                hops.avg, hops.p50, hops.p95, hops.min, hops.max,
             );
         }
         if let Some(spread) = &self.transaction_spread.settled_peer_spread {

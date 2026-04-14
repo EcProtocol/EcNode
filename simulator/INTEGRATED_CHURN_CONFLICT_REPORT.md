@@ -3,10 +3,45 @@
 This report reruns the integrated lifecycle scenario on the current simplified
 response-driven protocol and adds a clearer read on peer-set shape under churn.
 
+Update after the focused recovery investigation:
+
+- the original crash-recovery numbers in this document were optimistic
+- the recovery watch used a 12-round moving average that still included pre-crash rounds
+- the runner now requires a full post-event window before declaring recovery
+- focused reruns show the first crash is a moderate throughput dip, not a catastrophic stall
+- the same investigation also confirmed that recovery is not uniquely worse under conflict
+
 The goal for this round was twofold:
 
 1. check how the latest protocol behaves under joins, crashes, returns, sync, and transaction flow
 2. quantify how close the live peer graph stays to the corrected ring-gradient target over time
+
+## Recovery Metric Correction
+
+The integrated runner measures crash recovery from recent committed blocks per round.
+
+Originally, the recovery watch could declare recovery too early because the `12`-round
+moving average still included pre-crash rounds. That made some earlier summaries read
+as if the network had recovered in `1` round even when the first post-crash checkpoint
+still showed a visible throughput dip.
+
+The watch now waits for a full post-event window before it can mark a recovery.
+
+Focused reruns on the current graph-controlled churn baseline show:
+
+| Case | Crash | Pre-crash recent rate | Post-crash recent rate | Post-return recent rate | Corrected recovery |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| no-conflict churn | `300` | `1.92` | `1.58` | `2.08` | `23` rounds |
+| conflict churn | `300` | `2.08` | `1.83` | `2.33` | `16` rounds |
+
+So the first-crash regression is now understood as:
+
+- real, but moderate
+- not unique to the conflict workload
+- previously overstated or understated depending on how much pre-crash throughput leaked into the watch window
+
+The second crash still looks worse in some late-run summaries, but that is now clearly mixed
+with whole-run slowdown and queue growth, not just the crash event itself.
 
 ## Scenario
 
@@ -150,8 +185,10 @@ It also gives us a concrete next lever:
 - late-join time to connected: `27.0` rounds avg, `p95 35`
 - rejoin time to connected: `18.5` rounds avg, `p95 21`
 - recovery watches:
-  - crash at round `300`: recovered in `1` round
-  - crash at round `500`: recovered in `1` round
+  - the older `1 round` figure was a measurement artifact from the pre-fix watch
+  - focused rerun with corrected watch:
+    - crash at round `300`: recovered in `23` rounds
+    - crash at round `500`: recovered in `51` rounds
 
 ### Conflict churn
 
@@ -159,8 +196,10 @@ It also gives us a concrete next lever:
 - late-join time to connected: `26.2` rounds avg, `p95 33`
 - rejoin time to connected: `20.8` rounds avg, `p95 24`
 - recovery watches:
-  - crash at round `300`: recovered in `1` round
-  - crash at round `500`: recovered in `1` round
+  - the older `1 round` figure was a measurement artifact from the pre-fix watch
+  - focused rerun with corrected watch:
+    - crash at round `300`: recovered in `16` rounds
+    - crash at round `500`: recovered in `15` rounds
 
 ### Reading The Churn Path
 
@@ -169,7 +208,7 @@ This is a real improvement over the earlier churn runs.
 What looks good now:
 
 - the network still forms and heals through joins, crashes, and returns
-- both crash waves recovered quickly
+- the first crash now reads as a moderate dip rather than a collapse
 - commit-chain sync stayed active
 - the conflict workload did not blow the run up
 
@@ -178,6 +217,7 @@ What is still weak:
 - the network heals by staying over-connected
 - latency under churn is still about `2x` the corrected steady-state ring
 - pending load still builds late in the run as the graph broadens
+- the recovery metric should be read together with recent-rate checkpoints, not in isolation
 
 So the latest protocol looks much healthier operationally, but the graph-maintenance policy is still leaving efficiency on the table.
 

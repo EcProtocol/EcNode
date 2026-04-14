@@ -85,6 +85,14 @@ pub enum TopologyMode {
     /// instead of guaranteed close neighbors.
     RingProbabilistic,
 
+    /// Symmetric ring topology with a dense local core and a small evenly spaced tail.
+    /// The closest ±neighbors stay steep and local, while `tail_peers_per_side`
+    /// adds a flat routing base across the rest of the ring.
+    RingCoreTail {
+        neighbors: usize,
+        tail_peers_per_side: usize,
+    },
+
     /// Bootstrap scenario: Each peer starts with N randomly selected peers in Identified state
     /// This simulates a bootstrap scenario where peers discover the network gradually
     RandomIdentified {

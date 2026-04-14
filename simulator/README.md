@@ -176,6 +176,8 @@ commit-chain sync, and transaction flow.
 - See `simulator/INTEGRATED_CHURN_CONFLICT_REPORT.md` for the baseline churn-path comparison with and without injected conflicts
 - See `simulator/STEADY_STATE_REPORT.md` for the formed-network steady-state upper-bound benchmark
 - See `simulator/RING_TOPOLOGY_CORRECTION_REPORT.md` for the corrected ring-gradient steady-state benchmark
+- See `simulator/PEER_SET_SHAPE_ILLUSTRATIONS.md` for visual side-by-side sketches of the corrected ring, core+tail, and probabilistic peer-set shapes
+- See `simulator/CORE_TAIL_TOPOLOGY_REPORT.md` for the dense-core plus flat-tail routing experiment on larger steady-state rings
 - See `simulator/GRADIENT_PROFILE_COMPARISON.md` for the corrected ring target versus integrated churn profile comparison
 - See `simulator/ADVERSARIAL_CONFLICT_REPORT.md` for the current conflict-focused steady-state benchmark
 - See `simulator/CHURN_GRAPH_CONTROL_REPORT.md` for the current graph-shaping and churn-recovery experiments
@@ -183,6 +185,9 @@ commit-chain sync, and transaction flow.
 - See `Design/response_driven_commit_flow.md` for the current commit-path mechanics and timing model
 - See `Design/routing_depth_scaling.md` for the current routing-depth scaling model and large-network asymptotic discussion
 - See `Design/viability_assessment.md` for the current comparative assessment against other distributed-system approaches
+- See `Design/vote_simulation_reference.md` for the current simplified Python vote/commit model
+- See `Design/reactive_vote_topology_sweep.md` for the current topology, spread, and message-cost sweep on that simplified model
+- See `Design/heterogeneous_linear_slope_report.md` for the replayed heterogeneous-slope population experiment
 - See `simulator/archive/README.md` for older one-off experiment reports that were retained as historical context
 
 **Usage**

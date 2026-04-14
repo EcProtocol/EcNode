@@ -125,7 +125,7 @@ impl Default for PeerManagerConfig {
             prune_protection_time: 600,
             neighborhood_width: 4,
             vote_target_count: 2,
-            first_vote_target_count: 2,
+            first_vote_target_count: 4,
             adaptive_neighborhood: None,
             enable_request_batching: true,
             batch_vote_replies: false,
@@ -861,6 +861,44 @@ impl EcPeers {
     /// Get the configured vote targets for a token.
     pub(crate) fn vote_target_peers_for(&self, key: &TokenId, time: EcTime) -> Vec<PeerId> {
         self.collect_vote_targets(key, time, self.config.vote_target_count)
+    }
+
+    pub(crate) fn initial_vote_target_count(&self) -> usize {
+        self.config.first_vote_target_count.max(1)
+    }
+
+    pub(crate) fn initial_vote_sequence_span(&self) -> u8 {
+        self.initial_vote_target_count().div_ceil(2).min(u8::MAX as usize) as u8
+    }
+
+    /// Collect the first outward span of vote targets for a role, deduplicated across
+    /// the deterministic pair sweep. This is used for the reactive seed wave that starts
+    /// immediately after a new block is learned.
+    pub(crate) fn vote_target_peers_for_initial_count(
+        &self,
+        key: &TokenId,
+        count: usize,
+    ) -> Vec<PeerId> {
+        if self.active.is_empty() || count == 0 {
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        let max_sequences = self.active.len().max(1);
+
+        for sequence in 0..max_sequences {
+            for peer_id in self.vote_target_pair_for_sequence(key, sequence) {
+                if seen.insert(peer_id) {
+                    result.push(peer_id);
+                    if result.len() >= count {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Get one deterministic pair of vote targets for a token, one on each side

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use rand::rngs::StdRng;
@@ -26,7 +26,8 @@ use crate::peer_lifecycle::{
 };
 use crate::peer_lifecycle::stats::calculate_gradient_steepness;
 use crate::peer_lifecycle::topology::{
-    build_probabilistic_ring_gradient_topology, build_ring_gradient_topology,
+    build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+    build_ring_gradient_topology,
 };
 use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
 
@@ -46,6 +47,7 @@ struct TrackedBlock {
     owner: PeerId,
     submitted_round: usize,
     max_entry_hops: usize,
+    max_role_route_hops: usize,
     ideal_role_sum_lower_bound_messages: usize,
     ideal_coalesced_lower_bound_messages: usize,
     delivered_block_messages: usize,
@@ -106,6 +108,7 @@ struct TransactionSpreadAccumulator {
     reachable_vote_peers: Vec<usize>,
     reachable_vote_edges: Vec<usize>,
     witness_coverage: Vec<usize>,
+    max_role_route_hops: Vec<usize>,
     ideal_role_sum_lower_bound_messages: Vec<usize>,
     ideal_coalesced_lower_bound_messages: Vec<usize>,
     settled_peer_spread: Vec<usize>,
@@ -490,6 +493,15 @@ impl IntegratedRunner {
                 *neighbors,
                 &mut self.rng,
             )),
+            TopologyMode::RingCoreTail {
+                neighbors,
+                tail_peers_per_side,
+            } => Some(build_ring_core_tail_topology(
+                &sorted_peer_ids,
+                *neighbors,
+                *tail_peers_per_side,
+                &mut self.rng,
+            )),
             TopologyMode::RingProbabilistic => Some(build_probabilistic_ring_gradient_topology(
                 &sorted_peer_ids,
                 &mut self.rng,
@@ -514,7 +526,9 @@ impl IntegratedRunner {
                         .filter(|_| self.rng.gen_bool(*peer_knowledge_fraction))
                         .collect()
                 }
-                TopologyMode::Ring { .. } | TopologyMode::RingProbabilistic => ring_adjacency
+                TopologyMode::Ring { .. }
+                | TopologyMode::RingCoreTail { .. }
+                | TopologyMode::RingProbabilistic => ring_adjacency
                     .as_ref()
                     .and_then(|adjacency| adjacency.get(&peer_id))
                     .cloned()
@@ -832,6 +846,9 @@ impl IntegratedRunner {
                     .settled_block_messages
                     .push(tracked.delivered_block_messages);
                 self.transaction_spread
+                    .max_role_route_hops
+                    .push(tracked.max_role_route_hops);
+                self.transaction_spread
                     .ideal_role_sum_lower_bound_messages
                     .push(tracked.ideal_role_sum_lower_bound_messages);
                 self.transaction_spread
@@ -903,6 +920,57 @@ impl IntegratedRunner {
 
     fn count_covering_peers(&self, token: TokenId) -> usize {
         self.collect_covering_peers(token).len()
+    }
+
+    fn shortest_connected_hops_to_coverers(
+        &self,
+        origin: PeerId,
+        coverers: &[PeerId],
+    ) -> Option<usize> {
+        let targets: HashSet<PeerId> = coverers
+            .iter()
+            .copied()
+            .filter(|peer_id| self.peers.get(peer_id).is_some_and(|peer| peer.active))
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        if targets.contains(&origin) {
+            return Some(0);
+        }
+
+        let mut visited = HashSet::new();
+        let mut frontier = VecDeque::new();
+        visited.insert(origin);
+        frontier.push_back((origin, 0usize));
+
+        while let Some((peer_id, depth)) = frontier.pop_front() {
+            let Some(peer) = self.peers.get(&peer_id) else {
+                continue;
+            };
+            if !peer.active {
+                continue;
+            }
+
+            for neighbor in peer.node.connected_peer_ids() {
+                if !self
+                    .peers
+                    .get(neighbor)
+                    .is_some_and(|neighbor_peer| neighbor_peer.active)
+                {
+                    continue;
+                }
+                if !visited.insert(*neighbor) {
+                    continue;
+                }
+                if targets.contains(neighbor) {
+                    return Some(depth + 1);
+                }
+                frontier.push_back((*neighbor, depth + 1));
+            }
+        }
+
+        None
     }
 
     fn role_sum_lower_bound_messages(
@@ -1257,6 +1325,7 @@ impl IntegratedRunner {
 
         let mut token_samples = Vec::new();
         let mut token_neighborhoods = Vec::new();
+        let mut role_route_hops = Vec::new();
         let mut reachable_vote_peers = HashSet::new();
         let mut reachable_vote_edges = HashSet::new();
 
@@ -1269,10 +1338,14 @@ impl IntegratedRunner {
                 .node
                 .active_hop_distance_to_token(token)
                 .unwrap_or(0);
+            let route_hops = self
+                .shortest_connected_hops_to_coverers(target, &covering_peers)
+                .unwrap_or(0);
             let entry_is_local = origin_peer.node.local_scope_contains(token);
 
             token_samples.push((coverage_size, vote_eligible_size, entry_hops, entry_is_local));
             token_neighborhoods.push(covering_peers);
+            role_route_hops.push(route_hops);
             self.extend_vote_graph(
                 target,
                 token,
@@ -1289,6 +1362,11 @@ impl IntegratedRunner {
             .unwrap_or(0);
         let witness_neighborhood = self.collect_covering_peers(block.id);
         let witness_coverage = witness_neighborhood.len();
+        role_route_hops.push(
+            self.shortest_connected_hops_to_coverers(target, &witness_neighborhood)
+                .unwrap_or(0),
+        );
+        let max_role_route_hops = role_route_hops.into_iter().max().unwrap_or(0);
         let ideal_role_sum_lower_bound_messages =
             self.role_sum_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
         let ideal_coalesced_lower_bound_messages = self
@@ -1312,8 +1390,9 @@ impl IntegratedRunner {
             .witness_coverage
             .push(witness_coverage);
 
+        let mut local_outbound = Vec::new();
         if let Some(peer) = self.peers.get_mut(&target) {
-            peer.node.block(&block);
+            peer.node.submit_local_block(&block, &mut local_outbound);
             let mut touched_peers = HashSet::new();
             touched_peers.insert(target);
             self.tracked_blocks.insert(
@@ -1322,6 +1401,7 @@ impl IntegratedRunner {
                     owner: target,
                     submitted_round: self.current_round,
                     max_entry_hops,
+                    max_role_route_hops,
                     ideal_role_sum_lower_bound_messages,
                     ideal_coalesced_lower_bound_messages,
                     delivered_block_messages: 0,
@@ -1330,6 +1410,7 @@ impl IntegratedRunner {
             );
             self.submitted_blocks += 1;
         }
+        self.outbound_messages.extend(local_outbound);
     }
 
     fn sample_additional_network_delay(&mut self) -> usize {
@@ -1517,6 +1598,12 @@ impl IntegratedRunner {
         let recent_rate = self.recent_average_commits();
         for recovery in &mut self.recovery_watches {
             if recovery.recovered_round.is_some() || self.current_round <= recovery.start_round {
+                continue;
+            }
+
+            // Require a full post-event window before calling the service recovered.
+            // Otherwise the moving average can still be dominated by pre-crash rounds.
+            if self.current_round < recovery.start_round + RECOVERY_WINDOW {
                 continue;
             }
 
@@ -2430,6 +2517,9 @@ impl IntegratedRunner {
                 ),
                 witness_coverage: DistributionSummary::from_samples(
                     &self.transaction_spread.witness_coverage,
+                ),
+                max_role_route_hops: DistributionSummary::from_samples(
+                    &self.transaction_spread.max_role_route_hops,
                 ),
                 ideal_role_sum_lower_bound_messages: DistributionSummary::from_samples(
                     &self.transaction_spread.ideal_role_sum_lower_bound_messages,

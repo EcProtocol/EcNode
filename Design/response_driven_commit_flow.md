@@ -9,7 +9,7 @@ It has two goals:
 
 This is not a formal proof. It is a design argument with explicit assumptions.
 
-Unless otherwise stated, the timing discussion below models the **current implementation**, not a future idealized reactive version.
+Unless otherwise stated, the timing discussion below models the **current implementation**, including the newer reactive first wave on block arrival.
 
 ## Scope
 
@@ -41,7 +41,8 @@ The closer description is:
 
 - the first wave plants the transaction into the token and witness neighborhoods
 - each receiving node records who is interested
-- once the block content and relevant local state are known, nodes answer back
+- once the block content is known, nodes immediately seed the first outward span toward the next closer peers
+- once relevant local state becomes terminal, nodes answer back
 - when local state changes from `Pending` to `Commit` or `Blocked`, nodes push that new state back to interested peers
 - periodic outward sweeps remain only as a repair mechanism for loss, delay, and churn
 
@@ -91,14 +92,14 @@ sequenceDiagram
     A->>B: round t+1: Vote
     B->>A: same round: QueryBlock
     A->>B: round t+3: Block
-    B->>B: same round tick: evaluate + schedule forward vote
+    B->>B: same round: validate + seed first outward wave
     B->>C: round t+4: Vote
 ```
 
 This is the important implementation reality:
 
 - receiving a vote and requesting the block is immediate
-- receiving the block and scheduling the next proactive wave can still happen in the same round
+- receiving the block and seeding the next proactive wave can happen in the same round
 - but the **next hop sees that forwarded vote one round later**
 
 So one inward routing step is not "1 tick". In the current implementation it is closer to a **4-round sender-to-next-receiver cycle**, or about **3 extra rounds after the first receiver sees the vote**.
@@ -132,6 +133,13 @@ The current polling pattern is:
 - sequence `2`: send to the third pair
 - sequence `3`: send to the fourth pair
 - sequence `4`: skip one round and reset to `0`
+
+When a node learns a block for the first time and can evaluate it, it does not wait for the next tick to start.
+It immediately emits the first span of that sweep:
+
+- first `4` targets if available, corresponding to sequence `0` and `1`
+- then it records the local sequence as `2`
+- later periodic polling continues at sequence `2`, `3`, skip, then restart at `0`
 
 So the steady conflict-free polling rule is:
 
@@ -175,7 +183,7 @@ The node must first request the block:
 4. receive `Block(block)`
 5. validate and store the block
 
-Only after step 5 can the node evaluate its own vote.
+Only after step 5 can the node evaluate its own vote and seed the first outward span.
 
 ### 4. Terminal fast reply only
 
@@ -186,12 +194,13 @@ The current rule is narrower:
 - if the block is `Commit`, reply immediately with all `1`s
 - if the block is `Blocked`, reply immediately with all `0`s
 - if the block is `Pending`, do not fast-reply
-- receiving the `Block` itself does not trigger a reply
+- receiving the `Block` itself does not trigger a terminal reply, but it does trigger the first outward seed wave
 
 This keeps the protocol simple:
 
 - votes register interest
-- terminal state changes satisfy that interest
+- block arrival starts routing progress
+- terminal state changes satisfy the registered interest
 
 ### 5. State-change pushes
 
@@ -245,7 +254,7 @@ If the origin is far away from the hosts, the first few hops act like proxies:
 
 - they record interest
 - they fetch the block
-- they forward toward nodes that are closer to the role address
+- they immediately forward toward nodes that are closer to the role address
 
 ### Phase B: saturate the host core
 
@@ -375,13 +384,13 @@ So the first inward wave is delayed by block acquisition.
 
 In a perfect network, that delay is still real even if no packets are lost.
 
-For the **current implementation**, forwarding remains tick-driven after block acquisition.
+For the **current implementation**, the first outward span is now emitted immediately after block acquisition.
 So the current `τ_seed` should be read as including:
 
 1. receive vote
 2. request block
 3. receive block
-4. forward on the next local proactive wave
+4. validate and emit the first outward seed wave immediately
 5. one more round for that forwarded vote to be observed downstream
 
 That is the more honest lower-bound timing model for the system as it exists now.
@@ -414,7 +423,7 @@ This is still better than the inward pre-host path, but it is not instantaneous.
 For the **current implementation** in a perfect network, the practical constants are:
 
 ```text
-τ_seed ≈ 4 rounds
+τ_seed ≈ 3 rounds
 τ_core ≈ 1 round
 τ_reflect ≈ 1 round
 ```
@@ -422,7 +431,7 @@ For the **current implementation** in a perfect network, the practical constants
 So the clean first-order timing model used below is:
 
 ```text
-T_i ≈ 5 * d_i + 1
+T_i ≈ 4 * d_i + 1
 ```
 
 where `d_i` is the number of inward routing steps before the host core is reached.
@@ -603,7 +612,7 @@ For the example tables below, assume:
 - effective side spread: `g = 2`
 - host core size: `h = 5`
 - current implementation timing:
-  - `τ_seed = 4`
+  - `τ_seed = 3`
   - `τ_core = 1`
   - `τ_reflect = 1`
 
@@ -613,7 +622,7 @@ So the working estimates are:
 d = ceil(Δ / s)
 S ≈ h + g * d
 M >= 4 * S - 2
-T >= 5d + 1
+T >= 4d + 1
 ```
 
 Here:
@@ -632,11 +641,11 @@ Under `s = 4`, the role depth bands look like this:
 
 | Entry distance `Δ` | Inward steps `d` | Tagged role-participants `S` | Role messages `M` | Role latency `T` |
 | --- | ---: | ---: | ---: | ---: |
-| `1..4` | `1` | `7` | `26` | `6` rounds |
-| `5..8` | `2` | `9` | `34` | `11` rounds |
-| `9..12` | `3` | `11` | `42` | `16` rounds |
-| `13..16` | `4` | `13` | `50` | `21` rounds |
-| `17..20` | `5` | `15` | `58` | `26` rounds |
+| `1..4` | `1` | `7` | `26` | `5` rounds |
+| `5..8` | `2` | `9` | `34` | `9` rounds |
+| `9..12` | `3` | `11` | `42` | `13` rounds |
+| `13..16` | `4` | `13` | `50` | `17` rounds |
+| `17..20` | `5` | `15` | `58` | `21` rounds |
 
 So with a healthy gradient, transactions that enter within roughly `8..12` rank steps of the true role center should reach it in about `2..3` inward steps.
 

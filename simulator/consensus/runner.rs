@@ -257,8 +257,12 @@ impl SimRunner {
             }
 
             let target = self.peers.choose(&mut self.rng).unwrap();
-            let node = self.nodes.get_mut(target).unwrap();
-            node.block(&new_block);
+            let mut local_messages = Vec::new();
+            {
+                let node = self.nodes.get_mut(target).unwrap();
+                node.submit_local_block(&new_block, &mut local_messages);
+            }
+            self.messages.extend(local_messages);
             self.blocks.insert(new_block.id, *target);
 
             x += used;

@@ -195,6 +195,29 @@ fn validate_with_parent(parent: &Block, block: &Block, i: usize) -> bool {
 }
 
 impl EcMemPool {
+    fn sorted_interested_voters(state: &PoolBlockState) -> Vec<PeerId> {
+        let mut voters: Vec<PeerId> = state
+            .votes
+            .iter()
+            .filter_map(|(peer_id, vote)| vote.reply.then_some(*peer_id))
+            .collect();
+        voters.sort_unstable();
+        voters
+    }
+
+    fn sorted_block_ids<F>(&self, mut predicate: F) -> Vec<BlockId>
+    where
+        F: FnMut(&PoolBlockState) -> bool,
+    {
+        let mut block_ids: Vec<BlockId> = self
+            .pool
+            .iter()
+            .filter_map(|(block_id, state)| predicate(state).then_some(*block_id))
+            .collect();
+        block_ids.sort_unstable();
+        block_ids
+    }
+
     pub fn new() -> Self {
         Self::with_vote_balance_threshold(VOTE_THRESHOLD)
     }
@@ -284,12 +307,12 @@ impl EcMemPool {
         let mut competing_by_block: HashMap<BlockId, BlockId> = HashMap::new();
         let mut transitions = Vec::new();
         let mut family_members: HashMap<(TokenId, BlockId), Vec<BlockId>> = HashMap::new();
+        let block_ids_with_blocks = self.sorted_block_ids(|state| state.block.is_some());
 
-        for (block_id, state) in self
-            .pool
-            .iter()
-            .filter(|(_, state)| state.block.is_some())
-        {
+        for block_id in &block_ids_with_blocks {
+            let Some(state) = self.pool.get(block_id) else {
+                continue;
+            };
             let Some(block) = state.block else {
                 continue;
             };
@@ -338,15 +361,16 @@ impl EcMemPool {
             }
         }
 
-        for (block_id, state) in self.pool.iter_mut() {
-            state.competing_block = competing_by_block.get(block_id).copied();
+        for block_id in self.sorted_block_ids(|_| true) {
+            if let Some(state) = self.pool.get_mut(&block_id) {
+                state.competing_block = competing_by_block.get(&block_id).copied();
+            }
         }
 
-        for (block_id, state) in self
-            .pool
-            .iter_mut()
-            .filter(|(_, state)| state.state == BlockState::Pending)
-        {
+        for block_id in self.sorted_block_ids(|state| state.state == BlockState::Pending) {
+            let Some(state) = self.pool.get_mut(&block_id) else {
+                continue;
+            };
             let Some(block) = state.block else {
                 continue;
             };
@@ -356,20 +380,16 @@ impl EcMemPool {
                     let key = (block.parts[i].token, block.parts[i].last);
                     highest_by_conflict.get(&key).copied()
                 })
-                .filter(|highest| *highest > *block_id)
+                .filter(|highest| *highest > block_id)
                 .max();
 
             if let Some(higher_block_id) = higher_conflict {
                 state.state = BlockState::Blocked;
                 state.updated = false;
                 transitions.push(BlockedConflictTransition {
-                    blocked_block_id: *block_id,
+                    blocked_block_id: block_id,
                     higher_block_id,
-                    interested_voters: state
-                        .votes
-                        .iter()
-                        .filter_map(|(peer_id, vote)| vote.reply.then_some(*peer_id))
-                        .collect(),
+                    interested_voters: Self::sorted_interested_voters(state),
                 });
             }
         }
@@ -396,8 +416,10 @@ impl EcMemPool {
     ) -> (Vec<BlockEvaluation>, Vec<MessageRequest>) {
         let mut evaluations = Vec::new();
         let mut messages = Vec::new();
-
-        for (block_id, block_state) in self.pool.iter().filter(|(_, state)| state.state == Pending) {
+        for block_id in self.sorted_block_ids(|state| state.state == Pending) {
+            let Some(block_state) = self.pool.get(&block_id) else {
+                continue;
+            };
             if let Some(block) = block_state.block {
                 let mut vote = 0;
                 let mut can_commit = true;
@@ -427,7 +449,7 @@ impl EcMemPool {
                             time,
                             id,
                             Event::Reorg {
-                                block_id: *block_id,
+                                block_id,
                                 peer: id,
                                 from: current_mapping,
                                 to: last_mapping,
@@ -439,7 +461,7 @@ impl EcMemPool {
                 // Only add blocks that can potentially commit this tick
                 if can_commit {
                     evaluations.push(BlockEvaluation {
-                        block_id: *block_id,
+                        block_id,
                         block,
                         vote_mask: vote,
                     });
@@ -449,6 +471,64 @@ impl EcMemPool {
         }
 
         (evaluations, messages)
+    }
+
+    pub(crate) fn evaluate_pending_block(
+        &self,
+        block_id: &BlockId,
+        tokens: &dyn EcTokensV2,
+        time: EcTime,
+        id: PeerId,
+        event_sink: &mut dyn EventSink,
+    ) -> (Option<BlockEvaluation>, Vec<MessageRequest>) {
+        let mut messages = Vec::new();
+        let Some(block_state) = self.pool.get(block_id).filter(|state| state.state == Pending) else {
+            return (None, messages);
+        };
+        let Some(block) = block_state.block else {
+            return (None, messages);
+        };
+
+        let mut vote = 0;
+        let mut can_commit = true;
+
+        for i in 0..block.used as usize {
+            let token_id = block.parts[i].token;
+            let last_mapping = block.parts[i].last;
+            let current_mapping = tokens.lookup_current(&token_id).map_or(0, |t| t.block);
+
+            if current_mapping == last_mapping {
+                vote |= 1 << i;
+            } else if current_mapping == 0 {
+                // We do not hold this token locally; the role must find a host.
+            } else {
+                can_commit = false;
+                messages.push(MessageRequest::MissingParent(last_mapping));
+                event_sink.log(
+                    time,
+                    id,
+                    Event::Reorg {
+                        block_id: *block_id,
+                        peer: id,
+                        from: current_mapping,
+                        to: last_mapping,
+                    },
+                );
+            }
+        }
+
+        if can_commit {
+            (
+                Some(BlockEvaluation {
+                    block_id: *block_id,
+                    block,
+                    vote_mask: vote,
+                }),
+                messages,
+            )
+        } else {
+            (None, messages)
+        }
     }
 
     pub(crate) fn status(&self, block: &BlockId, blocks: &dyn EcBlocks) -> Option<BlockState> {
@@ -488,13 +568,7 @@ impl EcMemPool {
     pub(crate) fn interested_voters(&self, block: &BlockId) -> Vec<PeerId> {
         self.pool
             .get(block)
-            .map(|state| {
-                state
-                    .votes
-                    .iter()
-                    .filter_map(|(peer_id, vote)| vote.reply.then_some(*peer_id))
-                    .collect()
-            })
+            .map(Self::sorted_interested_voters)
             .unwrap_or_default()
     }
 
@@ -560,6 +634,126 @@ impl EcMemPool {
             })
     }
 
+    fn refresh_pending_vote_state(
+        block_state: &mut PoolBlockState,
+        block: &Block,
+        peers: &EcPeers,
+        vote_balance_threshold: i64,
+    ) {
+        let previous_remaining = block_state.remaining;
+        let ranges: Vec<PeerRange> = (0..block.used as usize)
+            .map(|i| peers.peer_range(&block.parts[i].token))
+            .collect();
+        let mut balance = [0; TOKENS_PER_BLOCK];
+
+        let witness = peers.peer_range(&block.id);
+        let mut witness_balance = 0;
+
+        for (peer_id, peer_vote) in &block_state.votes {
+            for (i, range) in ranges.iter().enumerate() {
+                if range.in_range(peer_id) {
+                    balance[i] += if peer_vote.vote & 1 << i == 0 { -1 } else { 1 };
+                }
+            }
+            if witness.in_range(peer_id) {
+                witness_balance += 1;
+            }
+        }
+
+        block_state.remaining = if witness_balance <= vote_balance_threshold {
+            1 << TOKENS_PER_BLOCK
+        } else {
+            0
+        };
+
+        for i in 0..ranges.len() {
+            if balance[i] > vote_balance_threshold {
+                continue;
+            }
+
+            block_state.remaining |= 1 << i;
+
+            if balance[i] < -vote_balance_threshold {
+                block_state.vote_sequence[i] = PAUSED_VOTE_SEQUENCE;
+            } else if block_state.vote_sequence[i] == PAUSED_VOTE_SEQUENCE {
+                block_state.vote_sequence[i] = 0;
+            }
+        }
+
+        for bit in 0..=TOKENS_PER_BLOCK {
+            let bit_mask = 1 << bit;
+            if (block_state.remaining & bit_mask) == 0 {
+                block_state.vote_sequence[bit] = 0;
+            } else if (previous_remaining & bit_mask) == 0 {
+                if block_state.vote_sequence[bit] != PAUSED_VOTE_SEQUENCE {
+                    block_state.vote_sequence[bit] = 0;
+                }
+            }
+        }
+
+        block_state.updated = false;
+    }
+
+    pub(crate) fn seed_reactive_vote_requests(
+        &mut self,
+        peers: &EcPeers,
+        evaluation: &BlockEvaluation,
+        initial_sequence_span: u8,
+    ) -> Vec<TokenId> {
+        if initial_sequence_span == 0 {
+            return Vec::new();
+        }
+
+        let Some(block_state) = self.pool.get_mut(&evaluation.block_id) else {
+            return Vec::new();
+        };
+        if block_state.state != BlockState::Pending {
+            return Vec::new();
+        }
+
+        if block_state.updated {
+            Self::refresh_pending_vote_state(
+                block_state,
+                &evaluation.block,
+                peers,
+                self.vote_balance_threshold,
+            );
+        }
+
+        let seed_sequence = initial_sequence_span.min(self.vote_request_active_rounds);
+        if seed_sequence == 0 {
+            return Vec::new();
+        }
+
+        let mut targets = Vec::new();
+
+        for i in 0..evaluation.block.used as usize {
+            let bit_mask = 1 << i;
+            if (block_state.remaining & bit_mask) == 0 {
+                block_state.vote_sequence[i] = 0;
+                continue;
+            }
+            if block_state.vote_sequence[i] == PAUSED_VOTE_SEQUENCE || block_state.vote_sequence[i] != 0 {
+                continue;
+            }
+
+            block_state.vote_sequence[i] = seed_sequence;
+            targets.push(evaluation.block.parts[i].token);
+        }
+
+        let witness_idx = TOKENS_PER_BLOCK;
+        let witness_mask = 1 << witness_idx;
+        if (block_state.remaining & witness_mask) != 0
+            && block_state.vote_sequence[witness_idx] != PAUSED_VOTE_SEQUENCE
+            && block_state.vote_sequence[witness_idx] == 0
+        {
+            block_state.vote_sequence[witness_idx] = seed_sequence;
+            targets.push(evaluation.block_id);
+        }
+
+        targets
+    }
+
     /// Process evaluated blocks for voting and committing
     ///
     /// This phase only receives blocks that passed reorg checks.
@@ -584,59 +778,12 @@ impl EcMemPool {
             let block = &evaluation.block;
             // Check for Commit if updated
             if block_state.updated {
-                let previous_remaining = block_state.remaining;
-                let ranges: Vec<PeerRange> = (0..block.used as usize)
-                    .map(|i| peers.peer_range(&block.parts[i].token))
-                    .collect();
-                let mut balance = [0; TOKENS_PER_BLOCK];
-
-                let witness = peers.peer_range(&block_id);
-                let mut witness_balance = 0;
-
-                // Test all votes for range and sum up
-                for (peer_id, peer_vote) in &block_state.votes {
-                    for (i, range) in ranges.iter().enumerate() {
-                        if range.in_range(&peer_id) {
-                            balance[i] += if peer_vote.vote & 1 << i == 0 { -1 } else { 1 };
-                        }
-                    }
-                    if witness.in_range(&peer_id) {
-                        witness_balance += 1;
-                    }
-                }
-
-                block_state.remaining = if witness_balance <= self.vote_balance_threshold {
-                    1 << TOKENS_PER_BLOCK
-                } else {
-                    0
-                };
-
-                for i in 0..ranges.len() {
-                    if balance[i] > self.vote_balance_threshold {
-                        continue;
-                    }
-
-                    block_state.remaining |= 1 << i;
-
-                    if balance[i] < -self.vote_balance_threshold {
-                        block_state.vote_sequence[i] = PAUSED_VOTE_SEQUENCE;
-                    } else if block_state.vote_sequence[i] == PAUSED_VOTE_SEQUENCE {
-                        block_state.vote_sequence[i] = 0;
-                    }
-                }
-
-                for bit in 0..=TOKENS_PER_BLOCK {
-                    let bit_mask = 1 << bit;
-                    if (block_state.remaining & bit_mask) == 0 {
-                        block_state.vote_sequence[bit] = 0;
-                    } else if (previous_remaining & bit_mask) == 0 {
-                        if block_state.vote_sequence[bit] != PAUSED_VOTE_SEQUENCE {
-                            block_state.vote_sequence[bit] = 0;
-                        }
-                    }
-                }
-
-                block_state.updated = false;
+                Self::refresh_pending_vote_state(
+                    block_state,
+                    block,
+                    peers,
+                    self.vote_balance_threshold,
+                );
             }
 
             // Check if ready to commit (all votes collected and validated)
@@ -644,11 +791,7 @@ impl EcMemPool {
                 commits.push(CommitTransition {
                     committed_block_id: block_id,
                     competing_block_id: block_state.competing_block,
-                    interested_voters: block_state
-                        .votes
-                        .iter()
-                        .filter_map(|(peer_id, vote)| vote.reply.then_some(*peer_id))
-                        .collect(),
+                    interested_voters: Self::sorted_interested_voters(block_state),
                 });
                 // COMMIT!
                 batch.save_block(block);
@@ -1168,6 +1311,67 @@ mod tests {
         assert_eq!(seen[2], vec![2]);
         assert!(seen[3].is_empty(), "fourth tick should skip before restarting");
         assert_eq!(seen[4], vec![0]);
+    }
+
+    #[test]
+    fn reactive_seed_advances_sequence_to_next_unsent_pair() {
+        let block = Block {
+            id: 401,
+            time: 10,
+            used: 1,
+            parts: [TokenBlock {
+                token: 42,
+                last: 7,
+                key: 1,
+            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            signatures: [None; TOKENS_PER_BLOCK],
+        };
+
+        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4);
+        assert!(mem_pool.block(&block, 10));
+
+        let evaluation = BlockEvaluation {
+            block_id: block.id,
+            block: block.clone(),
+            vote_mask: 0b0000_0001,
+        };
+        let peers = EcPeers::with_config_and_rng(
+            55,
+            crate::ec_peers::PeerManagerConfig::default(),
+            rand::rngs::StdRng::from_seed([38u8; 32]),
+        );
+
+        let reactive_targets = mem_pool.seed_reactive_vote_requests(&peers, &evaluation, 2);
+        assert_eq!(reactive_targets, vec![42, block.id]);
+
+        let mut batch = TestBatch::default();
+        let mut sink = NoOpSink;
+        let (messages, _) = mem_pool.tick_with_evaluations(
+            &peers,
+            11,
+            55,
+            &mut sink,
+            std::slice::from_ref(&evaluation),
+            &mut batch,
+        );
+
+        let token_sequences: Vec<u8> = messages
+            .iter()
+            .filter_map(|message| match message {
+                MessageRequest::Vote(block_id, token_id, _, true, sequence)
+                    if *block_id == block.id && *token_id == 42 =>
+                {
+                    Some(*sequence)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            token_sequences,
+            vec![2],
+            "after the reactive seed consumes the first two pairs, periodic polling should continue at sequence 2",
+        );
     }
 
     impl MockEcBlocks {

@@ -248,7 +248,7 @@ This is the important distinction.
 From [response_driven_commit_flow.md](./response_driven_commit_flow.md), the current conflict-free timing model for one role is approximately:
 
 ```text
-T_role,current ~= 5d + 1 rounds
+T_role,current ~= 4d + 1 rounds
 ```
 
 where `d` is the inward depth to the host core.
@@ -257,9 +257,9 @@ Using the depth estimates above:
 
 | Network size | Approx role rounds | At `25 ms/round` | At `50 ms/round` |
 | --- | ---: | ---: | ---: |
-| `1,000` | `~26` | `~0.65s` | `~1.3s` |
-| `10,000` | `~41-46` | `~1.0-1.15s` | `~2.0-2.3s` |
-| `1,000,000` | `~76-81` | `~1.9-2.0s` | `~3.8-4.0s` |
+| `1,000` | `~21` | `~0.53s` | `~1.05s` |
+| `10,000` | `~33-37` | `~0.83-0.93s` | `~1.65-1.85s` |
+| `1,000,000` | `~61-65` | `~1.53-1.63s` | `~3.05-3.25s` |
 
 That is still within a range that looks plausible for an open global network.
 
@@ -272,7 +272,7 @@ The current timing model is deliberately honest to the implementation:
 - receive `Vote`
 - `QueryBlock`
 - receive `Block`
-- wait for tick-driven forwarding
+- emit the first outward seed wave immediately
 - next hop sees the forwarded `Vote`
 
 That is why one inward routing step currently costs several rounds rather than one transport delay.
@@ -287,13 +287,13 @@ Rough per-step picture:
 Vote arrives
 -> QueryBlock immediately
 -> Block returns
--> next outward vote wave waits on tick / outbox cycle
+-> first outward vote wave emits immediately
 ```
 
-This is roughly why:
+This is roughly why the current protocol has already improved to:
 
 ```text
-T_role,current ~= 5d + 1
+T_role,current ~= 4d + 1
 ```
 
 ### More reactive model: what changes
@@ -301,7 +301,8 @@ T_role,current ~= 5d + 1
 The protocol becomes more reactive if one or more of these happen:
 
 1. **Forward immediately after block arrival**
-   - once a proxy has the block and knows the next targets, it does not wait for the next normal sweep tick
+   - this is now done for the first outward seed span
+   - a fuller reactive design would extend the same principle deeper into later progress and terminal evaluation
 
 2. **Push terminal state immediately**
    - `Pending -> Commit` or `Pending -> Blocked` sends replies immediately rather than waiting for the next round boundary
@@ -322,7 +323,7 @@ The protocol becomes more reactive if one or more of these happen:
 
 ### Latency effect of a more reactive model
 
-If the next forwarding step can be triggered on block arrival rather than waiting for the periodic poll cycle, the inward step cost can shrink.
+If more of the later progress can move off the periodic poll cycle, the inward step cost can shrink further.
 
 A reasonable target model would be closer to:
 
