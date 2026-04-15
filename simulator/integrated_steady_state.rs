@@ -68,9 +68,15 @@ fn main() {
     let topology = env_string("EC_STEADY_STATE_TOPOLOGY", "ring");
     let ring_neighbors = env_usize("EC_STEADY_STATE_RING_NEIGHBORS", 8);
     let ring_tail_peers_per_side = env_usize("EC_STEADY_STATE_RING_TAIL_PEERS_PER_SIDE", 4);
+    let ring_linear_center_prob = env_f64("EC_STEADY_STATE_LINEAR_CENTER_PROB", 1.0);
+    let ring_linear_far_prob = env_f64("EC_STEADY_STATE_LINEAR_FAR_PROB", 0.2);
+    let ring_linear_guaranteed_neighbors =
+        env_usize("EC_STEADY_STATE_LINEAR_GUARANTEED_NEIGHBORS", 0);
     let neighborhood_width = env_usize("EC_STEADY_STATE_NEIGHBORHOOD_WIDTH", 6);
     let vote_target_count = env_usize("EC_STEADY_STATE_VOTE_TARGETS", 2);
     let vote_active_rounds = env_usize("EC_STEADY_STATE_VOTE_ACTIVE_ROUNDS", 4)
+        .min(u8::MAX as usize) as u8;
+    let vote_pairs_per_tick = env_usize("EC_STEADY_STATE_VOTE_PAIRS_PER_TICK", 1)
         .min(u8::MAX as usize) as u8;
     let adaptive_far_width = env_usize("EC_STEADY_STATE_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_STEADY_STATE_ADAPTIVE_HOP_THRESHOLD", 0);
@@ -114,11 +120,19 @@ fn main() {
         );
     } else if topology == "ring_probabilistic" {
         println!("Ring topology: pairwise probabilistic closeness on the 64-bit ring");
+    } else if topology == "ring_linear_probability" {
+        println!(
+            "Ring topology: full-ring linear probability, center {:.2}, far {:.2}, guaranteed ±{}",
+            ring_linear_center_prob,
+            ring_linear_far_prob,
+            ring_linear_guaranteed_neighbors
+        );
     }
     println!("Neighborhood width: {}", neighborhood_width);
     println!("Vote targets per request: {}", vote_target_count);
     println!(
-        "Vote request pattern: deterministic outward pairs, {} rounds on / 1 round skip",
+        "Vote request pattern: deterministic outward pairs, {} pair slots/tick, {} active slots with one pause between each",
+        vote_pairs_per_tick,
         vote_active_rounds
     );
     println!("Vote balance threshold: {}", vote_balance_threshold);
@@ -167,6 +181,11 @@ fn main() {
                 connected_fraction: 1.0,
             },
             "ring_probabilistic" => TopologyMode::RingProbabilistic,
+            "ring_linear_probability" => TopologyMode::RingLinearProbability {
+                center_prob: ring_linear_center_prob,
+                far_prob: ring_linear_far_prob,
+                guaranteed_neighbors: ring_linear_guaranteed_neighbors,
+            },
             "ring_core_tail" => TopologyMode::RingCoreTail {
                 neighbors: ring_neighbors,
                 tail_peers_per_side: ring_tail_peers_per_side,
@@ -187,6 +206,7 @@ fn main() {
     config.peer_config.neighborhood_width = neighborhood_width;
     config.peer_config.vote_target_count = vote_target_count;
     config.peer_config.vote_request_active_rounds = vote_active_rounds;
+    config.peer_config.vote_request_pairs_per_tick = vote_pairs_per_tick;
     config.peer_config.vote_balance_threshold = vote_balance_threshold;
     config.peer_config.elections_per_tick = elections_per_tick;
     config.peer_config.prune_protection_time = prune_protection_time;

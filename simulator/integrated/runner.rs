@@ -26,7 +26,7 @@ use crate::peer_lifecycle::{
 };
 use crate::peer_lifecycle::stats::calculate_gradient_steepness;
 use crate::peer_lifecycle::topology::{
-    build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
     build_ring_gradient_topology,
 };
 use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
@@ -506,6 +506,17 @@ impl IntegratedRunner {
                 &sorted_peer_ids,
                 &mut self.rng,
             )),
+            TopologyMode::RingLinearProbability {
+                center_prob,
+                far_prob,
+                guaranteed_neighbors,
+            } => Some(build_linear_probability_ring_topology(
+                &sorted_peer_ids,
+                *center_prob,
+                *far_prob,
+                *guaranteed_neighbors,
+                &mut self.rng,
+            )),
             _ => None,
         };
 
@@ -528,7 +539,8 @@ impl IntegratedRunner {
                 }
                 TopologyMode::Ring { .. }
                 | TopologyMode::RingCoreTail { .. }
-                | TopologyMode::RingProbabilistic => ring_adjacency
+                | TopologyMode::RingProbabilistic
+                | TopologyMode::RingLinearProbability { .. } => ring_adjacency
                     .as_ref()
                     .and_then(|adjacency| adjacency.get(&peer_id))
                     .cloned()

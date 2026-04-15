@@ -24,6 +24,52 @@ pub enum MessageRequest {
 
 const PAUSED_VOTE_SEQUENCE: u8 = u8::MAX;
 
+fn vote_schedule_cycle_len(active_ticks: u8) -> u8 {
+    active_ticks.saturating_mul(2).max(1)
+}
+
+fn vote_schedule_pair_start_for_state(
+    state: u8,
+    active_ticks: u8,
+    pairs_per_tick: u8,
+) -> Option<u8> {
+    if active_ticks == 0 || pairs_per_tick == 0 {
+        return None;
+    }
+
+    let cycle_len = vote_schedule_cycle_len(active_ticks);
+    let normalized = state % cycle_len;
+    if normalized % 2 == 0 {
+        Some((normalized / 2).saturating_mul(pairs_per_tick))
+    } else {
+        None
+    }
+}
+
+fn vote_schedule_next_state(state: u8, active_ticks: u8) -> u8 {
+    if active_ticks == 0 {
+        return 0;
+    }
+
+    let cycle_len = vote_schedule_cycle_len(active_ticks);
+    (state + 1) % cycle_len
+}
+
+fn vote_schedule_state_after_reactive_seed(
+    seed_pairs_sent: u8,
+    active_ticks: u8,
+    pairs_per_tick: u8,
+) -> u8 {
+    if active_ticks == 0 || pairs_per_tick == 0 {
+        return 0;
+    }
+
+    let cycle_len = vote_schedule_cycle_len(active_ticks);
+    let active_slots_consumed = seed_pairs_sent.div_ceil(pairs_per_tick).max(1);
+    let next_pause = active_slots_consumed.saturating_mul(2).saturating_sub(1);
+    next_pause % cycle_len
+}
+
 impl MessageRequest {
     pub fn sort_key(&self) -> (TokenId, Reverse<BlockId>, Reverse<bool>) {
         match self {
@@ -149,6 +195,7 @@ pub struct EcMemPool {
     pool: HashMap<BlockId, PoolBlockState>,
     vote_balance_threshold: i64,
     vote_request_active_rounds: u8,
+    vote_request_pairs_per_tick: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -223,18 +270,20 @@ impl EcMemPool {
     }
 
     pub fn with_vote_balance_threshold(vote_balance_threshold: i64) -> Self {
-        Self::with_vote_policy(vote_balance_threshold, 0, 4)
+        Self::with_vote_policy(vote_balance_threshold, 0, 4, 1)
     }
 
     pub fn with_vote_policy(
         vote_balance_threshold: i64,
         _vote_request_resend_cooldown: EcTime,
         vote_request_active_rounds: u8,
+        vote_request_pairs_per_tick: u8,
     ) -> Self {
         Self {
             pool: HashMap::new(),
             vote_balance_threshold,
             vote_request_active_rounds: vote_request_active_rounds.max(1),
+            vote_request_pairs_per_tick: vote_request_pairs_per_tick.max(1),
         }
     }
 
@@ -720,8 +769,8 @@ impl EcMemPool {
             );
         }
 
-        let seed_sequence = initial_sequence_span.min(self.vote_request_active_rounds);
-        if seed_sequence == 0 {
+        let seed_pairs_sent = initial_sequence_span.min(self.vote_request_active_rounds.max(1));
+        if seed_pairs_sent == 0 {
             return Vec::new();
         }
 
@@ -737,7 +786,12 @@ impl EcMemPool {
                 continue;
             }
 
-            block_state.vote_sequence[i] = seed_sequence;
+            block_state.vote_sequence[i] =
+                vote_schedule_state_after_reactive_seed(
+                    seed_pairs_sent,
+                    self.vote_request_active_rounds,
+                    self.vote_request_pairs_per_tick,
+                );
             targets.push(evaluation.block.parts[i].token);
         }
 
@@ -747,7 +801,12 @@ impl EcMemPool {
             && block_state.vote_sequence[witness_idx] != PAUSED_VOTE_SEQUENCE
             && block_state.vote_sequence[witness_idx] == 0
         {
-            block_state.vote_sequence[witness_idx] = seed_sequence;
+            block_state.vote_sequence[witness_idx] =
+                vote_schedule_state_after_reactive_seed(
+                    seed_pairs_sent,
+                    self.vote_request_active_rounds,
+                    self.vote_request_pairs_per_tick,
+                );
             targets.push(evaluation.block_id);
         }
 
@@ -826,42 +885,61 @@ impl EcMemPool {
                 }
 
                 if (block_state.remaining & 1 << i) != 0 {
-                    let sequence = block_state.vote_sequence[i];
-                    if sequence == PAUSED_VOTE_SEQUENCE {
+                    let state = block_state.vote_sequence[i];
+                    if state == PAUSED_VOTE_SEQUENCE {
                         continue;
                     }
-                    if sequence >= self.vote_request_active_rounds {
-                        block_state.vote_sequence[i] = 0;
+                    let next_state = vote_schedule_next_state(state, self.vote_request_active_rounds);
+                    let Some(sequence_start) = vote_schedule_pair_start_for_state(
+                        state,
+                        self.vote_request_active_rounds,
+                        self.vote_request_pairs_per_tick,
+                    )
+                    else {
+                        block_state.vote_sequence[i] = next_state;
                         continue;
+                    };
+                    block_state.vote_sequence[i] = next_state;
+                    for offset in 0..self.vote_request_pairs_per_tick {
+                        // Request vote using pre-calculated vote_mask
+                        messages.push(MessageRequest::Vote(
+                            block_id,
+                            block.parts[i].token,
+                            evaluation.vote_mask,
+                            evaluation.vote_mask & 1 << i != 0,
+                            sequence_start + offset,
+                        ));
                     }
-                    block_state.vote_sequence[i] = sequence + 1;
-                    // Request vote using pre-calculated vote_mask
-                    messages.push(MessageRequest::Vote(
-                        block_id,
-                        block.parts[i].token,
-                        evaluation.vote_mask,
-                        evaluation.vote_mask & 1 << i != 0,
-                        sequence,
-                    ));
                 }
             }
 
             // Vote witness
             if (block_state.remaining & 1 << TOKENS_PER_BLOCK) != 0 {
                 let witness_idx = TOKENS_PER_BLOCK;
-                let sequence = block_state.vote_sequence[witness_idx];
-                if sequence >= self.vote_request_active_rounds {
-                    block_state.vote_sequence[witness_idx] = 0;
+                let state = block_state.vote_sequence[witness_idx];
+                if state == PAUSED_VOTE_SEQUENCE {
                     continue;
                 }
-                block_state.vote_sequence[witness_idx] = sequence + 1;
-                messages.push(MessageRequest::Vote(
-                    block_id,
-                    block_id,
-                    evaluation.vote_mask,
-                    false,
-                    sequence,
-                ));
+                let next_state = vote_schedule_next_state(state, self.vote_request_active_rounds);
+                let Some(sequence_start) = vote_schedule_pair_start_for_state(
+                    state,
+                    self.vote_request_active_rounds,
+                    self.vote_request_pairs_per_tick,
+                )
+                else {
+                    block_state.vote_sequence[witness_idx] = next_state;
+                    continue;
+                };
+                block_state.vote_sequence[witness_idx] = next_state;
+                for offset in 0..self.vote_request_pairs_per_tick {
+                    messages.push(MessageRequest::Vote(
+                        block_id,
+                        block_id,
+                        evaluation.vote_mask,
+                        false,
+                        sequence_start + offset,
+                    ));
+                }
             }
         }
 
@@ -1120,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn vote_sequence_cycles_four_steps_then_resets() {
+    fn vote_sequence_interleaves_pauses_between_four_steps() {
         let block = Block {
             id: 200,
             time: 10,
@@ -1133,7 +1211,7 @@ mod tests {
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
-        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4);
+        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4, 1);
         assert!(mem_pool.block(&block, 10));
 
         let evaluation = BlockEvaluation {
@@ -1150,7 +1228,7 @@ mod tests {
         let mut sink = NoOpSink;
 
         let mut seen = Vec::new();
-        for time in 10..16 {
+        for time in 10..19 {
             let (messages, _) = mem_pool.tick_with_evaluations(
                 &peers,
                 time,
@@ -1174,11 +1252,14 @@ mod tests {
         }
 
         assert_eq!(seen[0], vec![0]);
-        assert_eq!(seen[1], vec![1]);
-        assert_eq!(seen[2], vec![2]);
-        assert_eq!(seen[3], vec![3]);
-        assert!(seen[4].is_empty(), "fifth tick should skip before restarting");
-        assert_eq!(seen[5], vec![0]);
+        assert!(seen[1].is_empty(), "second tick should pause");
+        assert_eq!(seen[2], vec![1]);
+        assert!(seen[3].is_empty(), "fourth tick should pause");
+        assert_eq!(seen[4], vec![2]);
+        assert!(seen[5].is_empty(), "sixth tick should pause");
+        assert_eq!(seen[6], vec![3]);
+        assert!(seen[7].is_empty(), "eighth tick should pause before restarting");
+        assert_eq!(seen[8], vec![0]);
     }
 
     #[test]
@@ -1195,7 +1276,7 @@ mod tests {
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
-        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4);
+        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4, 1);
         assert!(mem_pool.block(&block, 10));
 
         for peer_id in [11, 12, 13] {
@@ -1253,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn vote_sequence_can_use_three_active_rounds_then_skip() {
+    fn vote_sequence_can_use_three_active_rounds_with_interleaved_pauses() {
         let block = Block {
             id: 301,
             time: 10,
@@ -1266,7 +1347,7 @@ mod tests {
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
-        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 3);
+        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 3, 1);
         assert!(mem_pool.block(&block, 10));
 
         let evaluation = BlockEvaluation {
@@ -1283,7 +1364,7 @@ mod tests {
         let mut sink = NoOpSink;
 
         let mut seen = Vec::new();
-        for time in 10..15 {
+        for time in 10..17 {
             let (messages, _) = mem_pool.tick_with_evaluations(
                 &peers,
                 time,
@@ -1307,14 +1388,16 @@ mod tests {
         }
 
         assert_eq!(seen[0], vec![0]);
-        assert_eq!(seen[1], vec![1]);
-        assert_eq!(seen[2], vec![2]);
-        assert!(seen[3].is_empty(), "fourth tick should skip before restarting");
-        assert_eq!(seen[4], vec![0]);
+        assert!(seen[1].is_empty(), "second tick should pause");
+        assert_eq!(seen[2], vec![1]);
+        assert!(seen[3].is_empty(), "fourth tick should pause");
+        assert_eq!(seen[4], vec![2]);
+        assert!(seen[5].is_empty(), "sixth tick should pause before restarting");
+        assert_eq!(seen[6], vec![0]);
     }
 
     #[test]
-    fn reactive_seed_advances_sequence_to_next_unsent_pair() {
+    fn reactive_seed_pauses_then_advances_to_next_unsent_pair() {
         let block = Block {
             id: 401,
             time: 10,
@@ -1327,7 +1410,7 @@ mod tests {
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
-        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4);
+        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4, 1);
         assert!(mem_pool.block(&block, 10));
 
         let evaluation = BlockEvaluation {
@@ -1367,10 +1450,36 @@ mod tests {
             })
             .collect();
 
+        assert!(
+            token_sequences.is_empty(),
+            "after the reactive seed consumes the first two pairs, the next periodic tick should pause",
+        );
+
+        let (messages_after_pause, _) = mem_pool.tick_with_evaluations(
+            &peers,
+            12,
+            55,
+            &mut sink,
+            std::slice::from_ref(&evaluation),
+            &mut batch,
+        );
+
+        let token_sequences_after_pause: Vec<u8> = messages_after_pause
+            .iter()
+            .filter_map(|message| match message {
+                MessageRequest::Vote(block_id, token_id, _, true, sequence)
+                    if *block_id == block.id && *token_id == 42 =>
+                {
+                    Some(*sequence)
+                }
+                _ => None,
+            })
+            .collect();
+
         assert_eq!(
-            token_sequences,
+            token_sequences_after_pause,
             vec![2],
-            "after the reactive seed consumes the first two pairs, periodic polling should continue at sequence 2",
+            "after the inserted pause, periodic polling should continue at the next unsent pair",
         );
     }
 

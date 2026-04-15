@@ -183,6 +183,28 @@ pub fn build_probabilistic_ring_gradient_topology(
     peer_ids: &[PeerId],
     rng: &mut StdRng,
 ) -> HashMap<PeerId, Vec<PeerId>> {
+    build_linear_probability_ring_topology(peer_ids, 1.0, 0.0, 0, rng)
+}
+
+/// Build a symmetric full-ring linear-probability connectivity graph.
+///
+/// The model is:
+/// - peers are ordered by ring position (sorted peer ids)
+/// - optional `guaranteed_neighbors` on each side are always connected
+/// - beyond that core, every pair is considered once
+/// - connection probability falls linearly from `center_prob` at distance 0
+///   to `far_prob` at the far side of the ring
+///
+/// This expresses a dense "high core" probabilistic family directly. It is
+/// useful for comparing how broad, dense linear slope profiles behave in the
+/// steady-state harness.
+pub fn build_linear_probability_ring_topology(
+    peer_ids: &[PeerId],
+    center_prob: f64,
+    far_prob: f64,
+    guaranteed_neighbors: usize,
+    rng: &mut StdRng,
+) -> HashMap<PeerId, Vec<PeerId>> {
     let mut sorted_peer_ids = peer_ids.to_vec();
     sorted_peer_ids.sort_unstable();
 
@@ -199,14 +221,31 @@ pub fn build_probabilistic_ring_gradient_topology(
             .collect();
     }
 
-    let max_distance = u64::MAX as f64 / 2.0;
+    let center_prob = center_prob.clamp(0.0, 1.0);
+    let far_prob = far_prob.clamp(0.0, center_prob);
+    let max_step = sorted_peer_ids.len() / 2;
+    let guaranteed_steps = guaranteed_neighbors.min(max_step.max(1));
 
     for i in 0..sorted_peer_ids.len() {
         for j in (i + 1)..sorted_peer_ids.len() {
-            let distance = ring_distance(sorted_peer_ids[i], sorted_peer_ids[j]) as f64;
-            let closeness = (1.0 - (distance / max_distance)).clamp(0.0, 1.0);
+            let clockwise_steps = j - i;
+            let counter_clockwise_steps = sorted_peer_ids.len() - clockwise_steps;
+            let rank_distance = clockwise_steps.min(counter_clockwise_steps);
 
-            if rng.gen_bool(closeness) {
+            let connect = if rank_distance <= guaranteed_steps {
+                true
+            } else {
+                let distance_fraction = if max_step == 0 {
+                    0.0
+                } else {
+                    (rank_distance as f64 / max_step as f64).clamp(0.0, 1.0)
+                };
+                let probability =
+                    (center_prob + ((far_prob - center_prob) * distance_fraction)).clamp(0.0, 1.0);
+                rng.gen_bool(probability)
+            };
+
+            if connect {
                 adjacency
                     .get_mut(&sorted_peer_ids[i])
                     .expect("peer should exist")
@@ -223,11 +262,6 @@ pub fn build_probabilistic_ring_gradient_topology(
         .into_iter()
         .map(|(peer_id, peers)| (peer_id, peers.into_iter().collect()))
         .collect()
-}
-
-fn ring_distance(a: PeerId, b: PeerId) -> u64 {
-    let diff = a.abs_diff(b);
-    diff.min(u64::MAX - diff + 1)
 }
 
 fn evenly_spaced_tail_offsets(
@@ -258,7 +292,8 @@ mod tests {
     use rand::SeedableRng;
 
     use super::{
-        build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+        build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
+        build_ring_core_tail_topology,
         build_ring_gradient_topology,
     };
 
@@ -300,6 +335,38 @@ mod tests {
         let peer_ids: Vec<u64> = (0..16).map(|n| n as u64 * 10).collect();
         let mut rng = rand::rngs::StdRng::seed_from_u64(11);
         let adjacency = build_probabilistic_ring_gradient_topology(&peer_ids, &mut rng);
+
+        for (peer_id, peers) in &adjacency {
+            for other_id in peers {
+                assert!(
+                    adjacency
+                        .get(other_id)
+                        .expect("other peer should exist")
+                        .contains(peer_id),
+                    "adjacency should be symmetric for {peer_id} <-> {other_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linear_probability_ring_topology_keeps_guaranteed_neighbors_and_is_symmetric() {
+        let peer_ids: Vec<u64> = (0..16).map(|n| n as u64 * 10).collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(23);
+        let adjacency = build_linear_probability_ring_topology(&peer_ids, 1.0, 0.2, 2, &mut rng);
+
+        for (idx, peer_id) in peer_ids.iter().enumerate() {
+            let peers = adjacency.get(peer_id).expect("peer should exist");
+            let forward_1 = peer_ids[(idx + 1) % peer_ids.len()];
+            let forward_2 = peer_ids[(idx + 2) % peer_ids.len()];
+            let backward_1 = peer_ids[(idx + peer_ids.len() - 1) % peer_ids.len()];
+            let backward_2 = peer_ids[(idx + peer_ids.len() - 2) % peer_ids.len()];
+
+            assert!(peers.contains(&forward_1));
+            assert!(peers.contains(&forward_2));
+            assert!(peers.contains(&backward_1));
+            assert!(peers.contains(&backward_2));
+        }
 
         for (peer_id, peers) in &adjacency {
             for other_id in peers {

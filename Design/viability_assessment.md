@@ -7,7 +7,7 @@ This note steps back from individual protocol experiments and asks a broader que
 The answer is not "ready" and it is not "speculative". It is somewhere in between:
 
 - the core design now looks plausible
-- the steady-state path looks genuinely promising
+- the fixed-network steady-state path now looks genuinely strong
 - the open-network lifecycle path still has material work left
 
 This note is meant to keep that assessment grounded in current evidence rather than intuition.
@@ -18,8 +18,10 @@ This note draws mainly on:
 
 - [response_driven_commit_flow.md](./response_driven_commit_flow.md)
 - [vote_flow_and_batching.md](./vote_flow_and_batching.md)
+- [routing_depth_scaling.md](./routing_depth_scaling.md)
 - [INTEGRATED_SIMULATION.md](../simulator/INTEGRATED_SIMULATION.md)
 - [STEADY_STATE_REPORT.md](../simulator/STEADY_STATE_REPORT.md)
+- [DENSE_LINEAR_TOPOLOGY_REPORT.md](../simulator/DENSE_LINEAR_TOPOLOGY_REPORT.md)
 - [CHURN_GRAPH_CONTROL_REPORT.md](../simulator/CHURN_GRAPH_CONTROL_REPORT.md)
 - [ADVERSARIAL_CONFLICT_REPORT.md](../simulator/ADVERSARIAL_CONFLICT_REPORT.md)
 
@@ -81,24 +83,55 @@ The simulator work so far gives evidence for some parts of that thesis, and clea
 
 ### 1. Formed steady-state can already be fast
 
-The strongest evidence so far is still the fixed formed-network benchmark in [STEADY_STATE_REPORT.md](../simulator/STEADY_STATE_REPORT.md).
+The strongest evidence now comes from the fixed formed-network dense-linear branch in
+[DENSE_LINEAR_TOPOLOGY_REPORT.md](../simulator/DENSE_LINEAR_TOPOLOGY_REPORT.md).
 
 Representative result:
 
-- `192` peers, fixed connected graph
+- `1024` peers, fixed connected graph
 - `cross_dc_normal`
+- dense linear topology
+- `InitialVote` on the first reactive wave
+- `far_prob = 0.4`
 - commit latency about:
-  - p50 `13` rounds
-  - p95 `16` rounds
+  - p50 `6` rounds
+  - p95 `8` rounds
 
 At rough wall-clock mappings:
 
-- `25 ms/round` -> about `0.33s` p50, `0.40s` p95
-- `50 ms/round` -> about `0.65s` p50, `0.80s` p95
+- `25 ms/round` -> about `0.15s` p50, `0.20s` p95
+- `50 ms/round` -> about `0.30s` p50, `0.40s` p95
 
-That matters because it says the base transaction path is not fundamentally too slow.
+That matters because it says the base transaction path is not fundamentally too slow,
+and that the more reactive first wave was worth doing.
 
-### 2. The integrated lifecycle path stays live under churn
+This is a noticeably stronger steady-state claim than the project could make
+earlier.
+
+### 2. Fixed-network transaction scope now looks more local
+
+The current fixed-network branch no longer only says "commit can be fast". It
+also says "a transaction does not obviously have to touch most of the network".
+
+Representative result on the same `1024`-peer dense-linear setup:
+
+- settled peer spread about `38.6`
+- roughly `4%` of the population
+- while still holding `5.8 / 8` round commit latency
+
+At `192` peers the same branch settles at about `34-35` peers, so the absolute
+settled set is in the same general band while the fraction shrinks as the
+population grows.
+
+That is not yet a proof of large-scale sharding, but it is much closer to the
+intended scaling story:
+
+- fast commit
+- local role cores
+- limited transaction reach
+- no obvious need for graph-wide participation per transaction
+
+### 3. The integrated lifecycle path stays live under churn
 
 The integrated simulator in [INTEGRATED_SIMULATION.md](../simulator/INTEGRATED_SIMULATION.md) now exercises:
 
@@ -113,7 +146,7 @@ The system remains live under those conditions. It degrades, but it does not col
 
 That is a major milestone. It means the combined design is not obviously unstable.
 
-### 3. Response-driven vote flow helped materially
+### 4. Response-driven vote flow helped materially
 
 The protocol no longer depends as heavily on pure tick-pumping.
 
@@ -129,9 +162,34 @@ improved:
 - commit latency
 - conflict signaling quality
 
-This is important because it moved the protocol from "repeated blind polling" toward something more structurally efficient.
+The latest fixed-network results add a concrete version of that story:
 
-### 4. The churned graph was over-connected, not under-connected
+- `InitialVote` cut a large part of the repeated `Vote -> QueryBlock -> Block`
+  round-trip cost on the first useful wave
+- dense-linear topologies brought role-reaching graph depth close to `1`
+- commit latency then moved closer to what those short paths actually suggested
+
+This is important because it moved the protocol from "repeated blind polling"
+toward something more structurally efficient.
+
+### 5. Fixed-network conflict handling is much healthier on the denser linear graph
+
+The fixed-network conflict results improved materially on the same branch.
+
+Representative `1024`-peer dense-linear result at `far_prob = 0.4`:
+
+- `highest-majority = 53`
+- `stalled = 56`
+- `lower-owner commits = 0`
+- signal coverage about `0.73`
+
+Compared with the older sparse / corrected-ring steady-state baselines, that is
+a real step forward in contested-state behavior.
+
+It is not a final convergence story, but it means the protocol is no longer
+only attractive in the conflict-free case.
+
+### 6. The churned graph was over-connected, not under-connected
 
 This is one of the most encouraging findings.
 
@@ -150,16 +208,18 @@ It means the system is biased toward liveness, not starvation.
 
 ## Where It Still Falls Short
 
-### 1. Churn still pulls the system too far away from steady-state
+### 1. Churn and bootstrap still pull the system too far away from the good fixed-network regime
 
 This is still the largest practical gap.
 
-Even with better graph control, the churn path does not yet preserve enough of the steady-state envelope.
+Even with better graph control, the churn path does not yet preserve enough of
+the steady-state envelope.
 
 In other words:
 
-- the protocol can be fast on a good graph
-- but the open network still spends too much time paying for formation, repair, and topology churn
+- the protocol can now be both fast and relatively local on a good graph
+- but the open network still spends too much time paying for formation, repair,
+  sync, and topology churn
 
 This is the main reason the system is not yet competitive with mature production systems.
 
@@ -170,6 +230,7 @@ The conflict experiments show that the system now:
 - spreads conflict knowledge better
 - reduces some bad outcomes
 - can warn participants that conflict exists
+- can behave much better on the improved fixed-network topology
 
 But it still does not strongly enough guarantee that the highest contender wins locally or globally.
 
@@ -181,7 +242,7 @@ Too many families still:
 
 This is the biggest remaining correctness / usability gap in contested state.
 
-### 3. Message complexity is still well above the ideal lower bound
+### 3. Message complexity is improved, but still above the ideal lower bound
 
 The project has improved this substantially, but in the harder scenarios the actual cost is still far above the local lower bound.
 
@@ -190,7 +251,12 @@ That means:
 - the routing / neighborhood thesis is plausible
 - but the implementation is still leaving efficiency on the table
 
-This is especially visible under churn and conflict, where repair and repeated polling still dominate too much of the work.
+This is especially visible under churn and conflict, where repair, block fetch,
+commit-chain sync, and repeated polling still dominate too much of the work.
+
+It is also visible in fixed-network runs where latency is already good but
+`InitialVote`, ordinary `Vote`, and block traffic are still high enough that
+the batching and fetch rules deserve another round of tightening.
 
 ### 4. The design is still harder to reason about than fixed-committee systems
 
@@ -325,19 +391,23 @@ Current assessment:
 
 The best current strengths are:
 
-1. **Human-timescale steady-state looks real**
+1. **Human-timescale fixed-network commit looks real**
    - The project no longer depends on a purely speculative performance story.
+   - The current fixed-network branch is materially stronger than the older steady-state baseline.
 
-2. **Open-network liveness looks real**
+2. **A more local transaction scope now looks plausible**
+   - The project now has evidence that transactions can stay within a small slice of the network on a good graph.
+
+3. **Open-network liveness looks real**
    - The combined system survives churn and keeps processing work.
 
-3. **The graph problem is tractable**
+4. **The graph problem is tractable**
    - Over-connection is a better starting point than under-connection.
 
-4. **The protocol direction is improving**
+5. **The protocol direction is improving**
    - Response-driven flow and better graph shaping are materially better than the earlier simpler versions.
 
-5. **The scaling model is still distinctive**
+6. **The scaling model is still distinctive**
    - The project is not merely re-implementing a weaker or noisier version of Raft or HotStuff.
 
 ## Main Risks
@@ -348,13 +418,13 @@ The major risks are:
    - If highest-contender convergence stays too weak, the system becomes operationally awkward even if it is live.
 
 2. **Open-network overhead may remain too high**
-   - If steady-state behavior cannot be preserved under realistic churn, the design will remain academically interesting but operationally weak.
+   - If the system cannot form and preserve dense-linear-like peer sets under realistic churn, the design will remain academically interesting but operationally weak.
 
 3. **Complexity may outrun verifiability**
    - A protocol can fail not because it is impossible, but because it becomes too subtle for teams to implement consistently and safely.
 
-4. **Graph tuning may have diminishing returns**
-   - The recent results suggest graph shaping alone will not solve the remaining protocol-level issues.
+4. **Graph tuning alone may have diminishing returns**
+   - The recent results suggest topology can unlock the good regime, but peer management, commit-chain sync, and fetch / batching policy still decide whether that regime survives in the live system.
 
 ## What Would Count As The Next Proof Point
 
@@ -362,19 +432,23 @@ The next meaningful evidence bar is not "another small win".
 
 It is something stronger:
 
-1. **A churn baseline that keeps the graph near the target while preserving fast recovery**
-   - roughly the current best graph-control result or better
+1. **A churn/bootstrap baseline that forms something close to the current good fixed-network graph**
+   - not just any connected graph
+   - specifically a graph that preserves fast local settlement and limited spread after joins, crashes, and returns
 
-2. **Conflict improvements on top of that graph**
+2. **Commit-chain sync and peer management that fit inside the same efficiency envelope**
+   - the sync path and the peer-maintenance path need to cooperate with batching rather than silently becoming the dominant traffic source
+
+3. **Conflict improvements on top of that graph**
    - materially fewer stalled families
    - materially fewer lower-owner commits
    - no major regression in liveness
 
-3. **A clearer efficiency story**
+4. **A clearer efficiency story**
    - message-load factors moving closer to the local lower bound
    - especially in the non-conflict and moderate-conflict cases
 
-4. **A stronger design argument**
+5. **A stronger design argument**
    - not just simulator success, but a clearer explanation of why the protocol should converge and remain efficient under the intended operating conditions
 
 ## Bottom Line
@@ -387,7 +461,7 @@ It no longer looks like:
 
 It now looks like:
 
-- a plausible open, locality-driven transactional system with a real steady-state story
+- a plausible open, locality-driven transactional system with a real fixed-network story
 - a real churn/liveness story
 - and a still-incomplete conflict and lifecycle-efficiency story
 
@@ -397,7 +471,7 @@ So the current bottom-line assessment is:
 
 - **potential**: strong
 - **viability today**: not yet
-- **most encouraging evidence**: steady-state latency and open-network liveness
-- **most important missing piece**: better conflict convergence and better preservation of the target graph under churn
+- **most encouraging evidence**: fast fixed-network commit, more local transaction scope, and open-network liveness
+- **most important missing piece**: forming and preserving the right graph under churn, together with better conflict convergence and tighter sync / batching behavior
 
-If those two gaps close, the system could become a serious alternative in a part of the design space that current mainstream systems do not cover cleanly.
+If those gaps close, the system could become a serious alternative in a part of the design space that current mainstream systems do not cover cleanly.

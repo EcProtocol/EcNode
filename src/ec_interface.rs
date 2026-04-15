@@ -250,6 +250,11 @@ pub struct TokenSignature {
 // TODO make group message of Submit, Query and Validate
 #[derive(Clone)]
 pub enum Message {
+    InitialVote {
+        block: Block,
+        vote: u8,
+        reply: bool,
+    },
     Vote {
         block_id: BlockId,
         vote: u8,

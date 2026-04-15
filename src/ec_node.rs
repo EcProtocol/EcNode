@@ -30,6 +30,7 @@ pub struct EcNode<
     vote_diagnostics: VoteIngressDiagnostics,
     enable_request_batching: bool,
     batch_vote_replies: bool,
+    delayed_vote_block_requests: HashMap<BlockId, DelayedVoteBlockRequest>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +38,12 @@ pub struct VoteIngressDiagnostics {
     pub trusted_votes_recorded: usize,
     pub untrusted_votes_received: usize,
     pub block_requests_triggered: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DelayedVoteBlockRequest {
+    sender: PeerId,
+    sender_trusted: bool,
 }
 
 impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, T: TokenStorageBackend>
@@ -108,11 +115,13 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         let vote_balance_threshold = peer_config.vote_balance_threshold;
         let vote_request_resend_cooldown = peer_config.vote_request_resend_cooldown;
         let vote_request_active_rounds = peer_config.vote_request_active_rounds;
+        let vote_request_pairs_per_tick = peer_config.vote_request_pairs_per_tick;
         Self {
             mem_pool: EcMemPool::with_vote_policy(
                 vote_balance_threshold,
                 vote_request_resend_cooldown,
                 vote_request_active_rounds,
+                vote_request_pairs_per_tick,
             ),
             backend,
             token_storage,
@@ -125,6 +134,7 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
             vote_diagnostics: VoteIngressDiagnostics::default(),
             enable_request_batching,
             batch_vote_replies,
+            delayed_vote_block_requests: HashMap::new(),
         }
     }
 
@@ -237,6 +247,7 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
 
         // Rotate ticket secrets if needed
         self.ticket_manager.tick(self.time);
+        self.flush_delayed_vote_block_requests(responses);
 
         // Process mempool in phases
         let mut messages = {
@@ -322,16 +333,20 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
         // sorted by token and highest block_id first, later conflicts for the same token
         // are suppressed here.
         let mut previous_token: Option<TokenId> = None;
+        let mut primary_block_for_token: Option<BlockId> = None;
         for request in &messages {
             match request {
                 MessageRequest::Vote(block_id, token_id, vote, _, sequence) => {
-                    let primary_for_token = previous_token != Some(*token_id);
+                    if previous_token != Some(*token_id) {
+                        previous_token = Some(*token_id);
+                        primary_block_for_token = Some(*block_id);
+                    }
+                    let primary_for_token = primary_block_for_token == Some(*block_id);
                     let vote = if !primary_for_token {
                         0
                     } else {
                         *vote
                     };
-                    previous_token = Some(*token_id);
 
                     for peer_id in self
                         .peers
@@ -595,7 +610,7 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
                     self.peers.initial_vote_sequence_span(),
                 );
                 self.emit_reactive_seed_votes(
-                    evaluation.block_id,
+                    evaluation.block,
                     evaluation.vote_mask,
                     &role_targets,
                     responses,
@@ -638,12 +653,14 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
                     },
                 );
 
-                let backend = self.backend.borrow();
-                match (
-                    self.mem_pool.status(block, &*backend),
-                    self.peers.trusted_peer(&msg.sender),
-                ) {
-                    (Some(BlockState::Pending), Some(_)) => {
+                let trusted_sender = self.peers.trusted_peer(&msg.sender).is_some();
+                let block_status = {
+                    let backend = self.backend.borrow();
+                    self.mem_pool.status(block, &*backend)
+                };
+
+                match (block_status, trusted_sender) {
+                    (Some(BlockState::Pending), true) => {
                         self.vote_diagnostics.trusted_votes_recorded += 1;
                         self.mem_pool.vote(block, *vote, &msg.sender, msg.time, *reply);
                     }
@@ -657,28 +674,20 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
                             responses.push(self.send_blocked_update(msg.sender, *block, None));
                         }
                     }
-                    (None, Some(_)) => {
+                    (None, true) => {
                         self.vote_diagnostics.trusted_votes_recorded += 1;
                         // TODO check load-balancing count for this peer
                         self.mem_pool.vote(block, *vote, &msg.sender, msg.time, *reply);
-                        // better ask the sender for it - while propagating towards the "witness"
-                        self.vote_diagnostics.block_requests_triggered += 1;
-                        responses.push(self.request_block(
-                            &msg.sender,
-                            block,
-                            BlockUseCase::MempoolBlock,
-                        ))
+                        // Delay the fetch until the next tick so multiple early votes can
+                        // collapse into one block request if the eager first wave already
+                        // delivers the block in the meantime.
+                        self.schedule_delayed_vote_block_request(*block, msg.sender, true);
                     }
-                    (None, None) => {
+                    (None, false) => {
                         self.vote_diagnostics.untrusted_votes_received += 1;
                         // TODO test ticket is from subscribed client + DOS protection
                         if msg.ticket > 0 {
-                            self.vote_diagnostics.block_requests_triggered += 1;
-                            responses.push(self.request_block(
-                                &msg.sender,
-                                block,
-                                BlockUseCase::MempoolBlock,
-                            ))
+                            self.schedule_delayed_vote_block_request(*block, msg.sender, false);
                         }
 
                         // TODO this should be handled by "introduction" messages - linking peers
@@ -686,6 +695,51 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
                         // self.peers.update_peer(&msg.sender, self.time);
                     }
                     _ => {} // discard - do nothing
+                }
+            }
+            Message::InitialVote { block, vote, reply } => {
+                self.event_sink.log(
+                    self.time,
+                    self.peer_id,
+                    Event::VoteReceived {
+                        block_id: block.id,
+                        from_peer: msg.sender,
+                    },
+                );
+
+                let sender_trusted = self.peers.trusted_peer(&msg.sender).is_some();
+                let backend = self.backend.borrow();
+                let block_status = self.mem_pool.status(&block.id, &*backend);
+                let block_known = self.mem_pool.query(&block.id, &*backend).is_some();
+                drop(backend);
+
+                if sender_trusted && !block_known {
+                    self.mem_pool.vote(&block.id, *vote, &msg.sender, msg.time, *reply);
+                    self.accept_mempool_block(block, Some(msg.sender), true, responses);
+                } else {
+                    let synthetic_vote = MessageEnvelope {
+                        sender: msg.sender,
+                        receiver: msg.receiver,
+                        ticket: 0,
+                        time: msg.time,
+                        message: Message::Vote {
+                            block_id: block.id,
+                            vote: *vote,
+                            reply: *reply,
+                        },
+                    };
+
+                    match block_status {
+                        Some(_) => {
+                            self.handle_message_inner(&synthetic_vote, responses);
+                        }
+                        None if sender_trusted || block_known => {
+                            self.handle_message_inner(&synthetic_vote, responses);
+                        }
+                        None => {
+                            self.vote_diagnostics.untrusted_votes_received += 1;
+                        }
+                    }
                 }
             }
             Message::QueryBlock {
@@ -1007,7 +1061,7 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
 
     fn emit_reactive_seed_votes(
         &self,
-        block_id: BlockId,
+        block: Block,
         vote_mask: u8,
         role_targets: &[TokenId],
         responses: &mut Vec<MessageEnvelope>,
@@ -1023,8 +1077,8 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
                     receiver: peer_id,
                     ticket: 0,
                     time: self.time,
-                    message: Message::Vote {
-                        block_id,
+                    message: Message::InitialVote {
+                        block,
                         vote: vote_mask,
                         reply: true,
                     },
@@ -1200,6 +1254,50 @@ impl<B: BatchedBackend + EcTokensV2 + EcBlocks + EcCommitChainAccess + 'static, 
             },
         }
     }
+
+    fn schedule_delayed_vote_block_request(
+        &mut self,
+        block_id: BlockId,
+        sender: PeerId,
+        sender_trusted: bool,
+    ) {
+        self.delayed_vote_block_requests
+            .entry(block_id)
+            .and_modify(|existing| {
+                if sender_trusted && !existing.sender_trusted {
+                    *existing = DelayedVoteBlockRequest {
+                        sender,
+                        sender_trusted,
+                    };
+                }
+            })
+            .or_insert(DelayedVoteBlockRequest {
+                sender,
+                sender_trusted,
+            });
+    }
+
+    fn flush_delayed_vote_block_requests(&mut self, responses: &mut Vec<MessageEnvelope>) {
+        if self.delayed_vote_block_requests.is_empty() {
+            return;
+        }
+
+        let delayed_requests = std::mem::take(&mut self.delayed_vote_block_requests);
+        let backend = self.backend.borrow();
+
+        for (block_id, request) in delayed_requests {
+            if self.mem_pool.query(&block_id, &*backend).is_some() {
+                continue;
+            }
+
+            self.vote_diagnostics.block_requests_triggered += 1;
+            responses.push(self.request_block(
+                &request.sender,
+                &block_id,
+                BlockUseCase::MempoolBlock,
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1331,7 +1429,11 @@ mod tests {
         TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
 
         let rng = rand::rngs::StdRng::from_seed([11u8; 32]);
-        let mut node = EcNode::new(backend.clone(), 1, 0, MemTokens::new(), rng);
+        let mut config = PeerManagerConfig::default();
+        config.elections_per_tick = 0;
+        config.enable_request_batching = false;
+        let mut node =
+            EcNode::new_with_peer_config(backend.clone(), 1, 0, MemTokens::new(), config, rng);
         for peer_id in [2, 3, 4, 5, 6] {
             node.seed_peer(&peer_id);
         }
@@ -1370,6 +1472,13 @@ mod tests {
         let mut responses = Vec::new();
         node.handle_message(&early_vote, &mut responses);
 
+        assert!(
+            responses.is_empty(),
+            "early unknown votes should defer block fetches until the next tick"
+        );
+
+        node.tick(&mut responses);
+
         assert_eq!(responses.len(), 1);
         let block_ticket = match &responses[0].message {
             Message::QueryBlock { block_id, ticket, .. } => {
@@ -1404,11 +1513,11 @@ mod tests {
         let mut seed_targets = Vec::new();
         for envelope in &responses {
             match &envelope.message {
-                Message::Vote {
-                    block_id,
+                Message::InitialVote {
+                    block: initial_block,
                     vote,
                     reply: true,
-                } if *block_id == block.id && *vote == 0b0000_0001 => {
+                } if initial_block.id == block.id && *vote == 0b0000_0001 => {
                     seed_targets.push(envelope.receiver);
                 }
                 Message::RequestBatch { items } => {
@@ -1447,7 +1556,11 @@ mod tests {
         TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
 
         let rng = rand::rngs::StdRng::from_seed([21u8; 32]);
-        let mut node = EcNode::new(backend.clone(), 1, 0, MemTokens::new(), rng);
+        let mut config = PeerManagerConfig::default();
+        config.elections_per_tick = 0;
+        config.enable_request_batching = false;
+        let mut node =
+            EcNode::new_with_peer_config(backend.clone(), 1, 0, MemTokens::new(), config, rng);
         for peer_id in [2, 3, 4, 5, 6] {
             node.seed_peer(&peer_id);
         }
@@ -1486,6 +1599,13 @@ mod tests {
         let mut responses = Vec::new();
         node.handle_message(&early_vote, &mut responses);
 
+        assert!(
+            responses.is_empty(),
+            "non-interested early votes should also defer block fetches until the next tick"
+        );
+
+        node.tick(&mut responses);
+
         let block_ticket = match &responses[0].message {
             Message::QueryBlock { block_id, ticket, .. } => {
                 assert_eq!(*block_id, block.id);
@@ -1517,6 +1637,76 @@ mod tests {
                 } if block_id == block.id
             )),
             "non-interested early voters should still avoid terminal replies before Commit or Blocked"
+        );
+    }
+
+    #[test]
+    fn initial_vote_arrival_before_tick_cancels_delayed_vote_fetch() {
+        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
+        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
+
+        let rng = rand::rngs::StdRng::from_seed([22u8; 32]);
+        let mut node = EcNode::new(backend.clone(), 1, 0, MemTokens::new(), rng);
+        for peer_id in [2, 3, 4, 5, 6] {
+            node.seed_peer(&peer_id);
+        }
+
+        let block = crate::ec_interface::Block {
+            id: 192,
+            time: 1,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token: 11,
+                    last: 100,
+                    key: 0,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
+        };
+
+        let early_vote = MessageEnvelope {
+            sender: 2,
+            receiver: 1,
+            ticket: 0,
+            time: 1,
+            message: Message::Vote {
+                block_id: block.id,
+                vote: 0,
+                reply: true,
+            },
+        };
+
+        let mut responses = Vec::new();
+        node.handle_message(&early_vote, &mut responses);
+        assert!(responses.is_empty());
+
+        let initial_vote = MessageEnvelope {
+            sender: 2,
+            receiver: 1,
+            ticket: 0,
+            time: 1,
+            message: Message::InitialVote {
+                block,
+                vote: 0,
+                reply: true,
+            },
+        };
+        node.handle_message(&initial_vote, &mut responses);
+
+        responses.clear();
+        node.tick(&mut responses);
+
+        assert!(
+            !responses
+                .iter()
+                .any(|envelope| matches!(envelope.message, Message::QueryBlock { block_id, .. } if block_id == block.id)),
+            "once the block arrived through InitialVote, the delayed vote-triggered fetch should be skipped",
         );
     }
 
@@ -1556,11 +1746,11 @@ mod tests {
         let mut seed_targets = Vec::new();
         for envelope in &responses {
             match &envelope.message {
-                Message::Vote {
-                    block_id,
+                Message::InitialVote {
+                    block: initial_block,
                     vote,
                     reply: true,
-                } if *block_id == block.id && *vote == 0b0000_0001 => {
+                } if initial_block.id == block.id && *vote == 0b0000_0001 => {
                     seed_targets.push(envelope.receiver);
                 }
                 Message::RequestBatch { items } => {

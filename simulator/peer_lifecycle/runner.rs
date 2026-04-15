@@ -3,7 +3,7 @@
 use super::config::{BootstrapMethod, PeerLifecycleConfig};
 use super::stats::*;
 use super::topology::{
-    build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
     build_ring_gradient_topology,
 };
 use super::token_allocation::GlobalTokenMapping;
@@ -456,6 +456,28 @@ impl PeerLifecycleRunner {
                 }
             }
 
+            TopologyMode::RingLinearProbability {
+                center_prob,
+                far_prob,
+                guaranteed_neighbors,
+            } => {
+                let adjacency = build_linear_probability_ring_topology(
+                    &peer_ids,
+                    *center_prob,
+                    *far_prob,
+                    *guaranteed_neighbors,
+                    &mut self.rng,
+                );
+
+                for (peer_id, connected_peers) in adjacency {
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        for other_id in connected_peers {
+                            peer.peer_manager.update_peer(&other_id, 0);
+                        }
+                    }
+                }
+            }
+
             TopologyMode::RandomIdentified { peers_per_node } => {
                 // Bootstrap scenario: Each peer gets N random peers in Identified state
                 use rand::seq::SliceRandom;
@@ -544,7 +566,8 @@ impl PeerLifecycleRunner {
 
             TopologyMode::Ring { .. }
             | TopologyMode::RingCoreTail { .. }
-            | TopologyMode::RingProbabilistic => {
+            | TopologyMode::RingProbabilistic
+            | TopologyMode::RingLinearProbability { .. } => {
                 println!("WARNING: Ring topology not realistic for genesis mode");
                 println!("         (peers don't know ring positions at genesis)");
                 println!("         Using Isolated instead (peers will discover via elections)");

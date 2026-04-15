@@ -514,6 +514,96 @@ def build_heterogeneous_linear_slope_topology(
     return {node_id: sorted(peers) for node_id, peers in adjacency.items()}
 
 
+def build_heterogeneous_bounded_linear_slope_topology(
+    node_ids_by_address: List[int],
+    domain_steps: int,
+    center_prob_min: float,
+    center_prob_max: float,
+    far_prob_min: float,
+    far_prob_max: float,
+    tail_peers_per_side: int,
+    rng: random.Random,
+) -> Dict[int, List[int]]:
+    adjacency: Dict[int, Set[int]] = {node_id: set() for node_id in node_ids_by_address}
+    size = len(node_ids_by_address)
+    if size < 2:
+        return {node_id: [] for node_id in node_ids_by_address}
+
+    max_step = size // 2
+    bounded_domain = max(0, min(domain_steps, max_step))
+
+    center_low = max(0.0, min(center_prob_min, 1.0))
+    center_high = max(center_low, min(center_prob_max, 1.0))
+    far_low = max(0.0, min(far_prob_min, 1.0))
+    far_high = max(far_low, min(far_prob_max, 1.0))
+
+    node_slopes: Dict[int, Tuple[float, float]] = {}
+    for node_id in node_ids_by_address:
+        center_prob = rng.uniform(center_low, center_high)
+        bounded_far_high = min(far_high, center_prob)
+        bounded_far_low = min(far_low, bounded_far_high)
+        far_prob = rng.uniform(bounded_far_low, bounded_far_high)
+        node_slopes[node_id] = (center_prob, far_prob)
+
+    if bounded_domain > 0:
+        for i in range(size):
+            for j in range(i + 1, size):
+                clockwise = j - i
+                counter = size - clockwise
+                rank_distance = min(clockwise, counter)
+                if rank_distance > bounded_domain:
+                    continue
+
+                left = node_ids_by_address[i]
+                right = node_ids_by_address[j]
+                left_center, left_far = node_slopes[left]
+                right_center, right_far = node_slopes[right]
+                left_prob = probability_between_endpoints(
+                    rank_distance,
+                    bounded_domain,
+                    left_center,
+                    left_far,
+                )
+                right_prob = probability_between_endpoints(
+                    rank_distance,
+                    bounded_domain,
+                    right_center,
+                    right_far,
+                )
+                pair_prob = max(0.0, min(1.0, (left_prob + right_prob) / 2.0))
+                if rng.random() < pair_prob:
+                    adjacency[left].add(right)
+                    adjacency[right].add(left)
+
+    result = {node_id: sorted(peers) for node_id, peers in adjacency.items()}
+    if tail_peers_per_side > 0:
+        tail_augmented = add_guaranteed_ring_neighbors(
+            {node_id: list(peers) for node_id, peers in result.items()},
+            node_ids_by_address,
+            0,
+        )
+        merged: Dict[int, Set[int]] = {
+            node_id: set(peers)
+            for node_id, peers in tail_augmented.items()
+        }
+        offsets = evenly_spaced_offsets(
+            bounded_domain + 1,
+            max_step,
+            tail_peers_per_side,
+        )
+        for idx, node_id in enumerate(node_ids_by_address):
+            for step in offsets:
+                right = node_ids_by_address[(idx + step) % size]
+                left = node_ids_by_address[(idx - step) % size]
+                merged[node_id].add(right)
+                merged[node_id].add(left)
+                merged[right].add(node_id)
+                merged[left].add(node_id)
+        result = {node_id: sorted(peers) for node_id, peers in merged.items()}
+
+    return result
+
+
 def build_full_table_topology(
     node_ids_by_address: List[int],
 ) -> Dict[int, List[int]]:
@@ -556,6 +646,8 @@ class ReactiveVoteSimulation:
         hetero_center_prob_max: float,
         hetero_far_prob_min: float,
         hetero_far_prob_max: float,
+        bounded_domain_steps: int,
+        bounded_tail_peers_per_side: int,
         stepwise_mid_steps: int,
         stepwise_mid_peers_per_side: int,
         stepwise_far_peers_per_side: int,
@@ -579,6 +671,8 @@ class ReactiveVoteSimulation:
         self.hetero_center_prob_max = hetero_center_prob_max
         self.hetero_far_prob_min = hetero_far_prob_min
         self.hetero_far_prob_max = hetero_far_prob_max
+        self.bounded_domain_steps = bounded_domain_steps
+        self.bounded_tail_peers_per_side = bounded_tail_peers_per_side
         self.stepwise_mid_steps = stepwise_mid_steps
         self.stepwise_mid_peers_per_side = stepwise_mid_peers_per_side
         self.stepwise_far_peers_per_side = stepwise_far_peers_per_side
@@ -664,6 +758,28 @@ class ReactiveVoteSimulation:
                 hetero_center_prob_max,
                 hetero_far_prob_min,
                 hetero_far_prob_max,
+                self.rng,
+            )
+        elif topology == "heterogeneous_bounded_linear_slope":
+            self.adjacency = build_heterogeneous_bounded_linear_slope_topology(
+                self.node_ids_by_address,
+                bounded_domain_steps,
+                hetero_center_prob_min,
+                hetero_center_prob_max,
+                hetero_far_prob_min,
+                hetero_far_prob_max,
+                0,
+                self.rng,
+            )
+        elif topology == "heterogeneous_bounded_linear_slope_with_tail":
+            self.adjacency = build_heterogeneous_bounded_linear_slope_topology(
+                self.node_ids_by_address,
+                bounded_domain_steps,
+                hetero_center_prob_min,
+                hetero_center_prob_max,
+                hetero_far_prob_min,
+                hetero_far_prob_max,
+                bounded_tail_peers_per_side,
                 self.rng,
             )
         elif topology == "full_table":
@@ -1163,6 +1279,8 @@ def parse_args() -> argparse.Namespace:
             "linear_probability",
             "linear_probability_with_core",
             "heterogeneous_linear_slope",
+            "heterogeneous_bounded_linear_slope",
+            "heterogeneous_bounded_linear_slope_with_tail",
             "full_table",
         ),
         default="ring_gradient",
@@ -1175,6 +1293,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hetero-center-prob-max", type=float, default=1.00)
     parser.add_argument("--hetero-far-prob-min", type=float, default=0.00)
     parser.add_argument("--hetero-far-prob-max", type=float, default=0.10)
+    parser.add_argument("--bounded-domain-steps", type=int, default=32)
+    parser.add_argument("--bounded-tail-peers-per-side", type=int, default=1)
     parser.add_argument("--stepwise-mid-steps", type=int, default=32)
     parser.add_argument("--stepwise-mid-peers-per-side", type=int, default=4)
     parser.add_argument("--stepwise-far-peers-per-side", type=int, default=1)
@@ -1209,6 +1329,8 @@ def main() -> None:
         hetero_center_prob_max=args.hetero_center_prob_max,
         hetero_far_prob_min=args.hetero_far_prob_min,
         hetero_far_prob_max=args.hetero_far_prob_max,
+        bounded_domain_steps=args.bounded_domain_steps,
+        bounded_tail_peers_per_side=args.bounded_tail_peers_per_side,
         stepwise_mid_steps=args.stepwise_mid_steps,
         stepwise_mid_peers_per_side=args.stepwise_mid_peers_per_side,
         stepwise_far_peers_per_side=args.stepwise_far_peers_per_side,

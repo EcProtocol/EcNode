@@ -72,6 +72,7 @@ impl FloatDistributionSummary {
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageTypeBreakdown {
+    pub initial_vote: usize,
     pub vote: usize,
     pub query_block: usize,
     pub query_token: usize,
@@ -96,6 +97,7 @@ impl MessageTypeBreakdown {
 
     pub fn record_wire(&mut self, message: &Message) {
         match message {
+            Message::InitialVote { .. } => self.initial_vote += 1,
             Message::Vote { .. } => self.vote += 1,
             Message::QueryBlock { .. } => self.query_block += 1,
             Message::QueryToken { .. } => self.query_token += 1,
@@ -124,6 +126,7 @@ impl MessageTypeBreakdown {
 
     pub fn total(&self) -> usize {
         self.vote
+            + self.initial_vote
             + self.query_block
             + self.query_token
             + self.request_batch
@@ -522,8 +525,9 @@ impl SimResult {
             );
         }
         println!(
-            "Scheduled logical messages by type: total {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
+            "Scheduled logical messages by type: total {}, initial-votes {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
             self.scheduled_message_types.total(),
+            self.scheduled_message_types.initial_vote,
             self.scheduled_message_types.vote,
             self.scheduled_message_types.query_block,
             self.scheduled_message_types.query_token,
@@ -534,8 +538,9 @@ impl SimResult {
             self.scheduled_message_types.commit_block,
         );
         println!(
-            "Delivered logical messages by type: total {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
+            "Delivered logical messages by type: total {}, initial-votes {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
             self.delivered_message_types.total(),
+            self.delivered_message_types.initial_vote,
             self.delivered_message_types.vote,
             self.delivered_message_types.query_block,
             self.delivered_message_types.query_token,
@@ -546,10 +551,11 @@ impl SimResult {
             self.delivered_message_types.commit_block,
         );
         println!(
-            "Scheduled wire messages by type: total {}, request-batches {}, batched-items {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
+            "Scheduled wire messages by type: total {}, request-batches {}, batched-items {}, initial-votes {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
             self.scheduled_wire_message_types.total(),
             self.scheduled_wire_message_types.request_batch,
             self.scheduled_wire_message_types.batched_request_items,
+            self.scheduled_wire_message_types.initial_vote,
             self.scheduled_wire_message_types.vote,
             self.scheduled_wire_message_types.query_block,
             self.scheduled_wire_message_types.query_token,
@@ -560,10 +566,11 @@ impl SimResult {
             self.scheduled_wire_message_types.commit_block,
         );
         println!(
-            "Delivered wire messages by type: total {}, request-batches {}, batched-items {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
+            "Delivered wire messages by type: total {}, request-batches {}, batched-items {}, initial-votes {}, votes {}, query-block {}, query-token {}, answers {}, blocks {}, referrals {}, query-commit {}, commit-block {}",
             self.delivered_wire_message_types.total(),
             self.delivered_wire_message_types.request_batch,
             self.delivered_wire_message_types.batched_request_items,
+            self.delivered_wire_message_types.initial_vote,
             self.delivered_wire_message_types.vote,
             self.delivered_wire_message_types.query_block,
             self.delivered_wire_message_types.query_token,

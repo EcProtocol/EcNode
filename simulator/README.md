@@ -176,6 +176,7 @@ commit-chain sync, and transaction flow.
 - See `simulator/INTEGRATED_CHURN_CONFLICT_REPORT.md` for the baseline churn-path comparison with and without injected conflicts
 - See `simulator/STEADY_STATE_REPORT.md` for the formed-network steady-state upper-bound benchmark
 - See `simulator/RING_TOPOLOGY_CORRECTION_REPORT.md` for the corrected ring-gradient steady-state benchmark
+- See `simulator/DENSE_LINEAR_TOPOLOGY_REPORT.md` for the fixed-network dense linear-slope comparison against the corrected ring baseline
 - See `simulator/PEER_SET_SHAPE_ILLUSTRATIONS.md` for visual side-by-side sketches of the corrected ring, core+tail, and probabilistic peer-set shapes
 - See `simulator/CORE_TAIL_TOPOLOGY_REPORT.md` for the dense-core plus flat-tail routing experiment on larger steady-state rings
 - See `simulator/GRADIENT_PROFILE_COMPARISON.md` for the corrected ring target versus integrated churn profile comparison

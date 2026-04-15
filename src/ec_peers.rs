@@ -81,11 +81,18 @@ pub struct PeerManagerConfig {
     /// token or witness slot of a block. `0` means reissue every tick.
     pub vote_request_resend_cooldown: EcTime,
 
-    /// Number of active outward polling rounds before one skip/reset round.
+    /// Number of outward pair positions kept in the periodic polling cycle.
     ///
-    /// With the current deterministic pair sweep, `4` means:
-    /// sequence `0,1,2,3`, then one skipped round, then restart at `0`.
+    /// Polling interleaves one skipped round after every active pair. For example,
+    /// `3` means the periodic cadence walks pair sequences `0,1,2`, with one
+    /// pause between each active step before repeating.
     pub vote_request_active_rounds: u8,
+
+    /// Number of outward pair positions emitted on each active polling tick.
+    ///
+    /// `1` is the original "one pair, then maybe pause" behavior. Higher values
+    /// resend multiple adjacent pair positions on the same active tick.
+    pub vote_request_pairs_per_tick: u8,
 
     /// Optional target connected-degree band center. When set, pruning and optional
     /// election throttling try to keep the live connected set near this size.
@@ -132,6 +139,7 @@ impl Default for PeerManagerConfig {
             vote_balance_threshold: VOTE_THRESHOLD,
             vote_request_resend_cooldown: 0,
             vote_request_active_rounds: 4,
+            vote_request_pairs_per_tick: 1,
             connected_target: None,
             connected_target_hysteresis: 0,
             elections_per_tick_above_target: None,

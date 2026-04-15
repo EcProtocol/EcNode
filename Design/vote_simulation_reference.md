@@ -82,6 +82,8 @@ Current families under active comparison include:
 - `ring_core_tail`
 - `ring_stepwise_sample`
 - `heterogeneous_linear_slope`
+- `heterogeneous_bounded_linear_slope`
+- `heterogeneous_bounded_linear_slope_with_tail`
 
 ## Core Sanity Bound
 

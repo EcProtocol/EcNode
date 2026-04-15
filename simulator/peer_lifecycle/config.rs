@@ -85,6 +85,16 @@ pub enum TopologyMode {
     /// instead of guaranteed close neighbors.
     RingProbabilistic,
 
+    /// Symmetric full-ring linear-probability topology.
+    /// Connection probability interpolates from `center_prob` at the local center
+    /// to `far_prob` at the far side of the ring, with optional guaranteed close
+    /// neighbors on each side.
+    RingLinearProbability {
+        center_prob: f64,
+        far_prob: f64,
+        guaranteed_neighbors: usize,
+    },
+
     /// Symmetric ring topology with a dense local core and a small evenly spaced tail.
     /// The closest ±neighbors stay steep and local, while `tail_peers_per_side`
     /// adds a flat routing base across the rest of the ring.
