@@ -6,8 +6,8 @@ mod peer_lifecycle;
 use ec_rust::ec_genesis::GenesisConfig;
 
 use integrated::{
-    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
-    TransactionSourcePolicy,
+    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig,
+    TransactionFlowConfig, TransactionSourcePolicy,
 };
 use peer_lifecycle::{
     BootstrapMethod, InitialNetworkState, NetworkEvent, ScheduledEvent, TokenDistributionConfig,

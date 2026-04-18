@@ -1,8 +1,8 @@
 // Peer Lifecycle Simulator Configuration
 
-use ec_rust::ec_peers::PeerManagerConfig;
 use ec_rust::ec_interface::PeerId;
-use serde::{Serialize, Deserialize};
+use ec_rust::ec_peers::PeerManagerConfig;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Main Configuration
@@ -70,8 +70,8 @@ pub enum TopologyMode {
     /// peer_knowledge_fraction controls what % of nearby peers they know (0.0-1.0)
     /// connected_fraction of known peers start as Connected
     LocalKnowledge {
-        peer_knowledge_fraction: f64,  // What % of nearby peers are known
-        connected_fraction: f64,       // What % of known peers are Connected
+        peer_knowledge_fraction: f64, // What % of nearby peers are known
+        connected_fraction: f64,      // What % of known peers are Connected
     },
 
     /// Symmetric ring-gradient topology.
@@ -106,7 +106,7 @@ pub enum TopologyMode {
     /// Bootstrap scenario: Each peer starts with N randomly selected peers in Identified state
     /// This simulates a bootstrap scenario where peers discover the network gradually
     RandomIdentified {
-        peers_per_node: usize,  // Number of random Identified peers each node starts with
+        peers_per_node: usize, // Number of random Identified peers each node starts with
     },
 
     /// No initial connections (peers must discover via elections)
@@ -187,20 +187,16 @@ pub enum NetworkEvent {
     /// Add new peers to the network
     PeerJoin {
         count: usize,
-        coverage_fraction: f64, // Quality of new peers (0.0-1.0)
+        coverage_fraction: f64,            // Quality of new peers (0.0-1.0)
         bootstrap_method: BootstrapMethod, // How new peers learn about existing peers
-        group_name: Option<String>, // Optional group identifier for tracking
+        group_name: Option<String>,        // Optional group identifier for tracking
     },
 
     /// Gracefully remove peers (they send goodbye messages)
-    PeerLeave {
-        selection: PeerSelection,
-    },
+    PeerLeave { selection: PeerSelection },
 
     /// Suddenly remove peers (no cleanup, simulates crashes)
-    PeerCrash {
-        selection: PeerSelection,
-    },
+    PeerCrash { selection: PeerSelection },
 
     /// Reactivate previously crashed peers with stale persisted state
     PeerReturn {
@@ -215,14 +211,12 @@ pub enum NetworkEvent {
     },
 
     /// Pause elections for N rounds (test recovery)
-    PauseElections {
-        duration: usize,
-    },
+    PauseElections { duration: usize },
 
     /// Report current statistics to console
     /// Useful for monitoring long simulations at checkpoints
     ReportStats {
-        label: Option<String>,  // Optional label for this checkpoint
+        label: Option<String>, // Optional label for this checkpoint
     },
 }
 
@@ -341,8 +335,8 @@ impl Default for InitialNetworkState {
         Self {
             num_peers: 50,
             initial_topology: TopologyMode::LocalKnowledge {
-                peer_knowledge_fraction: 0.2,  // Know 20% of nearby peers
-                connected_fraction: 0.3,        // 30% of known peers are Connected
+                peer_knowledge_fraction: 0.2, // Know 20% of nearby peers
+                connected_fraction: 0.3,      // 30% of known peers are Connected
             },
             bootstrap_rounds: 50,
         }
@@ -353,10 +347,10 @@ impl Default for TokenDistributionConfig {
     fn default() -> Self {
         Self {
             total_tokens: 10_000,
-            neighbor_overlap: 5,  // Overlap with 5 neighbors on each side
-            coverage_fraction: 0.8,  // Know 80% of nearby tokens
-            genesis_config: None,  // Use Random mode by default
-            genesis_storage_fraction: 0.25,  // 1/4 of ring if genesis is enabled
+            neighbor_overlap: 5,    // Overlap with 5 neighbors on each side
+            coverage_fraction: 0.8, // Know 80% of nearby tokens
+            genesis_config: None,   // Use Random mode by default
+            genesis_storage_fraction: 0.25, // 1/4 of ring if genesis is enabled
         }
     }
 }

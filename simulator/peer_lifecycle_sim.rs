@@ -3,14 +3,8 @@
 mod peer_lifecycle;
 
 use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-    InitialNetworkState,
-    TokenDistributionConfig,
-    TopologyMode,
-    EventSchedule,
-    ScheduledEvent,
-    NetworkEvent,
+    EventSchedule, InitialNetworkState, NetworkEvent, PeerLifecycleConfig, PeerLifecycleRunner,
+    ScheduledEvent, TokenDistributionConfig, TopologyMode,
 };
 
 fn main() {
@@ -34,8 +28,8 @@ fn main() {
     config.peer_config.min_collection_time = 10; // Wait 10 ticks before checking election completion
     config.peer_config.pending_timeout = 1000; // Long timeout for discovered peers
     config.peer_config.elections_per_tick = 3; // Trigger multiple elections per tick
-    // Bootstrap scenario test: Each peer starts with 5 random Identified peers
-    // This tests the network's ability to bootstrap from minimal initial knowledge
+                                               // Bootstrap scenario test: Each peer starts with 5 random Identified peers
+                                               // This tests the network's ability to bootstrap from minimal initial knowledge
     config.initial_state = InitialNetworkState {
         num_peers: 30, // Start with 30 peers
         // RandomIdentified: Each peer knows 5 random other peers (Identified state)
@@ -48,11 +42,11 @@ fn main() {
     // Token distribution with 90% coverage (high quality nodes)
     // neighbor_overlap controls view width - each peer overlaps with N neighbors
     config.token_distribution = TokenDistributionConfig {
-        total_tokens: 100_000,    // 100K tokens + peer IDs automatically injected
-        neighbor_overlap: 10,      // Overlap with 10 neighbors on each side (gives ~12 nearby)
-        coverage_fraction: 0.9,    // Know 90% of nearby tokens (high quality)
+        total_tokens: 100_000,  // 100K tokens + peer IDs automatically injected
+        neighbor_overlap: 10,   // Overlap with 10 neighbors on each side (gives ~12 nearby)
+        coverage_fraction: 0.9, // Know 90% of nearby tokens (high quality)
         genesis_config: None,
-        genesis_storage_fraction: 0.0
+        genesis_storage_fraction: 0.0,
     };
     config.metrics.sample_interval = 10;
 

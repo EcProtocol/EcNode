@@ -1,0 +1,73 @@
+
+ec_commit_chain
+!- top-down only commit latest. But go back on Blocks / transactions
+- Analyze fraud detect - and incentives to store Blocks (wait - first prio sync)
+
+- each trace keeps its own "watermark" until end.
+- drop traces if not getting blocks/commit-bloks - no progress
+  - Maybe change trace at random from time to time?
+- confirm counter on Block without tokens in-range.
+- when changing peers - maintain 2 above/below balance.
+
+!- investigate long traces (bootstrap) with nodes that have opposite logs:
+  so one forming top-down and one button-up. So verification may take a long time
+
+- Changed design to drop shaddow and keep state-based 2-slot record in DB.
+- Since organic sharding shifts the width of neighborhoods: Keep a watermark per peer.
+  This way a new peer - outside previous read range - is traced all the way back (2 years)
+  So maybe only trace 1 +/- address?
+- Use ec_ticket_manager
+
+
+ec_peers
+- Pending + Connected in active-ring. All peer-selection from this. 
+  This means that Pending-peers also mark the organic range of this peer.
+  And that the code can function in client-side-libs - where peers never reach Connected.
+- Add a "my-range" function - +/- 4 active points around addr.
+- Refresh ALIVE on receive block
+
+ec_node
+!- Ticket validation. Secret-now, Secret-prev rotate every eg. 2 sec. 
+  AT startup generate secure-random:
+    - Each type of ticket one "type-secret"
+  Validate tickets as: Blake3(Secret || "query - token/block") => base-secret
+  THEN
+    for each "type-secret" check: Ticket == base-secret ^ "type-secret"
+
+ec_identitiy
+!- Identity TTL - add 8 byte timestamp to SALT. Only accept address/SALT within +24 hours -> 1 year (?)
+  require users to rebuild new nodes every year.
+
+!- Last part of 192 -> 256 could serve as network-Identity
+  Nodes may be setup to belong to a special "network".
+  This can be enforced by keeping a shared secret or just id -
+  and when computing Identity concat this as part of the SALT
+  such that user-supplied SALT only validates with this (and 
+  SALT for other "networks" very likely do not validate here)
+!- Use Network-Identity in DH shared secret as well to isolate.
+
+ec_genesis
+!- Sample tokens -> peer TokenStore
+!- Only store tokens/blocks in "range" (which will be approximate)
+
+ec_orchestrator (new)
+- All tick and message scheduling into this new module.
+- Collect all outbound messages - and group them into multi-message network packages
+  This requiers final target/destination to not be decided in sub-modules like mempool and commit-chain 
+  (more like a "neighborhood" indicator - and then this module would try to pack to optimize network transfers)
+
+(Consider dropping Identity-block - and just requirer SALT on Referral and Answer
+- not a good idea - it still makes sense to have peer-id (public key + SALT) as findable tokens.
+  needed for bootstraping new peers.
+)
+
++++
+Full scale simulator - all parts. Scenario-style - maybe consolidate into one.
++++
+
+256 bit transition.
+
+Network layer and UDP package design
+
+- Make simulators deterministic (last hashtable iterators etc.)
+

@@ -104,13 +104,13 @@ impl AddressConfig {
     /// Test configuration: fast mining for development
     /// Expected time: ~1-10 seconds for 4 trailing zero bits
     pub const TEST: Self = AddressConfig {
-        difficulty: 4,        // 4 trailing zero bits
-        memory_cost: 256,     // 256 KiB
-        time_cost: 1,         // 1 iteration
-        parallelism: 1,       // Single thread
-        max_age_secs: 365 * 24 * 3600,      // 1 year
-        future_tolerance_secs: 24 * 3600,   // 24 hours
-        network_id: 0,        // Mainnet default
+        difficulty: 4,                    // 4 trailing zero bits
+        memory_cost: 256,                 // 256 KiB
+        time_cost: 1,                     // 1 iteration
+        parallelism: 1,                   // Single thread
+        max_age_secs: 365 * 24 * 3600,    // 1 year
+        future_tolerance_secs: 24 * 3600, // 24 hours
+        network_id: 0,                    // Mainnet default
     };
 
     /// Production configuration: ~1 day of computation expected
@@ -135,13 +135,13 @@ impl AddressConfig {
     /// - We use lower memory because validation is frequent, not one-time login
     /// - We compensate with higher difficulty (24 bits vs typical password requirements)
     pub const PRODUCTION: Self = AddressConfig {
-        difficulty: 24,       // 24 trailing zero bits (~16.7M attempts)
-        memory_cost: 4096,    // 4 MiB (balanced: memory-hard but fast validation)
-        time_cost: 1,         // 1 iteration (validation happens frequently)
-        parallelism: 1,       // Single thread
-        max_age_secs: 365 * 24 * 3600,      // 1 year
-        future_tolerance_secs: 24 * 3600,   // 24 hours
-        network_id: 0,        // Mainnet default
+        difficulty: 24,                   // 24 trailing zero bits (~16.7M attempts)
+        memory_cost: 4096,                // 4 MiB (balanced: memory-hard but fast validation)
+        time_cost: 1,                     // 1 iteration (validation happens frequently)
+        parallelism: 1,                   // Single thread
+        max_age_secs: 365 * 24 * 3600,    // 1 year
+        future_tolerance_secs: 24 * 3600, // 24 hours
+        network_id: 0,                    // Mainnet default
     };
 
     /// Alternative: Maximum ASIC resistance (higher memory)
@@ -149,13 +149,13 @@ impl AddressConfig {
     /// - Mining: ~24 hours with 23 bits difficulty
     /// - Use if ASIC resistance is more important than validation speed
     pub const HIGH_MEMORY: Self = AddressConfig {
-        difficulty: 23,       // 23 bits (~8.4M attempts)
-        memory_cost: 16384,   // 16 MiB (strong memory-hardness)
+        difficulty: 23,     // 23 bits (~8.4M attempts)
+        memory_cost: 16384, // 16 MiB (strong memory-hardness)
         time_cost: 1,
         parallelism: 1,
-        max_age_secs: 365 * 24 * 3600,      // 1 year
-        future_tolerance_secs: 24 * 3600,   // 24 hours
-        network_id: 0,        // Mainnet default
+        max_age_secs: 365 * 24 * 3600,    // 1 year
+        future_tolerance_secs: 24 * 3600, // 24 hours
+        network_id: 0,                    // Mainnet default
     };
 
     /// Alternative: Maximum validation speed (low latency)
@@ -163,13 +163,13 @@ impl AddressConfig {
     /// - Mining: ~24 hours with 26 bits difficulty
     /// - Use for high-throughput networks where validation is critical
     pub const LOW_LATENCY: Self = AddressConfig {
-        difficulty: 26,       // 26 bits (~67M attempts)
-        memory_cost: 1024,    // 1 MiB (faster validation)
+        difficulty: 26,    // 26 bits (~67M attempts)
+        memory_cost: 1024, // 1 MiB (faster validation)
         time_cost: 1,
         parallelism: 1,
-        max_age_secs: 365 * 24 * 3600,      // 1 year
-        future_tolerance_secs: 24 * 3600,   // 24 hours
-        network_id: 0,        // Mainnet default
+        max_age_secs: 365 * 24 * 3600,    // 1 year
+        future_tolerance_secs: 24 * 3600, // 24 hours
+        network_id: 0,                    // Mainnet default
     };
 }
 
@@ -201,7 +201,10 @@ pub struct PeerIdentity {
 impl std::fmt::Debug for PeerIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerIdentity")
-            .field("public_key", &format_args!("{:?}", self.public_key.as_bytes()))
+            .field(
+                "public_key",
+                &format_args!("{:?}", self.public_key.as_bytes()),
+            )
             .field("salt", &self.salt)
             .field("peer_id", &self.peer_id)
             .field("attempts", &self.attempts)
@@ -293,8 +296,8 @@ impl PeerIdentity {
 
             // Generate 192-bit transmitted salt (128 random + 64 timestamp)
             let mut salt = [0u8; 24];
-            rand::Rng::fill(&mut OsRng, &mut salt[0..16]);  // Random entropy
-            salt[16..24].copy_from_slice(&timestamp.to_le_bytes());  // Unix timestamp
+            rand::Rng::fill(&mut OsRng, &mut salt[0..16]); // Random entropy
+            salt[16..24].copy_from_slice(&timestamp.to_le_bytes()); // Unix timestamp
 
             // Extend to 256 bits with network_id for hashing (NOT transmitted)
             let extended_salt = Self::extend_salt_with_network_id(&salt, network_id);
@@ -367,8 +370,8 @@ impl PeerIdentity {
     /// A 256-bit salt: [entropy | timestamp | network_id]
     fn extend_salt_with_network_id(salt: &Salt, network_id: u64) -> [u8; 32] {
         let mut extended = [0u8; 32];
-        extended[0..24].copy_from_slice(salt);  // Copy 192-bit transmitted salt
-        extended[24..32].copy_from_slice(&network_id.to_le_bytes());  // Append network_id
+        extended[0..24].copy_from_slice(salt); // Copy 192-bit transmitted salt
+        extended[24..32].copy_from_slice(&network_id.to_le_bytes()); // Append network_id
         extended
     }
 
@@ -498,7 +501,11 @@ impl PeerIdentity {
     /// - **Network isolation**: Different networks produce different secrets
     /// - **Domain separation**: Cannot reuse secrets for other protocols
     /// - **Key derivation**: Raw DH properly derived through Blake3 KDF
-    pub fn compute_shared_secret(&self, their_public_key: &PublicKey, network_id: u64) -> SharedSecret {
+    pub fn compute_shared_secret(
+        &self,
+        their_public_key: &PublicKey,
+        network_id: u64,
+    ) -> SharedSecret {
         let raw_secret = self.static_secret.diffie_hellman(their_public_key);
 
         // Derive shared secret with network_id for network isolation
@@ -539,15 +546,11 @@ fn hash_public_key(
     )
     .map_err(|e| format!("Invalid Argon2 params: {}", e))?;
 
-    let argon2 = Argon2::new(
-        argon2::Algorithm::Argon2id,
-        Version::V0x13,
-        params,
-    );
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
 
     // Convert salt to SaltString (base64 encoding required by argon2 crate)
-    let salt_b64 = SaltString::encode_b64(salt)
-        .map_err(|e| format!("Salt encoding error: {}", e))?;
+    let salt_b64 =
+        SaltString::encode_b64(salt).map_err(|e| format!("Salt encoding error: {}", e))?;
 
     // Hash the public key bytes
     let public_key_bytes = public_key.as_bytes();
@@ -556,9 +559,7 @@ fn hash_public_key(
         .map_err(|e| format!("Argon2 hashing error: {}", e))?;
 
     // Extract the hash bytes
-    let hash_bytes = hash
-        .hash
-        .ok_or_else(|| "No hash output".to_string())?;
+    let hash_bytes = hash.hash.ok_or_else(|| "No hash output".to_string())?;
 
     let mut result = [0u8; 32];
     result.copy_from_slice(hash_bytes.as_bytes());
@@ -620,20 +621,18 @@ mod tests {
     fn test_difficulty_check() {
         // Hash with 8 trailing zero bits
         let hash1 = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0x00,
         ];
         assert!(check_difficulty(&hash1, 8));
         assert!(!check_difficulty(&hash1, 9));
 
         // Hash with 12 trailing zero bits
         let hash2 = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0x00,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xF0, 0x00,
         ];
         assert!(check_difficulty(&hash2, 12));
         assert!(!check_difficulty(&hash2, 13));
@@ -911,13 +910,13 @@ mod tests {
 
     #[test]
     fn test_extend_salt_with_network_id() {
-        let salt = [1u8; 24];  // 192-bit salt
+        let salt = [1u8; 24]; // 192-bit salt
         let network_id = 0x123456789ABCDEFu64;
         let extended = PeerIdentity::extend_salt_with_network_id(&salt, network_id);
 
         assert_eq!(extended.len(), 32);
-        assert_eq!(&extended[0..24], &salt);  // First 192 bits unchanged
-        assert_eq!(&extended[24..32], &network_id.to_le_bytes());  // Last 64 bits = network_id
+        assert_eq!(&extended[0..24], &salt); // First 192 bits unchanged
+        assert_eq!(&extended[24..32], &network_id.to_le_bytes()); // Last 64 bits = network_id
     }
 
     #[test]
@@ -959,7 +958,7 @@ mod tests {
     fn test_mainnet_and_testnet_isolated() {
         // Mine for mainnet (network_id = 0)
         let mut mainnet_identity = PeerIdentity::new();
-        mainnet_identity.mine(AddressConfig::TEST);  // Uses default network_id = 0
+        mainnet_identity.mine(AddressConfig::TEST); // Uses default network_id = 0
 
         // Try to validate on testnet (network_id = 12345)
         let testnet_config = AddressConfig {

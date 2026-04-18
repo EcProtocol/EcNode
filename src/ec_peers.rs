@@ -2,8 +2,10 @@ use crate::ec_interface::{
     CommitBlockId, EcTime, Message, MessageEnvelope, MessageTicket, PeerId, TokenId, TokenMapping,
     TOKENS_SIGNATURE_SIZE, VOTE_THRESHOLD,
 };
-use crate::ec_proof_of_storage::{ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend};
-use serde::{Serialize, Deserialize};
+use crate::ec_proof_of_storage::{
+    ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ============================================================================
@@ -265,7 +267,11 @@ impl PeerAction {
         head_of_chain: CommitBlockId,
     ) -> MessageEnvelope {
         match self {
-            PeerAction::SendQuery { receiver, token, ticket } => MessageEnvelope {
+            PeerAction::SendQuery {
+                receiver,
+                token,
+                ticket,
+            } => MessageEnvelope {
                 sender,
                 receiver,
                 ticket,
@@ -277,7 +283,11 @@ impl PeerAction {
                 },
             },
 
-            PeerAction::SendAnswer { answer, signature, ticket } => MessageEnvelope {
+            PeerAction::SendAnswer {
+                answer,
+                signature,
+                ticket,
+            } => MessageEnvelope {
                 sender,
                 receiver,
                 ticket,
@@ -289,7 +299,11 @@ impl PeerAction {
                 },
             },
 
-            PeerAction::SendReferral { token, ticket, suggested_peers } => MessageEnvelope {
+            PeerAction::SendReferral {
+                token,
+                ticket,
+                suggested_peers,
+            } => MessageEnvelope {
                 sender,
                 receiver,
                 ticket,
@@ -301,7 +315,11 @@ impl PeerAction {
                 },
             },
 
-            PeerAction::SendInvitation { receiver, answer, signature } => MessageEnvelope {
+            PeerAction::SendInvitation {
+                receiver,
+                answer,
+                signature,
+            } => MessageEnvelope {
                 sender,
                 receiver,
                 ticket: 0, // Invitations always use ticket=0
@@ -394,10 +412,7 @@ impl TokenSampleCollection {
     fn pick_and_remove<R: rand::Rng>(&mut self, n: usize, rng: &mut R) -> Vec<TokenId> {
         use rand::seq::IteratorRandom;
 
-        let selected: Vec<TokenId> = self.samples
-            .iter()
-            .copied()
-            .choose_multiple(rng, n);
+        let selected: Vec<TokenId> = self.samples.iter().copied().choose_multiple(rng, n);
 
         // Remove selected tokens from the collection
         for &token in &selected {
@@ -417,10 +432,7 @@ impl TokenSampleCollection {
         use rand::seq::IteratorRandom;
 
         let excess = self.samples.len() - self.max_capacity;
-        let to_evict: Vec<TokenId> = self.samples
-            .iter()
-            .copied()
-            .choose_multiple(rng, excess);
+        let to_evict: Vec<TokenId> = self.samples.iter().copied().choose_multiple(rng, excess);
 
         for token in &to_evict {
             self.samples.remove(token);
@@ -521,13 +533,17 @@ impl EcPeers {
         let mut candidates = Vec::new();
 
         // Walk forward from target (including target)
-        let forward: Vec<_> = self.peers.range(target..)
+        let forward: Vec<_> = self
+            .peers
+            .range(target..)
             .take(count)
             .map(|(id, _)| *id)
             .collect();
 
         // Walk backward from target (excluding target)
-        let backward: Vec<_> = self.peers.range(..target)
+        let backward: Vec<_> = self
+            .peers
+            .range(..target)
             .rev()
             .take(count)
             .map(|(id, _)| *id)
@@ -546,7 +562,8 @@ impl EcPeers {
 
     /// Check if a peer is active (Pending or Connected)
     pub fn is_active(&self, peer_id: &PeerId) -> bool {
-        self.peers.get(peer_id)
+        self.peers
+            .get(peer_id)
             .map(|peer| peer.state.is_pending() || peer.state.is_connected())
             .unwrap_or(false)
     }
@@ -556,14 +573,18 @@ impl EcPeers {
         let mut candidates = Vec::new();
 
         // Walk forward from target (including target)
-        let forward: Vec<_> = self.peers.range(target..)
+        let forward: Vec<_> = self
+            .peers
+            .range(target..)
             .filter(|(_, peer)| peer.state.is_pending() || peer.state.is_connected())
             .take(count)
             .map(|(id, _)| *id)
             .collect();
 
         // Walk backward from target (excluding target)
-        let backward: Vec<_> = self.peers.range(..target)
+        let backward: Vec<_> = self
+            .peers
+            .range(..target)
             .rev()
             .filter(|(_, peer)| peer.state.is_pending() || peer.state.is_connected())
             .take(count)
@@ -582,8 +603,12 @@ impl EcPeers {
     }
 
     /// Get commit chain head for a peer
-    pub fn get_commit_chain_head(&self, peer_id: &PeerId) -> Option<crate::ec_interface::CommitBlockId> {
-        self.peers.get(peer_id)
+    pub fn get_commit_chain_head(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<crate::ec_interface::CommitBlockId> {
+        self.peers
+            .get(peer_id)
             .and_then(|peer| peer.commit_chain_head)
     }
 
@@ -600,7 +625,7 @@ impl EcPeers {
     }
 
     // ========================================================================
-    // Message Handlers 
+    // Message Handlers
     // ========================================================================
 
     /// Handle an Answer message (election response or invitation)
@@ -630,7 +655,10 @@ impl EcPeers {
 
         if let Some(ongoing) = self.active_elections.get_mut(&challenge_token) {
             // Try to record the answer in the election
-            match ongoing.election.handle_answer(ticket, answer, signature, peer_id, time) {
+            match ongoing
+                .election
+                .handle_answer(ticket, answer, signature, peer_id, time)
+            {
                 Ok(()) => {
                     // Answer successfully recorded
                     self.update_keepalive(peer_id, time);
@@ -638,7 +666,8 @@ impl EcPeers {
                     // Winner will be detected in process_elections()
                     // Sample tokens from Answer for future discovery
                     // Answer contains: 1 answer token + 10 signature tokens + sender peer ID
-                    self.token_samples.sample_from_answer(answer, signature, peer_id);
+                    self.token_samples
+                        .sample_from_answer(answer, signature, peer_id);
                 }
                 Err(_e) => {
                     // Invalid signature or ticket, or channel already blocked
@@ -670,7 +699,10 @@ impl EcPeers {
 
         if let Some(peer) = self.peers.get_mut(&sender_peer_id) {
             match peer.state {
-                PeerState::Identified { last_invitation_election_at, .. } => {
+                PeerState::Identified {
+                    last_invitation_election_at,
+                    ..
+                } => {
                     // Peer is already known (from initial topology or discovery)
                     // Always respond regardless of distance (they're legitimate)
                     // Check per-peer invitation cooldown
@@ -683,10 +715,10 @@ impl EcPeers {
                     } else {
                         trigger_election = true
                     }
-                },
+                }
                 PeerState::Connected { .. } => {
                     self.update_keepalive(sender_peer_id, time);
-                },
+                }
                 PeerState::Pending { .. } => {
                     self.promote_to_connected(sender_peer_id, time);
                 }
@@ -694,7 +726,7 @@ impl EcPeers {
         } else {
             trigger_election = true
         }
-        
+
         if trigger_election {
             let accept_prob = self.invitation_acceptance_probability(sender_peer_id);
 
@@ -706,7 +738,7 @@ impl EcPeers {
             // Declined. Peer must retry at a later time
             // Lets NOT add it to Identified. This would allow user driven injection.
         }
-        
+
         return Vec::new();
     }
 
@@ -723,7 +755,10 @@ impl EcPeers {
         // Find the ongoing election for this token
         let action = if let Some(ongoing) = self.active_elections.get_mut(&token) {
             // Try to handle the referral
-            match ongoing.election.handle_referral(ticket, token, suggested_peers, sender) {
+            match ongoing
+                .election
+                .handle_referral(ticket, token, suggested_peers, sender)
+            {
                 Ok(next_peer) => {
                     // Election returned a suggested peer to try next
 
@@ -784,7 +819,10 @@ impl EcPeers {
         querier: PeerId,
     ) -> Option<PeerAction> {
         // Try to generate a signature (checks if we own the token)
-        if let Some(signature) = self.proof_system.generate_signature(token_storage, &token, &querier) {
+        if let Some(signature) =
+            self.proof_system
+                .generate_signature(token_storage, &token, &querier)
+        {
             // We own the token - send Answer
             return Some(PeerAction::SendAnswer {
                 answer: signature.answer,
@@ -876,7 +914,9 @@ impl EcPeers {
     }
 
     pub(crate) fn initial_vote_sequence_span(&self) -> u8 {
-        self.initial_vote_target_count().div_ceil(2).min(u8::MAX as usize) as u8
+        self.initial_vote_target_count()
+            .div_ceil(2)
+            .min(u8::MAX as usize) as u8
     }
 
     /// Collect the first outward span of vote targets for a role, deduplicated across
@@ -1090,7 +1130,12 @@ impl EcPeers {
     }
 
     /// Promote Identified peer to Pending after election win (we send Invitation)
-    fn promote_to_pending(&mut self, peer_id: PeerId, election_token: TokenId, time: EcTime) -> bool {
+    fn promote_to_pending(
+        &mut self,
+        peer_id: PeerId,
+        election_token: TokenId,
+        time: EcTime,
+    ) -> bool {
         let peer = match self.peers.get_mut(&peer_id) {
             Some(p) => p,
             None => return false, // Peer not found
@@ -1196,7 +1241,7 @@ impl EcPeers {
 
     // ========================================================================
     // Timeout Detection
-    // TODO looping over peers multiple time during tick - maybe combine 
+    // TODO looping over peers multiple time during tick - maybe combine
     // ========================================================================
 
     /// Detect and handle Pending peer timeouts
@@ -1206,7 +1251,10 @@ impl EcPeers {
         let mut timed_out = Vec::new();
 
         for (peer_id, peer) in &self.peers {
-            if let PeerState::Pending { invitation_sent_at, .. } = peer.state {
+            if let PeerState::Pending {
+                invitation_sent_at, ..
+            } = peer.state
+            {
                 if time - invitation_sent_at >= timeout_threshold {
                     timed_out.push(*peer_id);
                 }
@@ -1245,7 +1293,8 @@ impl EcPeers {
 
     /// Evict excess Identified peers (uniform random)
     fn evict_excess_identified(&mut self) {
-        let identified_peers: Vec<PeerId> = self.peers
+        let identified_peers: Vec<PeerId> = self
+            .peers
             .iter()
             .filter(|(_, p)| p.state.is_identified())
             .map(|(id, _)| *id)
@@ -1285,7 +1334,10 @@ impl EcPeers {
                 .peers
                 .iter()
                 .filter_map(|(peer_id, peer)| {
-                    if let PeerState::Connected { connected_since, .. } = peer.state {
+                    if let PeerState::Connected {
+                        connected_since, ..
+                    } = peer.state
+                    {
                         self.target_prune_weight(*peer_id, connected_since, time)
                             .map(|weight| (*peer_id, weight))
                     } else {
@@ -1326,10 +1378,14 @@ impl EcPeers {
 
         let ring_size = u64::MAX as f64 / 2.0; // Half ring (max distance)
 
-        let to_demote: Vec<PeerId> = self.peers
+        let to_demote: Vec<PeerId> = self
+            .peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if let PeerState::Connected { connected_since, .. } = peer.state {
+                if let PeerState::Connected {
+                    connected_since, ..
+                } = peer.state
+                {
                     // Protect recently connected peers
                     if time - connected_since < self.config.prune_protection_time {
                         return None;
@@ -1392,7 +1448,8 @@ impl EcPeers {
 
         for known_peer_id in self.peers.keys() {
             let known_distance = Self::ring_distance(self.peer_id, *known_peer_id);
-            if known_distance < distance || (known_distance == distance && *known_peer_id < peer_id) {
+            if known_distance < distance || (known_distance == distance && *known_peer_id < peer_id)
+            {
                 rank += 1;
             }
         }
@@ -1402,14 +1459,14 @@ impl EcPeers {
 
     fn connected_core_fill_ratio(&self) -> f64 {
         let (core_limit, _) = self.target_gradient_limits();
-        let mut closest_known = self
-            .peers
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        let mut closest_known = self.peers.keys().copied().collect::<Vec<_>>();
 
-        closest_known.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
-        let core_candidates = closest_known.into_iter().take(core_limit).collect::<Vec<_>>();
+        closest_known
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+        let core_candidates = closest_known
+            .into_iter()
+            .take(core_limit)
+            .collect::<Vec<_>>();
         if core_candidates.is_empty() {
             return 1.0;
         }
@@ -1506,8 +1563,9 @@ impl EcPeers {
         }
 
         // Pick N challenge tokens and remove them from collection
-        let mut challenge_tokens =
-            self.token_samples.pick_and_remove(elections_per_tick, &mut self.rng);
+        let mut challenge_tokens = self
+            .token_samples
+            .pick_and_remove(elections_per_tick, &mut self.rng);
 
         // If we don't have enough tokens, add random tokens to bootstrap discovery
         // Random tokens won't exist, so we'll get Referrals that populate Identified
@@ -1578,7 +1636,11 @@ impl EcPeers {
     }
 
     /// Create a new peer manager with custom configuration and specific RNG
-    pub fn with_config_and_rng(peer_id: PeerId, config: PeerManagerConfig, rng: rand::rngs::StdRng) -> Self {
+    pub fn with_config_and_rng(
+        peer_id: PeerId,
+        config: PeerManagerConfig,
+        rng: rand::rngs::StdRng,
+    ) -> Self {
         let proof_system = ProofOfStorage::new();
         let token_samples = TokenSampleCollection::new(config.token_sample_max_capacity);
 
@@ -1621,10 +1683,7 @@ impl EcPeers {
 
     /// Get number of Pending peers
     pub fn num_pending(&self) -> usize {
-        self.peers
-            .values()
-            .filter(|p| p.state.is_pending())
-            .count()
+        self.peers.values().filter(|p| p.state.is_pending()).count()
     }
 
     /// Get total number of active elections
@@ -1660,7 +1719,9 @@ impl EcPeers {
     ///
     /// Returns None if peer is unknown or head has not been learned yet.
     pub fn get_peer_commit_chain_head(&self, peer_id: &PeerId) -> Option<CommitBlockId> {
-        self.peers.get(peer_id).and_then(|peer| peer.commit_chain_head)
+        self.peers
+            .get(peer_id)
+            .and_then(|peer| peer.commit_chain_head)
     }
 
     /// Check if a peer is in Connected or Pending state
@@ -1668,7 +1729,8 @@ impl EcPeers {
     /// Returns true if the peer exists and is either Connected or Pending.
     /// Used by commit chain to filter peers worth tracking.
     pub fn is_peer_connected_or_pending(&self, peer_id: &PeerId) -> bool {
-        self.peers.get(peer_id)
+        self.peers
+            .get(peer_id)
             .map(|peer| peer.state.is_connected() || peer.state.is_pending())
             .unwrap_or(false)
     }
@@ -1767,7 +1829,11 @@ impl EcPeers {
         // Update last_invitation_election_at for spam prevention
         // If peer doesn't exist, add them to Identified state
         if let Some(peer) = self.peers.get_mut(&responder_peer) {
-            if let PeerState::Identified { last_invitation_election_at, .. } = &mut peer.state {
+            if let PeerState::Identified {
+                last_invitation_election_at,
+                ..
+            } = &mut peer.state
+            {
                 *last_invitation_election_at = Some(time);
             }
         } else {
@@ -1782,7 +1848,11 @@ impl EcPeers {
 
     /// Spawn N channels for an election
     /// Returns PeerActions to send Query messages for the channels
-    fn spawn_election_channels(&mut self, challenge_token: TokenId, time: EcTime) -> Vec<PeerAction> {
+    fn spawn_election_channels(
+        &mut self,
+        challenge_token: TokenId,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
         // Check if election exists
         if !self.active_elections.contains_key(&challenge_token) {
             return Vec::new(); // Election not found
@@ -1831,7 +1901,11 @@ impl EcPeers {
     }
 
     /// Process ongoing elections and check for winners
-    fn process_elections(&mut self, token_storage: &dyn TokenStorageBackend, time: EcTime) -> Vec<PeerAction> {
+    fn process_elections(
+        &mut self,
+        token_storage: &dyn TokenStorageBackend,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
         use crate::ec_proof_of_storage::WinnerResult;
         let mut actions = Vec::new();
         let mut to_resolve: Vec<(TokenId, usize)> = Vec::new();
@@ -1865,7 +1939,9 @@ impl EcPeers {
 
                 WinnerResult::SplitBrain { .. } => {
                     // Split-brain detected
-                    if elapsed < self.config.election_timeout && ongoing.election.can_create_channel() {
+                    if elapsed < self.config.election_timeout
+                        && ongoing.election.can_create_channel()
+                    {
                         // Try to resolve with more channels
                         let needed = 2;
                         to_resolve.push((token, needed));
@@ -1919,7 +1995,13 @@ impl EcPeers {
     }
 
     /// Handle successful election - add winner to peer list
-    fn handle_election_success(&mut self, token_storage: &dyn TokenStorageBackend, _token: TokenId, winner: PeerId, time: EcTime) -> Vec<PeerAction> {
+    fn handle_election_success(
+        &mut self,
+        token_storage: &dyn TokenStorageBackend,
+        _token: TokenId,
+        winner: PeerId,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
         let mut actions = Vec::new();
 
         // Check if winner is self (shouldn't happen, but be safe)
@@ -1929,7 +2011,10 @@ impl EcPeers {
 
         self.promote_to_pending(winner, _token, time);
         // Generate SendInvitation action
-        if let Some(sig) = self.proof_system.generate_signature(token_storage, &self.peer_id, &winner) {
+        if let Some(sig) =
+            self.proof_system
+                .generate_signature(token_storage, &self.peer_id, &winner)
+        {
             actions.push(PeerAction::SendInvitation {
                 receiver: winner,
                 answer: sig.answer,
@@ -1945,11 +2030,15 @@ impl EcPeers {
     // ========================================================================
 
     /// Main tick function - returns actions for EcNode to execute
-    pub fn tick(&mut self, token_storage: &dyn TokenStorageBackend, time: EcTime) -> Vec<PeerAction> {
+    pub fn tick(
+        &mut self,
+        token_storage: &dyn TokenStorageBackend,
+        time: EcTime,
+    ) -> Vec<PeerAction> {
         let mut actions = Vec::new();
 
         // Phase 1: Timeout detection
-        // TODO before evicting Pending - maybe re-send invite 
+        // TODO before evicting Pending - maybe re-send invite
         self.detect_pending_timeouts(time);
         self.detect_connection_timeouts(time);
 
@@ -2184,10 +2273,10 @@ mod tests {
         assert_eq!(collection.samples.len(), 6);
         assert!(collection.samples.contains(&100)); // answer token
         assert!(collection.samples.contains(&500)); // sender peer ID
-        assert!(collection.samples.contains(&1));   // sig tokens
+        assert!(collection.samples.contains(&1)); // sig tokens
         assert!(collection.samples.contains(&2));
         assert!(collection.samples.contains(&3));
-        assert!(collection.samples.contains(&0));   // zero token
+        assert!(collection.samples.contains(&0)); // zero token
     }
 
     #[test]
@@ -2337,10 +2426,8 @@ mod tests {
         config.connected_target_hysteresis = 4;
 
         let connected_far = [
-            10, 20, 30, 40, 50, 60, 70, 80,
-            90, 100, 110, 120, 130, 140, 150, 160,
-            250, 260, 270, 280, 290, 300, 310, 320,
-            330, 340, 350, 360, 370, 380,
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 250, 260, 270,
+            280, 290, 300, 310, 320, 330, 340, 350, 360, 370, 380,
         ];
         let nearby_known = [180, 190, 200, 210, 220, 230, 240];
 

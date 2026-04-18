@@ -8,15 +8,12 @@
 mod peer_lifecycle;
 
 use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-    InitialNetworkState,
+    EventSchedule, InitialNetworkState, PeerLifecycleConfig, PeerLifecycleRunner,
     TokenDistributionConfig,
-    EventSchedule,
 };
+use std::env;
 use std::fs;
 use std::path::Path;
-use std::env;
 
 /// Simplified scenario file format
 #[derive(Debug, serde::Deserialize)]
@@ -87,7 +84,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <scenario.yaml | directory/> [--seed SEED_HEX]", args[0]);
+        eprintln!(
+            "Usage: {} <scenario.yaml | directory/> [--seed SEED_HEX]",
+            args[0]
+        );
         eprintln!("\nExamples:");
         eprintln!("  {} scenarios/bootstrap.yaml", args[0]);
         eprintln!("  {} scenarios/", args[0]);
@@ -121,8 +121,9 @@ fn run_scenario_directory(dir: &Path, seed: Option<[u8; 32]>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("yaml") ||
-               path.extension().and_then(|s| s.to_str()) == Some("yml") {
+            if path.extension().and_then(|s| s.to_str()) == Some("yaml")
+                || path.extension().and_then(|s| s.to_str()) == Some("yml")
+            {
                 scenarios.push(path);
             }
         }
@@ -141,7 +142,12 @@ fn run_scenario_directory(dir: &Path, seed: Option<[u8; 32]>) {
     println!("Found {} scenario(s) to run\n", scenarios.len());
 
     for (i, scenario_path) in scenarios.iter().enumerate() {
-        println!("\n{}/{} Running: {}\n", i + 1, scenarios.len(), scenario_path.display());
+        println!(
+            "\n{}/{} Running: {}\n",
+            i + 1,
+            scenarios.len(),
+            scenario_path.display()
+        );
         run_scenario_file(scenario_path, seed);
     }
 
@@ -154,24 +160,29 @@ fn run_scenario_file(path: &Path, seed: Option<[u8; 32]>) {
     println!("Loading scenario from: {}", path.display());
 
     // Load and parse YAML
-    let yaml_content = fs::read_to_string(path)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read {}: {}", path.display(), e);
-            std::process::exit(1);
-        });
+    let yaml_content = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
 
-    let scenario: ScenarioFile = serde_yaml::from_str(&yaml_content)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to parse {}: {}", path.display(), e);
-            std::process::exit(1);
-        });
+    let scenario: ScenarioFile = serde_yaml::from_str(&yaml_content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
 
     // Print scenario header
     println!("\n╔════════════════════════════════════════════════════════╗");
     if let Some(ref name) = scenario.meta.name {
-        println!("║  {}  {}", name, " ".repeat(54_usize.saturating_sub(name.len())));
+        println!(
+            "║  {}  {}",
+            name,
+            " ".repeat(54_usize.saturating_sub(name.len()))
+        );
     } else {
-        println!("║  Scenario: {}  ", path.file_stem().unwrap().to_str().unwrap());
+        println!(
+            "║  Scenario: {}  ",
+            path.file_stem().unwrap().to_str().unwrap()
+        );
     }
     println!("╚════════════════════════════════════════════════════════╝\n");
 
@@ -235,7 +246,10 @@ fn run_scenario_file(path: &Path, seed: Option<[u8; 32]>) {
     println!("  Initial Peers: {}", config.initial_state.num_peers);
     println!("  Topology: {:?}", config.initial_state.initial_topology);
     println!("  Total Tokens: {}", config.token_distribution.total_tokens);
-    println!("  Coverage: {:.0}%", config.token_distribution.coverage_fraction * 100.0);
+    println!(
+        "  Coverage: {:.0}%",
+        config.token_distribution.coverage_fraction * 100.0
+    );
     println!("\nStarting simulation...\n");
 
     // Run simulation
@@ -257,11 +271,10 @@ fn parse_seed_hex(hex: &str) -> [u8; 32] {
             break;
         }
         let byte_str = std::str::from_utf8(chunk).unwrap();
-        seed[i] = u8::from_str_radix(byte_str, 16)
-            .unwrap_or_else(|e| {
-                eprintln!("Invalid hex seed: {}", e);
-                std::process::exit(1);
-            });
+        seed[i] = u8::from_str_radix(byte_str, 16).unwrap_or_else(|e| {
+            eprintln!("Invalid hex seed: {}", e);
+            std::process::exit(1);
+        });
     }
 
     seed

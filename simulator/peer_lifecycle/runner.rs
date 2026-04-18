@@ -2,13 +2,15 @@
 
 use super::config::{BootstrapMethod, PeerLifecycleConfig};
 use super::stats::*;
-use super::topology::{
-    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
-    build_ring_gradient_topology,
-};
 use super::token_allocation::GlobalTokenMapping;
+use super::topology::{
+    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
+    build_ring_core_tail_topology, build_ring_gradient_topology,
+};
+use ec_rust::ec_interface::{
+    EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
+};
 use ec_rust::ec_memory_backend::MemTokens;
-use ec_rust::ec_interface::{EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE};
 use ec_rust::ec_peers::{EcPeers, PeerAction};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -22,16 +24,16 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct PeerLifecycleRunner {
     config: PeerLifecycleConfig,
     rng: StdRng,
-    seed: [u8; 32],  // Stored for reproducibility reporting
+    seed: [u8; 32], // Stored for reproducibility reporting
     current_round: usize,
 
     // Network state
     peers: BTreeMap<PeerId, SimPeer>,
-    global_mapping: Option<GlobalTokenMapping>,  // Stored for dynamic peer allocation
+    global_mapping: Option<GlobalTokenMapping>, // Stored for dynamic peer allocation
 
     // Peer group tracking
     peer_groups: BTreeMap<String, PeerGroup>,
-    peer_to_group: BTreeMap<PeerId, String>,  // Maps peer ID to group name
+    peer_to_group: BTreeMap<PeerId, String>, // Maps peer ID to group name
 
     // Message queue
     messages: VecDeque<MessageEnvelope>,
@@ -56,7 +58,7 @@ struct SimPeer {
     peer_id: PeerId,
     peer_manager: EcPeers,
     token_storage: MemTokens,
-    known_tokens: Vec<TokenId>,  // Tokens in this peer's view
+    known_tokens: Vec<TokenId>, // Tokens in this peer's view
     active: bool,
 }
 
@@ -192,7 +194,8 @@ impl PeerLifecycleRunner {
         // Allocate peer IDs from the token pool
         let mut peer_ids = Vec::with_capacity(num_peers);
         for _ in 0..num_peers {
-            let peer_id = global_mapping.allocate_peer_id()
+            let peer_id = global_mapping
+                .allocate_peer_id()
                 .expect("Failed to allocate peer ID from token pool - increase total_tokens");
             peer_ids.push(peer_id);
         }
@@ -217,7 +220,8 @@ impl PeerLifecycleRunner {
 
             // Create peer manager with seeded RNG
             let peer_rng = StdRng::from_seed(self.rng.gen());
-            let peer_manager = EcPeers::with_config_and_rng(peer_id, self.config.peer_config.clone(), peer_rng);
+            let peer_manager =
+                EcPeers::with_config_and_rng(peer_id, self.config.peer_config.clone(), peer_rng);
 
             let peer = SimPeer {
                 peer_id,
@@ -245,14 +249,18 @@ impl PeerLifecycleRunner {
             coverage_fraction: self.config.token_distribution.coverage_fraction,
         };
 
-        self.peer_groups.insert("initial".to_string(), initial_group);
+        self.peer_groups
+            .insert("initial".to_string(), initial_group);
         for peer_id in peer_ids {
             self.peer_to_group.insert(peer_id, "initial".to_string());
         }
     }
 
     /// Initialize network with genesis token allocation (new implementation)
-    fn initialize_network_with_genesis(&mut self, genesis_config: ec_rust::ec_genesis::GenesisConfig) {
+    fn initialize_network_with_genesis(
+        &mut self,
+        genesis_config: ec_rust::ec_genesis::GenesisConfig,
+    ) {
         use super::token_allocation::GenesisTokenSet;
         use ec_rust::ec_genesis::generate_genesis;
         use ec_rust::ec_memory_backend::MemoryBackend;
@@ -263,19 +271,24 @@ impl PeerLifecycleRunner {
         println!("╔════════════════════════════════════════════════════════╗");
         println!("║  Genesis Bootstrap Mode                               ║");
         println!("╚════════════════════════════════════════════════════════╝");
-        println!("Generating {} genesis tokens...", genesis_config.block_count);
+        println!(
+            "Generating {} genesis tokens...",
+            genesis_config.block_count
+        );
         println!("Allocating {} peer IDs from genesis tokens...", num_peers);
-        println!("Each peer stores {:.0}% of the ring", storage_fraction * 100.0);
+        println!(
+            "Each peer stores {:.0}% of the ring",
+            storage_fraction * 100.0
+        );
         println!();
 
         // 1. Pre-generate all genesis token IDs
-        let mut genesis_set = GenesisTokenSet::new(
-            &genesis_config,
-            StdRng::from_seed(self.rng.gen()),
-        );
+        let mut genesis_set =
+            GenesisTokenSet::new(&genesis_config, StdRng::from_seed(self.rng.gen()));
 
         // 2. Allocate peer IDs from genesis tokens
-        let peer_ids = genesis_set.allocate_peer_ids(num_peers)
+        let peer_ids = genesis_set
+            .allocate_peer_ids(num_peers)
             .expect("Failed to allocate peer IDs from genesis tokens");
 
         println!("Allocated {} peer IDs", peer_ids.len());
@@ -283,16 +296,17 @@ impl PeerLifecycleRunner {
 
         // 3. Create each peer with genesis-generated storage
         for (idx, peer_id) in peer_ids.iter().enumerate() {
-            println!("  [{}/{}] Starting genesis for peer {:016x}...",
-                idx + 1, peer_ids.len(), peer_id);
+            println!(
+                "  [{}/{}] Starting genesis for peer {:016x}...",
+                idx + 1,
+                peer_ids.len(),
+                peer_id
+            );
 
             // Create peer manager first (needed for genesis)
             let peer_rng = StdRng::from_seed(self.rng.gen());
-            let mut peer_manager = EcPeers::with_config_and_rng(
-                *peer_id,
-                self.config.peer_config.clone(),
-                peer_rng,
-            );
+            let mut peer_manager =
+                EcPeers::with_config_and_rng(*peer_id, self.config.peer_config.clone(), peer_rng);
 
             // Create backend for this peer
             let mut backend = MemoryBackend::new();
@@ -304,14 +318,20 @@ impl PeerLifecycleRunner {
                 &mut peer_manager,
                 storage_fraction,
                 &mut self.rng,
-            ).expect("Genesis generation failed");
+            )
+            .expect("Genesis generation failed");
 
             // Extract token storage (using Clone we just added)
             let token_storage = backend.tokens().clone();
 
             // Progress reporting - show completion
-            println!("  [{}/{}] ✓ Peer {:016x} complete ({} tokens stored)",
-                idx + 1, peer_ids.len(), peer_id, stored_count);
+            println!(
+                "  [{}/{}] ✓ Peer {:016x} complete ({} tokens stored)",
+                idx + 1,
+                peer_ids.len(),
+                peer_id,
+                stored_count
+            );
 
             let peer = SimPeer {
                 peer_id: *peer_id,
@@ -337,9 +357,11 @@ impl PeerLifecycleRunner {
             coverage_fraction: storage_fraction,
         };
 
-        self.peer_groups.insert("genesis-cold-start".to_string(), initial_group);
+        self.peer_groups
+            .insert("genesis-cold-start".to_string(), initial_group);
         for peer_id in peer_ids {
-            self.peer_to_group.insert(peer_id, "genesis-cold-start".to_string());
+            self.peer_to_group
+                .insert(peer_id, "genesis-cold-start".to_string());
         }
 
         println!("✓ Genesis bootstrap complete\n");
@@ -356,7 +378,8 @@ impl PeerLifecycleRunner {
             TopologyMode::FullyKnown { connected_fraction } => {
                 // Every peer knows every other peer
                 for (peer_id, peer) in &mut self.peers {
-                    let mut known_peers: Vec<PeerId> = peer_ids.iter()
+                    let mut known_peers: Vec<PeerId> = peer_ids
+                        .iter()
                         .filter(|&&id| id != *peer_id)
                         .copied()
                         .collect();
@@ -377,7 +400,10 @@ impl PeerLifecycleRunner {
                 }
             }
 
-            TopologyMode::LocalKnowledge { peer_knowledge_fraction, connected_fraction } => {
+            TopologyMode::LocalKnowledge {
+                peer_knowledge_fraction,
+                connected_fraction,
+            } => {
                 // Peers know subset of neighbors based on view_width
                 let mut total_known = 0;
                 let mut total_connected = 0;
@@ -411,8 +437,7 @@ impl PeerLifecycleRunner {
             }
 
             TopologyMode::Ring { neighbors } => {
-                let adjacency =
-                    build_ring_gradient_topology(&peer_ids, *neighbors, &mut self.rng);
+                let adjacency = build_ring_gradient_topology(&peer_ids, *neighbors, &mut self.rng);
 
                 for (peer_id, connected_peers) in adjacency {
                     if let Some(peer) = self.peers.get_mut(&peer_id) {
@@ -484,14 +509,16 @@ impl PeerLifecycleRunner {
 
                 for (peer_id, peer) in &mut self.peers {
                     // Get all other peers
-                    let mut available_peers: Vec<PeerId> = peer_ids.iter()
+                    let mut available_peers: Vec<PeerId> = peer_ids
+                        .iter()
                         .filter(|&&id| id != *peer_id)
                         .copied()
                         .collect();
 
                     // Shuffle and take N peers
                     available_peers.shuffle(&mut self.rng);
-                    let selected_peers: Vec<PeerId> = available_peers.iter()
+                    let selected_peers: Vec<PeerId> = available_peers
+                        .iter()
                         .take(*peers_per_node)
                         .copied()
                         .collect();
@@ -515,7 +542,10 @@ impl PeerLifecycleRunner {
     /// so we only support topologies that don't depend on ring distance knowledge:
     /// - Isolated: No initial connections (most realistic for cold start)
     /// - RandomIdentified: Each peer knows N random others (bootstrap scenario)
-    fn initialize_topology_genesis(&mut self, _genesis_set: &super::token_allocation::GenesisTokenSet) {
+    fn initialize_topology_genesis(
+        &mut self,
+        _genesis_set: &super::token_allocation::GenesisTokenSet,
+    ) {
         use super::config::TopologyMode;
         use rand::seq::SliceRandom;
 
@@ -529,18 +559,23 @@ impl PeerLifecycleRunner {
 
             TopologyMode::RandomIdentified { peers_per_node } => {
                 // Each peer gets N random peers in Identified state
-                println!("✓ Topology: RandomIdentified ({} peers per node)", peers_per_node);
+                println!(
+                    "✓ Topology: RandomIdentified ({} peers per node)",
+                    peers_per_node
+                );
 
                 for (peer_id, peer) in &mut self.peers {
                     // Get all other peers
-                    let mut available_peers: Vec<PeerId> = peer_ids.iter()
+                    let mut available_peers: Vec<PeerId> = peer_ids
+                        .iter()
                         .filter(|&&id| id != *peer_id)
                         .copied()
                         .collect();
 
                     // Shuffle and take N peers
                     available_peers.shuffle(&mut self.rng);
-                    let selected_peers: Vec<PeerId> = available_peers.iter()
+                    let selected_peers: Vec<PeerId> = available_peers
+                        .iter()
                         .take(*peers_per_node)
                         .copied()
                         .collect();
@@ -602,7 +637,9 @@ impl PeerLifecycleRunner {
     /// Deliver a single message to recipient
     fn deliver_message(&mut self, envelope: MessageEnvelope) {
         // Check if recipient exists and is active
-        let is_active = self.peers.get(&envelope.to)
+        let is_active = self
+            .peers
+            .get(&envelope.to)
             .map(|p| p.active)
             .unwrap_or(false);
 
@@ -614,25 +651,46 @@ impl PeerLifecycleRunner {
             SimMessage::QueryToken { token, ticket } => {
                 // Use EcPeers.handle_query to generate response
                 if let Some(peer) = self.peers.get(&envelope.to) {
-                    let action = peer.peer_manager.handle_query(&peer.token_storage, token, ticket, envelope.from);
+                    let action = peer.peer_manager.handle_query(
+                        &peer.token_storage,
+                        token,
+                        ticket,
+                        envelope.from,
+                    );
 
                     if let Some(action) = action {
                         let sender_id = envelope.to;
                         let receiver = envelope.from;
                         match action {
-                            PeerAction::SendAnswer { answer, signature, ticket } => {
-                                self.send_message(sender_id, receiver, SimMessage::Answer {
-                                    answer,
-                                    signature,
-                                    ticket,
-                                });
+                            PeerAction::SendAnswer {
+                                answer,
+                                signature,
+                                ticket,
+                            } => {
+                                self.send_message(
+                                    sender_id,
+                                    receiver,
+                                    SimMessage::Answer {
+                                        answer,
+                                        signature,
+                                        ticket,
+                                    },
+                                );
                             }
-                            PeerAction::SendReferral { token, ticket, suggested_peers } => {
-                                self.send_message(sender_id, receiver, SimMessage::Referral {
-                                    token,
-                                    ticket,
-                                    suggested_peers,
-                                });
+                            PeerAction::SendReferral {
+                                token,
+                                ticket,
+                                suggested_peers,
+                            } => {
+                                self.send_message(
+                                    sender_id,
+                                    receiver,
+                                    SimMessage::Referral {
+                                        token,
+                                        ticket,
+                                        suggested_peers,
+                                    },
+                                );
                             }
                             _ => {
                                 // Ignore other action types
@@ -642,7 +700,11 @@ impl PeerLifecycleRunner {
                 }
             }
 
-            SimMessage::Answer { answer, signature, ticket } => {
+            SimMessage::Answer {
+                answer,
+                signature,
+                ticket,
+            } => {
                 // Peer received answer - route to election
                 if let Some(peer) = self.peers.get_mut(&envelope.to) {
                     let current_time = self.current_round as EcTime;
@@ -658,7 +720,11 @@ impl PeerLifecycleRunner {
                 }
             }
 
-            SimMessage::Referral { token, ticket, suggested_peers } => {
+            SimMessage::Referral {
+                token,
+                ticket,
+                suggested_peers,
+            } => {
                 // Peer received referral - route to election and spawn new channels
                 if let Some(peer) = self.peers.get_mut(&envelope.to) {
                     let current_time = self.current_round as EcTime;
@@ -674,12 +740,20 @@ impl PeerLifecycleRunner {
                     let peer_id = envelope.to;
                     if let Some(action) = actions {
                         match action {
-                            PeerAction::SendQuery { receiver, token, ticket } => {
-                                self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
+                            PeerAction::SendQuery {
+                                receiver,
+                                token,
+                                ticket,
+                            } => {
+                                self.send_message(
+                                    peer_id,
+                                    receiver,
+                                    SimMessage::QueryToken { token, ticket },
+                                );
                             }
-                            PeerAction::SendAnswer { .. } |
-                            PeerAction::SendReferral { .. } |
-                            PeerAction::SendInvitation { .. } => {
+                            PeerAction::SendAnswer { .. }
+                            | PeerAction::SendReferral { .. }
+                            | PeerAction::SendInvitation { .. } => {
                                 // Ignore for now
                             }
                         }
@@ -697,7 +771,8 @@ impl PeerLifecycleRunner {
             SimMessage::Referral { .. } => self.total_messages.referrals += 1,
         }
 
-        self.messages.push_back(MessageEnvelope { from, to, message });
+        self.messages
+            .push_back(MessageEnvelope { from, to, message });
     }
 
     /// Tick all active peers
@@ -717,11 +792,31 @@ impl PeerLifecycleRunner {
                 // Process actions
                 for action in actions {
                     match action {
-                        PeerAction::SendQuery { receiver, token, ticket } => {
-                            self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
+                        PeerAction::SendQuery {
+                            receiver,
+                            token,
+                            ticket,
+                        } => {
+                            self.send_message(
+                                peer_id,
+                                receiver,
+                                SimMessage::QueryToken { token, ticket },
+                            );
                         }
-                        PeerAction::SendInvitation { receiver, answer, signature } => {
-                            self.send_message(peer_id, receiver, SimMessage::Answer { answer, signature, ticket: 0 });
+                        PeerAction::SendInvitation {
+                            receiver,
+                            answer,
+                            signature,
+                        } => {
+                            self.send_message(
+                                peer_id,
+                                receiver,
+                                SimMessage::Answer {
+                                    answer,
+                                    signature,
+                                    ticket: 0,
+                                },
+                            );
                         }
                         _ => {
                             panic!("Unexpected Action returned from tick")
@@ -739,10 +834,10 @@ impl PeerLifecycleRunner {
 
     /// Collect metrics for current round
     fn collect_metrics(&mut self) {
-        use std::collections::BTreeMap;
-        use super::stats::calculate_gradient_steepness;
-        use super::stats::calculate_gradient_distribution;
         use super::stats::calculate_connected_peer_distribution;
+        use super::stats::calculate_gradient_distribution;
+        use super::stats::calculate_gradient_steepness;
+        use std::collections::BTreeMap;
 
         let mut metrics = RoundMetrics::new(
             self.current_round,
@@ -780,7 +875,8 @@ impl PeerLifecycleRunner {
                 connected_counts.push(num_connected);
 
                 // Collect election stats from this peer
-                let (started, completed, timeout, splitbrain) = peer.peer_manager.get_election_stats();
+                let (started, completed, timeout, splitbrain) =
+                    peer.peer_manager.get_election_stats();
                 total_elections_started += started;
                 total_elections_completed += completed;
                 total_elections_timeout += timeout;
@@ -794,9 +890,21 @@ impl PeerLifecycleRunner {
         }
 
         // Calculate averages
-        let avg_identified = if active_count > 0 { total_identified / active_count } else { 0 };
-        let avg_pending = if active_count > 0 { total_pending / active_count } else { 0 };
-        let avg_connected = if active_count > 0 { total_connected / active_count } else { 0 };
+        let avg_identified = if active_count > 0 {
+            total_identified / active_count
+        } else {
+            0
+        };
+        let avg_pending = if active_count > 0 {
+            total_pending / active_count
+        } else {
+            0
+        };
+        let avg_connected = if active_count > 0 {
+            total_connected / active_count
+        } else {
+            0
+        };
 
         metrics.peer_counts = PeerCounts {
             total_peers: self.peers.len(),
@@ -813,12 +921,14 @@ impl PeerLifecycleRunner {
             let avg = connected_counts.iter().sum::<usize>() as f64 / connected_counts.len() as f64;
 
             // Calculate standard deviation
-            let variance = connected_counts.iter()
+            let variance = connected_counts
+                .iter()
                 .map(|&count| {
                     let diff = count as f64 - avg;
                     diff * diff
                 })
-                .sum::<f64>() / connected_counts.len() as f64;
+                .sum::<f64>()
+                / connected_counts.len() as f64;
             let stddev = variance.sqrt();
 
             // Calculate connected peer count distribution (quartiles by default)
@@ -861,7 +971,10 @@ impl PeerLifecycleRunner {
         use super::config::NetworkEvent;
 
         // Find events scheduled for this round
-        let events_for_round: Vec<NetworkEvent> = self.config.events.events
+        let events_for_round: Vec<NetworkEvent> = self
+            .config
+            .events
+            .events
             .iter()
             .filter(|e| e.round == self.current_round)
             .map(|e| e.event.clone())
@@ -872,22 +985,41 @@ impl PeerLifecycleRunner {
                 NetworkEvent::ReportStats { label } => {
                     self.report_current_stats(label);
                 }
-                NetworkEvent::NetworkCondition { delay_fraction, loss_fraction } => {
+                NetworkEvent::NetworkCondition {
+                    delay_fraction,
+                    loss_fraction,
+                } => {
                     if let Some(delay) = delay_fraction {
                         self.config.network.delay_fraction = delay;
-                        println!("  [Round {}] Network delay changed to {:.1}%", self.current_round, delay * 100.0);
+                        println!(
+                            "  [Round {}] Network delay changed to {:.1}%",
+                            self.current_round,
+                            delay * 100.0
+                        );
                     }
                     if let Some(loss) = loss_fraction {
                         self.config.network.loss_fraction = loss;
-                        println!("  [Round {}] Network loss changed to {:.1}%", self.current_round, loss * 100.0);
+                        println!(
+                            "  [Round {}] Network loss changed to {:.1}%",
+                            self.current_round,
+                            loss * 100.0
+                        );
                     }
                 }
-                NetworkEvent::PeerJoin { count, coverage_fraction, bootstrap_method, group_name } => {
+                NetworkEvent::PeerJoin {
+                    count,
+                    coverage_fraction,
+                    bootstrap_method,
+                    group_name,
+                } => {
                     self.handle_peer_join(count, coverage_fraction, bootstrap_method, group_name);
                 }
                 // TODO: Implement other events (PeerCrash, PeerLeave, PauseElections)
                 _ => {
-                    println!("  [Round {}] Event {:?} not yet implemented", self.current_round, event);
+                    println!(
+                        "  [Round {}] Event {:?} not yet implemented",
+                        self.current_round, event
+                    );
                 }
             }
         }
@@ -903,8 +1035,13 @@ impl PeerLifecycleRunner {
     ) {
         let group_name = group_name.unwrap_or_else(|| format!("join-r{}", self.current_round));
 
-        println!("  [Round {}] {} peers joining (group: '{}', coverage: {:.0}%)",
-            self.current_round, count, group_name, coverage_fraction * 100.0);
+        println!(
+            "  [Round {}] {} peers joining (group: '{}', coverage: {:.0}%)",
+            self.current_round,
+            count,
+            group_name,
+            coverage_fraction * 100.0
+        );
 
         // Check if we're in genesis mode
         if self.config.token_distribution.genesis_config.is_some() {
@@ -927,15 +1064,17 @@ impl PeerLifecycleRunner {
         use ec_rust::ec_memory_backend::MemoryBackend;
 
         // Get genesis config
-        let genesis_config = self.config.token_distribution.genesis_config.clone()
+        let genesis_config = self
+            .config
+            .token_distribution
+            .genesis_config
+            .clone()
             .expect("Genesis config should be Some in genesis mode");
 
         // Re-create GenesisTokenSet to allocate new peer IDs
         // (This regenerates all token IDs - we could optimize by caching)
-        let mut genesis_set = GenesisTokenSet::new(
-            &genesis_config,
-            StdRng::from_seed(self.rng.gen()),
-        );
+        let mut genesis_set =
+            GenesisTokenSet::new(&genesis_config, StdRng::from_seed(self.rng.gen()));
 
         // Get existing peer IDs for bootstrap
         let existing_peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
@@ -944,7 +1083,8 @@ impl PeerLifecycleRunner {
         let initial_knowledge = match bootstrap_method {
             BootstrapMethod::Random(n) => {
                 use rand::seq::SliceRandom;
-                existing_peer_ids.choose_multiple(&mut self.rng, n)
+                existing_peer_ids
+                    .choose_multiple(&mut self.rng, n)
                     .copied()
                     .collect()
             }
@@ -953,18 +1093,16 @@ impl PeerLifecycleRunner {
         };
 
         // Allocate peer IDs for new peers
-        let new_peer_ids = genesis_set.allocate_peer_ids(count)
+        let new_peer_ids = genesis_set
+            .allocate_peer_ids(count)
             .expect("Failed to allocate peer IDs from genesis tokens");
 
         // Create each new peer with genesis generation
         for peer_id in &new_peer_ids {
             // Create peer manager
             let peer_rng = StdRng::from_seed(self.rng.gen());
-            let mut peer_manager = EcPeers::with_config_and_rng(
-                *peer_id,
-                self.config.peer_config.clone(),
-                peer_rng,
-            );
+            let mut peer_manager =
+                EcPeers::with_config_and_rng(*peer_id, self.config.peer_config.clone(), peer_rng);
 
             // Create backend and run genesis (using shared RNG)
             let mut backend = MemoryBackend::new();
@@ -974,7 +1112,8 @@ impl PeerLifecycleRunner {
                 &mut peer_manager,
                 coverage_fraction,
                 &mut self.rng,
-            ).expect("Genesis generation failed for late joiner");
+            )
+            .expect("Genesis generation failed for late joiner");
 
             // Extract token storage
             let token_storage = backend.tokens().clone();
@@ -1026,7 +1165,9 @@ impl PeerLifecycleRunner {
         bootstrap_method: BootstrapMethod,
         group_name: String,
     ) {
-        let global_mapping = self.global_mapping.as_mut()
+        let global_mapping = self
+            .global_mapping
+            .as_mut()
             .expect("Global mapping not initialized in Random mode");
 
         // Resolve bootstrap method to actual peer IDs
@@ -1034,12 +1175,14 @@ impl PeerLifecycleRunner {
             BootstrapMethod::Random(n) => {
                 // Get existing peer IDs and randomly select N
                 use rand::seq::SliceRandom;
-                let existing_peers: Vec<PeerId> = global_mapping.allocated_peer_ids()
+                let existing_peers: Vec<PeerId> = global_mapping
+                    .allocated_peer_ids()
                     .iter()
                     .copied()
                     .collect();
 
-                existing_peers.choose_multiple(&mut self.rng, n)
+                existing_peers
+                    .choose_multiple(&mut self.rng, n)
                     .copied()
                     .collect()
             }
@@ -1061,22 +1204,21 @@ impl PeerLifecycleRunner {
         let mut new_peer_ids = Vec::new();
         for _ in 0..count {
             // Allocate peer ID from token pool
-            let peer_id = global_mapping.allocate_peer_id()
+            let peer_id = global_mapping
+                .allocate_peer_id()
                 .expect("Failed to allocate peer ID from token pool - increase total_tokens");
 
             // Get this peer's view as ready-to-use MemTokens
-            let token_storage = global_mapping.get_peer_view(
-                peer_id,
-                view_width,
-                coverage_fraction,
-            );
+            let token_storage =
+                global_mapping.get_peer_view(peer_id, view_width, coverage_fraction);
 
             // known_tokens is just for tracking (empty for now)
             let known_tokens = Vec::new();
 
             // Create peer manager with seeded RNG
             let peer_rng = StdRng::from_seed(self.rng.gen());
-            let mut peer_manager = EcPeers::with_config_and_rng(peer_id, self.config.peer_config.clone(), peer_rng);
+            let mut peer_manager =
+                EcPeers::with_config_and_rng(peer_id, self.config.peer_config.clone(), peer_rng);
 
             // Add initial knowledge (bootstrap peers)
             // Note: initial_knowledge is passed from the event but could also use a strategy
@@ -1123,7 +1265,9 @@ impl PeerLifecycleRunner {
 
     /// Report current statistics (for ReportStats event)
     fn report_current_stats(&mut self, label: Option<String>) {
-        use super::stats::{RoundMetrics, calculate_gradient_steepness, calculate_gradient_distribution};
+        use super::stats::{
+            calculate_gradient_distribution, calculate_gradient_steepness, RoundMetrics,
+        };
         use std::collections::BTreeMap;
 
         let checkpoint_label = label.unwrap_or_else(|| format!("Round {}", self.current_round));
@@ -1159,7 +1303,8 @@ impl PeerLifecycleRunner {
                 total_connected += num_connected;
                 connected_counts.push(num_connected);
 
-                let (started, completed, timeout, splitbrain) = peer.peer_manager.get_election_stats();
+                let (started, completed, timeout, splitbrain) =
+                    peer.peer_manager.get_election_stats();
                 total_elections_started += started;
                 total_elections_completed += completed;
                 total_elections_timeout += timeout;
@@ -1173,16 +1318,38 @@ impl PeerLifecycleRunner {
 
         println!("\n  Peer States:");
         println!("    Active: {}", active_count);
-        println!("    Identified: {} avg", if active_count > 0 { total_identified / active_count } else { 0 });
-        println!("    Pending: {} avg", if active_count > 0 { total_pending / active_count } else { 0 });
-        println!("    Connected: {} avg", if active_count > 0 { total_connected / active_count } else { 0 });
+        println!(
+            "    Identified: {} avg",
+            if active_count > 0 {
+                total_identified / active_count
+            } else {
+                0
+            }
+        );
+        println!(
+            "    Pending: {} avg",
+            if active_count > 0 {
+                total_pending / active_count
+            } else {
+                0
+            }
+        );
+        println!(
+            "    Connected: {} avg",
+            if active_count > 0 {
+                total_connected / active_count
+            } else {
+                0
+            }
+        );
 
         println!("\n  Elections:");
         println!("    Started: {}", total_elections_started);
         println!("    Completed: {}", total_elections_completed);
         println!("    Timed Out: {}", total_elections_timeout);
         if total_elections_started > 0 {
-            let success_rate = (total_elections_completed as f64 / total_elections_started as f64) * 100.0;
+            let success_rate =
+                (total_elections_completed as f64 / total_elections_started as f64) * 100.0;
             println!("    Success Rate: {:.1}%", success_rate);
         }
 
@@ -1191,21 +1358,29 @@ impl PeerLifecycleRunner {
             let max = *connected_counts.iter().max().unwrap();
             let avg = connected_counts.iter().sum::<usize>() as f64 / connected_counts.len() as f64;
 
-            println!("\n  Connected Peers: min={}, max={}, avg={:.1}", min, max, avg);
+            println!(
+                "\n  Connected Peers: min={}, max={}, avg={:.1}",
+                min, max, avg
+            );
         }
 
         if !peer_steepness_map.is_empty() {
             let gradient_dist = calculate_gradient_distribution(&peer_steepness_map, 4);
-            println!("\n  Locality Gradient: avg={:.3}, strong (≥0.7)={:.1}%",
-                gradient_dist.avg_steepness,
-                gradient_dist.near_ideal_percent);
+            println!(
+                "\n  Locality Gradient: avg={:.3}, strong (≥0.7)={:.1}%",
+                gradient_dist.avg_steepness, gradient_dist.near_ideal_percent
+            );
         }
 
-        println!("\n  Messages: {} total ({} queries, {} answers, {} referrals)",
-            self.total_messages.queries + self.total_messages.answers + self.total_messages.referrals,
+        println!(
+            "\n  Messages: {} total ({} queries, {} answers, {} referrals)",
+            self.total_messages.queries
+                + self.total_messages.answers
+                + self.total_messages.referrals,
             self.total_messages.queries,
             self.total_messages.answers,
-            self.total_messages.referrals);
+            self.total_messages.referrals
+        );
 
         // Per-group statistics
         if self.peer_groups.len() > 1 {
@@ -1238,16 +1413,23 @@ impl PeerLifecycleRunner {
                 }
 
                 if !group_connected.is_empty() {
-                    let avg_connected = group_connected.iter().sum::<usize>() as f64 / group_connected.len() as f64;
-                    let avg_locality = group_steepness.iter().sum::<f64>() / group_steepness.len() as f64;
+                    let avg_connected =
+                        group_connected.iter().sum::<usize>() as f64 / group_connected.len() as f64;
+                    let avg_locality =
+                        group_steepness.iter().sum::<f64>() / group_steepness.len() as f64;
                     let success_rate = if group_elections_started > 0 {
                         (group_elections_completed as f64 / group_elections_started as f64) * 100.0
                     } else {
                         0.0
                     };
 
-                    println!("\n  Group '{}' ({} peers, joined round {}, coverage {:.0}%):",
-                        group_name, group.peer_ids.len(), group.join_round, group.coverage_fraction * 100.0);
+                    println!(
+                        "\n  Group '{}' ({} peers, joined round {}, coverage {:.0}%):",
+                        group_name,
+                        group.peer_ids.len(),
+                        group.join_round,
+                        group.coverage_fraction * 100.0
+                    );
                     println!("    Avg Connected: {:.1}", avg_connected);
                     println!("    Locality: {:.3}", avg_locality);
                     println!("    Election Success: {:.1}%", success_rate);
@@ -1260,11 +1442,15 @@ impl PeerLifecycleRunner {
 
     /// Build final simulation result
     fn build_result(self) -> SimulationResult {
-        let final_metrics = self.metrics_history.last().cloned().unwrap_or_else(|| {
-            RoundMetrics::new(0, 0)
-        });
+        let final_metrics = self
+            .metrics_history
+            .last()
+            .cloned()
+            .unwrap_or_else(|| RoundMetrics::new(0, 0));
 
-        let total_messages = self.total_messages.queries + self.total_messages.answers + self.total_messages.referrals;
+        let total_messages = self.total_messages.queries
+            + self.total_messages.answers
+            + self.total_messages.referrals;
         let messages_per_peer_per_round = if self.config.rounds > 0 && !self.peers.is_empty() {
             total_messages as f64 / (self.config.rounds * self.peers.len()) as f64
         } else {

@@ -16,8 +16,8 @@ pub use config::{
 };
 pub use runner::IntegratedRunner;
 pub use stats::{
-    ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary,
-    MempoolPressureSummary, MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary,
-    OnboardingSummary, RecoverySummary, RoundMetrics, SimResult, TransactionSpreadSummary,
-    TransactionWorkloadSummary, VoteIngressSummary,
+    ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary, MempoolPressureSummary,
+    MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary, OnboardingSummary,
+    RecoverySummary, RoundMetrics, SimResult, TransactionSpreadSummary, TransactionWorkloadSummary,
+    VoteIngressSummary,
 };

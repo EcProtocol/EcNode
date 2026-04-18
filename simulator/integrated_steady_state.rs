@@ -8,10 +8,12 @@ use std::env;
 use ec_rust::ec_peers::AdaptiveNeighborhoodConfig;
 
 use integrated::{
-    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
-    TransactionSourcePolicy,
+    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig,
+    TransactionFlowConfig, TransactionSourcePolicy,
 };
-use peer_lifecycle::{InitialNetworkState, NetworkEvent, ScheduledEvent, TokenDistributionConfig, TopologyMode};
+use peer_lifecycle::{
+    InitialNetworkState, NetworkEvent, ScheduledEvent, TokenDistributionConfig, TopologyMode,
+};
 
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name)
@@ -47,9 +49,9 @@ fn env_bool(name: &str, default: bool) -> bool {
 
 fn fixed_seed(variant: u64) -> [u8; 32] {
     let mut seed = [
-        0x45, 0x63, 0x68, 0x6f, 0x2d, 0x53, 0x74, 0x65, 0x61, 0x64, 0x79, 0x2d, 0x53, 0x74,
-        0x61, 0x74, 0x65, 0x2d, 0x30, 0x31, 0x2d, 0x42, 0x61, 0x73, 0x65, 0x6c, 0x69, 0x6e,
-        0x65, 0x2d, 0x58, 0x59,
+        0x45, 0x63, 0x68, 0x6f, 0x2d, 0x53, 0x74, 0x65, 0x61, 0x64, 0x79, 0x2d, 0x53, 0x74, 0x61,
+        0x74, 0x65, 0x2d, 0x30, 0x31, 0x2d, 0x42, 0x61, 0x73, 0x65, 0x6c, 0x69, 0x6e, 0x65, 0x2d,
+        0x58, 0x59,
     ];
 
     for (idx, byte) in variant.to_le_bytes().iter().enumerate() {
@@ -74,10 +76,10 @@ fn main() {
         env_usize("EC_STEADY_STATE_LINEAR_GUARANTEED_NEIGHBORS", 0);
     let neighborhood_width = env_usize("EC_STEADY_STATE_NEIGHBORHOOD_WIDTH", 6);
     let vote_target_count = env_usize("EC_STEADY_STATE_VOTE_TARGETS", 2);
-    let vote_active_rounds = env_usize("EC_STEADY_STATE_VOTE_ACTIVE_ROUNDS", 4)
-        .min(u8::MAX as usize) as u8;
-    let vote_pairs_per_tick = env_usize("EC_STEADY_STATE_VOTE_PAIRS_PER_TICK", 1)
-        .min(u8::MAX as usize) as u8;
+    let vote_active_rounds =
+        env_usize("EC_STEADY_STATE_VOTE_ACTIVE_ROUNDS", 4).min(u8::MAX as usize) as u8;
+    let vote_pairs_per_tick =
+        env_usize("EC_STEADY_STATE_VOTE_PAIRS_PER_TICK", 1).min(u8::MAX as usize) as u8;
     let adaptive_far_width = env_usize("EC_STEADY_STATE_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_STEADY_STATE_ADAPTIVE_HOP_THRESHOLD", 0);
     let blocks_per_round = env_usize("EC_STEADY_STATE_BLOCKS_PER_ROUND", 3);
@@ -95,10 +97,7 @@ fn main() {
     let connected_hysteresis = env_usize("EC_STEADY_STATE_CONNECTED_HYSTERESIS", 0);
     let elections_when_over_target =
         env_usize("EC_STEADY_STATE_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
-    let connection_timeout = env_u64(
-        "EC_STEADY_STATE_CONNECTION_TIMEOUT",
-        rounds as u64 + 10_000,
-    );
+    let connection_timeout = env_u64("EC_STEADY_STATE_CONNECTION_TIMEOUT", rounds as u64 + 10_000);
 
     println!("╔════════════════════════════════════════════════════════╗");
     println!("║  Integrated Steady-State Simulator                    ║");
@@ -113,7 +112,10 @@ fn main() {
         println!("Ring tail: linear fade to zero by ±{}", ring_neighbors * 2);
     } else if topology == "ring_core_tail" {
         println!("Guaranteed ring neighbors on each side: {}", ring_neighbors);
-        println!("Ring fade tail: linear fade to zero by ±{}", ring_neighbors * 2);
+        println!(
+            "Ring fade tail: linear fade to zero by ±{}",
+            ring_neighbors * 2
+        );
         println!(
             "Long-range tail peers per side: {} (evenly spaced beyond the fade band)",
             ring_tail_peers_per_side
@@ -123,9 +125,7 @@ fn main() {
     } else if topology == "ring_linear_probability" {
         println!(
             "Ring topology: full-ring linear probability, center {:.2}, far {:.2}, guaranteed ±{}",
-            ring_linear_center_prob,
-            ring_linear_far_prob,
-            ring_linear_guaranteed_neighbors
+            ring_linear_center_prob, ring_linear_far_prob, ring_linear_guaranteed_neighbors
         );
     }
     println!("Neighborhood width: {}", neighborhood_width);
@@ -142,7 +142,11 @@ fn main() {
     println!(
         "Batching: {}, vote replies: {}",
         if enable_batching { "on" } else { "off" },
-        if batch_vote_replies { "batched" } else { "standalone" }
+        if batch_vote_replies {
+            "batched"
+        } else {
+            "standalone"
+        }
     );
     println!(
         "Existing-token workload target: {:.0}%",

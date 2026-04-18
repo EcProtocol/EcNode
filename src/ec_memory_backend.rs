@@ -9,13 +9,13 @@
 
 use std::collections::HashMap;
 
+use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 use crate::ec_interface::{
     BatchedBackend, Block, BlockId, BlockTime, CommitBlock, CommitBlockId, EcBlocks,
     EcCommitChainBackend, EcTime, EcTokens, EcTokensV2, PeerId, PendingMapping, StorageBatch,
     TokenId, TokenSignature, TokenState, TrustSource, TrustedMapping,
 };
 use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
-use crate::ec_commit_chain::{CommitChainConfig, EcCommitChain};
 
 // ============================================================================
 // In-Memory Token Storage
@@ -64,9 +64,7 @@ pub struct MemTokens {
 impl MemTokens {
     /// Create a new empty in-memory token storage
     pub fn new() -> Self {
-        Self {
-            tokens: Vec::new(),
-        }
+        Self { tokens: Vec::new() }
     }
 
     /// Create from unsorted mappings (will be sorted internally)
@@ -156,7 +154,10 @@ impl TokenStorageBackend for MemTokens {
             .ok()
             .and_then(|idx| {
                 // Only return from current (trusted) slot
-                self.tokens[idx].1.current.map(|c| BlockTime::new(c.block, c.parent, c.time))
+                self.tokens[idx]
+                    .1
+                    .current
+                    .map(|c| BlockTime::new(c.block, c.parent, c.time))
             })
     }
 
@@ -210,8 +211,8 @@ impl TokenStorageBackend for MemTokens {
 
         // Find starting position for forward search using binary search
         let start_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _)| *t) {
-            Ok(idx) => idx + 1,  // Found exact match, start after it
-            Err(idx) => idx,     // Not found, idx is insertion point (first token > lookup_token)
+            Ok(idx) => idx + 1, // Found exact match, start after it
+            Err(idx) => idx,    // Not found, idx is insertion point (first token > lookup_token)
         };
 
         // Search forward (above) for first 5 chunks
@@ -249,7 +250,7 @@ impl TokenStorageBackend for MemTokens {
 
         // Find starting position for backward search
         let end_idx = match self.tokens.binary_search_by_key(lookup_token, |(t, _)| *t) {
-            Ok(idx) => idx.saturating_sub(1),  // Found exact match, start before it
+            Ok(idx) => idx.saturating_sub(1), // Found exact match, start before it
             Err(idx) => idx.saturating_sub(1), // Not found, start at position before insertion point
         };
 
@@ -637,7 +638,8 @@ impl MemoryBackend {
     /// stored tokens, blocks, and persisted commit-chain history.
     pub fn reset_runtime_state(&mut self) {
         let my_range = crate::ec_peers::PeerRange::new(0, u64::MAX);
-        self.commit_chain = EcCommitChain::new(self.peer_id, my_range, CommitChainConfig::default());
+        self.commit_chain =
+            EcCommitChain::new(self.peer_id, my_range, CommitChainConfig::default());
     }
 
     /// Get immutable reference to token storage
@@ -721,7 +723,8 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
         time: EcTime,
         source_peer: PeerId,
     ) {
-        self.sync_tokens.push((*token, *block, *parent, time, source_peer));
+        self.sync_tokens
+            .push((*token, *block, *parent, time, source_peer));
     }
 
     fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
@@ -737,7 +740,9 @@ impl<'a> StorageBatch for MemoryBatch<'a> {
 
         // Apply sync token updates (two-slot state machine)
         for (token, block, parent, time, source_peer) in &self.sync_tokens {
-            self.backend.tokens.update_token_sync(token, block, parent, *time, *source_peer);
+            self.backend
+                .tokens
+                .update_token_sync(token, block, parent, *time, *source_peer);
         }
 
         // Create commit block if we committed any blocks
@@ -861,9 +866,16 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
         self.commit_chain_backend.lookup(&block_id)
     }
 
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: crate::ec_interface::MessageTicket, _current_time: EcTime) -> Option<crate::ec_interface::ParentBlockRequest> {
+    fn handle_commit_block(
+        &mut self,
+        block: CommitBlock,
+        sender: PeerId,
+        ticket: crate::ec_interface::MessageTicket,
+        _current_time: EcTime,
+    ) -> Option<crate::ec_interface::ParentBlockRequest> {
         // handle_commit_block expects &dyn EcBlocks as the last parameter
-        let accepted = self.commit_chain
+        let accepted = self
+            .commit_chain
             .handle_commit_block(block, sender, ticket, &self.blocks);
         // Return None since we don't implement parent block requests yet
         if accepted {
@@ -873,9 +885,12 @@ impl crate::ec_interface::EcCommitChainAccess for MemoryBackend {
         }
     }
 
-    fn handle_block(&mut self, block: crate::ec_interface::Block, ticket: crate::ec_interface::MessageTicket) -> bool {
-        self.commit_chain
-            .handle_block(block, ticket)
+    fn handle_block(
+        &mut self,
+        block: crate::ec_interface::Block,
+        ticket: crate::ec_interface::MessageTicket,
+    ) -> bool {
+        self.commit_chain.handle_block(block, ticket)
     }
 
     fn commit_chain_tick(
@@ -1016,7 +1031,11 @@ mod tests {
         // Add many tokens to potentially complete a signature
         for i in 0..2000 {
             let test_token = (token + i * 100) | (i % 1024);
-            let parent = if i == 0 { GENESIS_BLOCK_ID } else { block + i - 1 };
+            let parent = if i == 0 {
+                GENESIS_BLOCK_ID
+            } else {
+                block + i - 1
+            };
             TokenStorageBackend::set(&mut storage, &test_token, &(block + i), &parent, i);
         }
 
@@ -1181,7 +1200,12 @@ mod tests {
             batch.save_block(&block);
             // Add token updates
             for i in 0..block.used as usize {
-                batch.update_token(&block.parts[i].token, &block.id, &block.parts[i].last, block.time);
+                batch.update_token(
+                    &block.parts[i].token,
+                    &block.id,
+                    &block.parts[i].last,
+                    block.time,
+                );
             }
             assert_eq!(batch.block_count(), 1);
             batch.commit().unwrap();
@@ -1277,7 +1301,12 @@ mod tests {
                 batch.save_block(block);
                 // Add token updates for this block
                 for i in 0..block.used as usize {
-                    batch.update_token(&block.parts[i].token, &block.id, &block.parts[i].last, block.time);
+                    batch.update_token(
+                        &block.parts[i].token,
+                        &block.id,
+                        &block.parts[i].last,
+                        block.time,
+                    );
                 }
             }
             assert_eq!(batch.block_count(), 3);

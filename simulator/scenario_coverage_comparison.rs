@@ -12,12 +12,8 @@
 mod peer_lifecycle;
 
 use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-    InitialNetworkState,
-    TokenDistributionConfig,
-    TopologyMode,
-    ScenarioBuilder,
+    InitialNetworkState, PeerLifecycleConfig, PeerLifecycleRunner, ScenarioBuilder,
+    TokenDistributionConfig, TopologyMode,
 };
 
 fn run_simulation(coverage: f64, label: &str) -> (f64, f64, f64) {
@@ -40,7 +36,7 @@ fn run_simulation(coverage: f64, label: &str) -> (f64, f64, f64) {
     config.initial_state = InitialNetworkState {
         num_peers: 30,
         initial_topology: TopologyMode::RandomIdentified {
-            peers_per_node: 5,  // Same for both
+            peers_per_node: 5, // Same for both
         },
         bootstrap_rounds: 100,
     };
@@ -49,7 +45,7 @@ fn run_simulation(coverage: f64, label: &str) -> (f64, f64, f64) {
     config.token_distribution = TokenDistributionConfig {
         total_tokens: 100_000,
         neighbor_overlap: 10,
-        coverage_fraction: coverage,  // VARIED
+        coverage_fraction: coverage, // VARIED
         genesis_config: None,
         genesis_storage_fraction: 0.25,
     };
@@ -58,11 +54,16 @@ fn run_simulation(coverage: f64, label: &str) -> (f64, f64, f64) {
 
     // Add reporting checkpoints
     config.events = ScenarioBuilder::new()
-        .at_round(100).report_stats("Mid-simulation")
-        .at_round(200).report_stats("Final state")
+        .at_round(100)
+        .report_stats("Mid-simulation")
+        .at_round(200)
+        .report_stats("Final state")
         .build();
 
-    println!("Configuration: {}% token coverage\n", (coverage * 100.0) as usize);
+    println!(
+        "Configuration: {}% token coverage\n",
+        (coverage * 100.0) as usize
+    );
 
     // Run simulation
     let runner = PeerLifecycleRunner::new(config);
@@ -70,18 +71,28 @@ fn run_simulation(coverage: f64, label: &str) -> (f64, f64, f64) {
 
     // Extract key metrics
     let avg_connected = result.final_metrics.network_health.avg_connected_peers;
-    let locality = result.final_metrics.network_health.gradient_distribution
+    let locality = result
+        .final_metrics
+        .network_health
+        .gradient_distribution
         .as_ref()
         .map(|g| g.avg_steepness)
         .unwrap_or(0.0);
-    let strong_locality_pct = result.final_metrics.network_health.gradient_distribution
+    let strong_locality_pct = result
+        .final_metrics
+        .network_health
+        .gradient_distribution
         .as_ref()
         .map(|g| g.near_ideal_percent)
         .unwrap_or(0.0);
 
     let election_success_rate = if result.final_metrics.election_stats.total_elections_started > 0 {
-        (result.final_metrics.election_stats.total_elections_completed as f64 /
-         result.final_metrics.election_stats.total_elections_started as f64) * 100.0
+        (result
+            .final_metrics
+            .election_stats
+            .total_elections_completed as f64
+            / result.final_metrics.election_stats.total_elections_started as f64)
+            * 100.0
     } else {
         0.0
     };
@@ -128,16 +139,22 @@ fn main() {
     println!("├────────────────────────────────┼──────────┼──────────┼──────────┤");
 
     let connected_delta = ((high_connected - med_connected) / med_connected) * 100.0;
-    println!("│ Avg Connected Peers            │  {:6.1}  │  {:6.1}  │  {:+6.1}  │",
-             high_connected, med_connected, connected_delta);
+    println!(
+        "│ Avg Connected Peers            │  {:6.1}  │  {:6.1}  │  {:+6.1}  │",
+        high_connected, med_connected, connected_delta
+    );
 
     let locality_delta = ((high_locality - med_locality) / med_locality) * 100.0;
-    println!("│ Locality Coefficient           │  {:6.3}  │  {:6.3}  │  {:+6.1}  │",
-             high_locality, med_locality, locality_delta);
+    println!(
+        "│ Locality Coefficient           │  {:6.3}  │  {:6.3}  │  {:+6.1}  │",
+        high_locality, med_locality, locality_delta
+    );
 
     let success_delta = high_success - med_success;
-    println!("│ Election Success Rate (%)      │  {:6.1}  │  {:6.1}  │  {:+6.1}  │",
-             high_success, med_success, success_delta);
+    println!(
+        "│ Election Success Rate (%)      │  {:6.1}  │  {:6.1}  │  {:+6.1}  │",
+        high_success, med_success, success_delta
+    );
 
     println!("└────────────────────────────────┴──────────┴──────────┴──────────┘\n");
 
@@ -145,15 +162,19 @@ fn main() {
     println!("Findings:\n");
 
     if high_connected > med_connected * 1.1 {
-        println!("✓ High token coverage ({:.0}%) resulted in {:.0}% more connections",
-                 95.0, connected_delta);
+        println!(
+            "✓ High token coverage ({:.0}%) resulted in {:.0}% more connections",
+            95.0, connected_delta
+        );
     } else {
         println!("⚠ Token coverage had minimal impact on connection count");
     }
 
     if high_success > med_success + 5.0 {
-        println!("✓ High coverage improved election success rate by {:.1} percentage points",
-                 success_delta);
+        println!(
+            "✓ High coverage improved election success rate by {:.1} percentage points",
+            success_delta
+        );
     } else {
         println!("⚠ Election success rates were similar regardless of coverage");
     }

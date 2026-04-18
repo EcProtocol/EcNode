@@ -58,7 +58,9 @@ impl TokenStorageBackend for HashMapTokens {
         _lookup_token: &TokenId,
         _signature_chunks: &[u16; ec_rust::ec_proof_of_storage::SIGNATURE_CHUNKS],
     ) -> SignatureSearchResult {
-        panic!("HashMapTokens does not support signature search - use MemTokens or similar instead");
+        panic!(
+            "HashMapTokens does not support signature search - use MemTokens or similar instead"
+        );
     }
 
     fn len(&self) -> usize {

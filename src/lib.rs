@@ -52,14 +52,14 @@
 #![allow(unexpected_cfgs)]
 
 // Core consensus modules
+pub mod ec_commit_chain;
+pub mod ec_genesis;
+pub mod ec_identity;
 pub mod ec_interface;
 pub mod ec_mempool;
 pub mod ec_node;
 pub mod ec_peers;
 pub mod ec_proof_of_storage;
-pub mod ec_commit_chain;
-pub mod ec_identity;
-pub mod ec_genesis;
 pub mod ec_ticket_manager;
 
 // Storage backends

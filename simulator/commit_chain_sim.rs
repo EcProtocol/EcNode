@@ -44,7 +44,10 @@ fn main() {
     info!("Configuration:");
     info!("  Peers: {}", config.num_peers);
     info!("  Rounds: {}", config.rounds);
-    info!("  Blocks per round: {}", config.block_injection.blocks_per_round);
+    info!(
+        "  Blocks per round: {}",
+        config.block_injection.blocks_per_round
+    );
     info!("  Network delay: {}", config.network.delay_fraction);
     info!("  Network loss: {}", config.network.loss_fraction);
     info!("");

@@ -4,8 +4,8 @@ mod integrated;
 mod peer_lifecycle;
 
 use integrated::{
-    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
-    TransactionSourcePolicy,
+    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig,
+    TransactionFlowConfig, TransactionSourcePolicy,
 };
 use peer_lifecycle::{
     BootstrapMethod, InitialNetworkState, NetworkEvent, ScheduledEvent, TokenDistributionConfig,
@@ -22,9 +22,7 @@ fn main() {
     config.rounds = 180;
     config.initial_state = InitialNetworkState {
         num_peers: 24,
-        initial_topology: TopologyMode::RandomIdentified {
-            peers_per_node: 4,
-        },
+        initial_topology: TopologyMode::RandomIdentified { peers_per_node: 4 },
         bootstrap_rounds: 0,
     };
     config.token_distribution = TokenDistributionConfig {

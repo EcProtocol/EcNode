@@ -86,10 +86,8 @@ impl EcRocksDb {
             CF_TOKENS,
             Self::tokens_cf_options_with_cache(cache.clone()),
         );
-        let cf_blocks = ColumnFamilyDescriptor::new(
-            CF_BLOCKS,
-            Self::blocks_cf_options_with_cache(cache),
-        );
+        let cf_blocks =
+            ColumnFamilyDescriptor::new(CF_BLOCKS, Self::blocks_cf_options_with_cache(cache));
 
         let db = DB::open_cf_descriptors(&db_opts, path, vec![cf_tokens, cf_blocks])?;
 
@@ -234,7 +232,9 @@ impl RocksDbTokens {
     /// Get column family handle for tokens
     #[inline]
     fn cf_handle(&self) -> &rocksdb::ColumnFamily {
-        self.db.cf_handle(CF_TOKENS).expect("tokens CF should exist")
+        self.db
+            .cf_handle(CF_TOKENS)
+            .expect("tokens CF should exist")
     }
 }
 
@@ -553,7 +553,9 @@ impl RocksDbBlocks {
     /// Get column family handle for blocks
     #[inline]
     fn cf_handle(&self) -> &rocksdb::ColumnFamily {
-        self.db.cf_handle(CF_BLOCKS).expect("blocks CF should exist")
+        self.db
+            .cf_handle(CF_BLOCKS)
+            .expect("blocks CF should exist")
     }
 }
 
@@ -732,7 +734,10 @@ mod tests {
     fn test_encoding_preserves_order() {
         let tokens = [1u64, 100, 1000, 10000, 100000];
 
-        let encoded: Vec<_> = tokens.iter().map(|t| RocksDbTokens::encode_key(t)).collect();
+        let encoded: Vec<_> = tokens
+            .iter()
+            .map(|t| RocksDbTokens::encode_key(t))
+            .collect();
 
         // Encoded bytes should maintain sort order
         for i in 1..encoded.len() {

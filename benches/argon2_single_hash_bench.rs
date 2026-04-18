@@ -2,9 +2,9 @@ use argon2::{
     password_hash::{PasswordHasher, SaltString},
     Argon2, Params, Version,
 };
+use rand::rngs::OsRng;
 use std::time::Instant;
 use x25519_dalek::{PublicKey, StaticSecret};
-use rand::rngs::OsRng;
 
 /// Benchmark single Argon2 computation cost (= validation cost)
 fn main() {
@@ -33,8 +33,10 @@ fn main() {
         ("Production Current (64 MiB, 3 iter)", 65536, 3),
     ];
 
-    println!("{:<40} {:>12} {:>15} {:>20}",
-             "Configuration", "Time (ms)", "Validations/s", "Expected Mining");
+    println!(
+        "{:<40} {:>12} {:>15} {:>20}",
+        "Configuration", "Time (ms)", "Validations/s", "Expected Mining"
+    );
     println!("{}", "-".repeat(90));
 
     for (name, memory_kib, time_cost) in configs {
@@ -66,8 +68,10 @@ fn main() {
         let target_attempts = 86400.0 * 1000.0 / avg_time_ms;
         let required_difficulty = target_attempts.log2();
 
-        println!("{:<40} {:>12.2} {:>15.0} {:>20.1} bits",
-                 name, avg_time_ms, validations_per_sec, required_difficulty);
+        println!(
+            "{:<40} {:>12.2} {:>15.0} {:>20.1} bits",
+            name, avg_time_ms, validations_per_sec, required_difficulty
+        );
     }
 
     println!("\n{}", "=".repeat(90));

@@ -167,7 +167,11 @@ impl TicketManager {
     ///     None => println!("Invalid ticket - reject"),
     /// }
     /// ```
-    pub fn validate_ticket(&self, ticket: MessageTicket, block_id: BlockId) -> Option<BlockUseCase> {
+    pub fn validate_ticket(
+        &self,
+        ticket: MessageTicket,
+        block_id: BlockId,
+    ) -> Option<BlockUseCase> {
         // Try current secret
         if let Some(use_case) = self.try_validate(&self.current_secret, ticket, block_id) {
             return Some(use_case);
@@ -182,7 +186,12 @@ impl TicketManager {
     }
 
     /// Attempt validation with a specific secret
-    fn try_validate(&self, secret: &[u8; 32], ticket: MessageTicket, block_id: BlockId) -> Option<BlockUseCase> {
+    fn try_validate(
+        &self,
+        secret: &[u8; 32],
+        ticket: MessageTicket,
+        block_id: BlockId,
+    ) -> Option<BlockUseCase> {
         let hash = self.hash_with_secret(secret, block_id);
 
         // Check against all use case secrets
@@ -372,9 +381,21 @@ mod tests {
         assert_ne!(ticket2, ticket3);
 
         // Each should validate to correct use case
-        assert_eq!(manager.validate_ticket(ticket1, block_id), Some(BlockUseCase::MempoolBlock));
-        assert_eq!(manager.validate_ticket(ticket2, block_id), Some(BlockUseCase::ParentBlock));
-        assert_eq!(manager.validate_ticket(ticket3, block_id), Some(BlockUseCase::CommitChain));
-        assert_eq!(manager.validate_ticket(ticket4, block_id), Some(BlockUseCase::ValidateWith));
+        assert_eq!(
+            manager.validate_ticket(ticket1, block_id),
+            Some(BlockUseCase::MempoolBlock)
+        );
+        assert_eq!(
+            manager.validate_ticket(ticket2, block_id),
+            Some(BlockUseCase::ParentBlock)
+        );
+        assert_eq!(
+            manager.validate_ticket(ticket3, block_id),
+            Some(BlockUseCase::CommitChain)
+        );
+        assert_eq!(
+            manager.validate_ticket(ticket4, block_id),
+            Some(BlockUseCase::ValidateWith)
+        );
     }
 }

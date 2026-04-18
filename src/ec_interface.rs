@@ -204,7 +204,12 @@ impl CommitBlock {
     ///
     /// Note: In simulation, the id is just assigned sequentially.
     /// In production, it should be Blake3(previous || time || committed_blocks)
-    pub fn new(id: CommitBlockId, previous: CommitBlockId, time: EcTime, committed_blocks: Vec<BlockId>) -> Self {
+    pub fn new(
+        id: CommitBlockId,
+        previous: CommitBlockId,
+        time: EcTime,
+        committed_blocks: Vec<BlockId>,
+    ) -> Self {
         Self {
             id,
             previous,
@@ -253,7 +258,6 @@ pub enum Message {
     InitialVote {
         block: Block,
         vote: u8,
-        reply: bool,
     },
     Vote {
         block_id: BlockId,
@@ -276,7 +280,7 @@ pub enum Message {
     Answer {
         answer: TokenMapping,
         signature: [TokenMapping; TOKENS_SIGNATURE_SIZE],
-        head_of_chain: CommitBlockId,  // Head of sender's commit chain (0 for nodes without commit chain)
+        head_of_chain: CommitBlockId, // Head of sender's commit chain (0 for nodes without commit chain)
     },
     Block {
         block: Block,
@@ -452,14 +456,18 @@ pub const GENESIS_BLOCK_ID: BlockId = 0;
 #[derive(Copy, Clone, Debug)]
 pub struct BlockTime {
     pub(crate) block: BlockId,
-    pub(crate) parent: BlockId,  // Parent block in token chain (GENESIS_BLOCK_ID for new tokens)
+    pub(crate) parent: BlockId, // Parent block in token chain (GENESIS_BLOCK_ID for new tokens)
     pub(crate) time: EcTime,
 }
 
 impl BlockTime {
     /// Create a new BlockTime
     pub fn new(block: BlockId, parent: BlockId, time: EcTime) -> Self {
-        Self { block, parent, time }
+        Self {
+            block,
+            parent,
+            time,
+        }
     }
 
     /// Get the block ID
@@ -522,7 +530,13 @@ pub struct TokenState {
 impl TokenState {
     /// Check if current state is Local
     pub fn is_local(&self) -> bool {
-        matches!(self.current, Some(TrustedMapping { source: TrustSource::Local, .. }))
+        matches!(
+            self.current,
+            Some(TrustedMapping {
+                source: TrustSource::Local,
+                ..
+            })
+        )
     }
 
     /// Get current block ID if exists
@@ -612,7 +626,13 @@ pub trait EcCommitChainAccess {
     ///
     /// Verifies ticket and stores block in peer log if from tracked peer.
     /// Returns optional request data for parent block if needed (respecting max_sync_age).
-    fn handle_commit_block(&mut self, block: CommitBlock, sender: PeerId, ticket: MessageTicket, current_time: EcTime) -> Option<ParentBlockRequest>;
+    fn handle_commit_block(
+        &mut self,
+        block: CommitBlock,
+        sender: PeerId,
+        ticket: MessageTicket,
+        current_time: EcTime,
+    ) -> Option<ParentBlockRequest>;
 
     /// Handle an incoming transaction block from a peer
     ///
@@ -632,7 +652,12 @@ pub trait EcCommitChainAccess {
     ///
     /// # Returns
     /// List of (peer_id, message) tuples for ec_node to convert to messages
-    fn commit_chain_tick(&mut self, peers: &crate::ec_peers::EcPeers, mempool: &mut crate::ec_mempool::EcMemPool, time: EcTime) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)>;
+    fn commit_chain_tick(
+        &mut self,
+        peers: &crate::ec_peers::EcPeers,
+        mempool: &mut crate::ec_mempool::EcMemPool,
+        time: EcTime,
+    ) -> Vec<(PeerId, crate::ec_commit_chain::TickMessage)>;
 }
 
 // ============================================================================
@@ -786,10 +811,7 @@ pub enum Event {
         from_peer: PeerId,
     },
     /// Identity-block received from a peer
-    IdentityBlockReceived {
-        peer_id: TokenId,
-        sender: PeerId,
-    },
+    IdentityBlockReceived { peer_id: TokenId, sender: PeerId },
 }
 
 /// Trait for consuming events from the consensus system

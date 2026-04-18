@@ -9,8 +9,8 @@ use ec_rust::ec_genesis::GenesisConfig;
 use ec_rust::ec_peers::AdaptiveNeighborhoodConfig;
 
 use integrated::{
-    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
-    TransactionSourcePolicy,
+    ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig,
+    TransactionFlowConfig, TransactionSourcePolicy,
 };
 use peer_lifecycle::{
     BootstrapMethod, InitialNetworkState, NetworkEvent, PeerSelection, ScheduledEvent,
@@ -51,9 +51,9 @@ fn env_bool(name: &str, default: bool) -> bool {
 
 fn fixed_seed(variant: u64) -> [u8; 32] {
     let mut seed = [
-        0x45, 0x63, 0x68, 0x6f, 0x2d, 0x43, 0x6f, 0x6e, 0x73, 0x65, 0x6e, 0x74, 0x2d, 0x50,
-        0x4f, 0x43, 0x2d, 0x4c, 0x6f, 0x6e, 0x67, 0x2d, 0x52, 0x75, 0x6e, 0x2d, 0x30, 0x31,
-        0x2d, 0x58, 0x59, 0x5a,
+        0x45, 0x63, 0x68, 0x6f, 0x2d, 0x43, 0x6f, 0x6e, 0x73, 0x65, 0x6e, 0x74, 0x2d, 0x50, 0x4f,
+        0x43, 0x2d, 0x4c, 0x6f, 0x6e, 0x67, 0x2d, 0x52, 0x75, 0x6e, 0x2d, 0x30, 0x31, 0x2d, 0x58,
+        0x59, 0x5a,
     ];
 
     for (idx, byte) in variant.to_le_bytes().iter().enumerate() {
@@ -89,7 +89,8 @@ fn main() {
     let prune_protection_time = env_u64("EC_LONG_RUN_PRUNE_PROTECTION_TIME", 600);
     let connected_target = env_usize("EC_LONG_RUN_CONNECTED_TARGET", 0);
     let connected_hysteresis = env_usize("EC_LONG_RUN_CONNECTED_HYSTERESIS", 0);
-    let elections_when_over_target = env_usize("EC_LONG_RUN_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
+    let elections_when_over_target =
+        env_usize("EC_LONG_RUN_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
     let focus_first_crash = env_bool("EC_LONG_RUN_FOCUS_FIRST_CRASH", false);
     let focus_report_delta = env_usize("EC_LONG_RUN_FOCUS_REPORT_DELTA", 12);
     println!("╔════════════════════════════════════════════════════════╗");
@@ -105,7 +106,11 @@ fn main() {
     println!(
         "Batching: {}, vote replies: {}",
         if enable_batching { "on" } else { "off" },
-        if batch_vote_replies { "batched" } else { "standalone" }
+        if batch_vote_replies {
+            "batched"
+        } else {
+            "standalone"
+        }
     );
     println!(
         "Existing-token workload target: {:.0}%",
@@ -231,7 +236,9 @@ fn main() {
         ScheduledEvent {
             round: return_round,
             event: NetworkEvent::PeerReturn {
-                selection: PeerSelection::Random { count: return_count },
+                selection: PeerSelection::Random {
+                    count: return_count,
+                },
                 bootstrap_method: BootstrapMethod::Random(4),
             },
         },
@@ -284,7 +291,10 @@ fn main() {
                 },
             },
         ]);
-        config.events.events.sort_by_key(|scheduled| scheduled.round);
+        config
+            .events
+            .events
+            .sort_by_key(|scheduled| scheduled.round);
     }
 
     let runner = IntegratedRunner::new(config);

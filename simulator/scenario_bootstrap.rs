@@ -11,12 +11,8 @@
 mod peer_lifecycle;
 
 use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-    InitialNetworkState,
-    TokenDistributionConfig,
-    TopologyMode,
-    ScenarioBuilder,
+    InitialNetworkState, PeerLifecycleConfig, PeerLifecycleRunner, ScenarioBuilder,
+    TokenDistributionConfig, TopologyMode,
 };
 
 fn main() {
@@ -50,7 +46,7 @@ fn main() {
         num_peers: 30,
         // Each peer starts knowing only 3 random peers
         initial_topology: TopologyMode::RandomIdentified {
-            peers_per_node: 3,  // MINIMAL peer knowledge
+            peers_per_node: 3, // MINIMAL peer knowledge
         },
         bootstrap_rounds: 100,
     };
@@ -59,7 +55,7 @@ fn main() {
     config.token_distribution = TokenDistributionConfig {
         total_tokens: 100_000,
         neighbor_overlap: 10,
-        coverage_fraction: 0.95,  // 95% - excellent shared state knowledge
+        coverage_fraction: 0.95, // 95% - excellent shared state knowledge
         genesis_config: None,
         genesis_storage_fraction: 0.25,
     };
@@ -84,7 +80,10 @@ fn main() {
     println!("╚════════════════════════════════════════════════════════╝\n");
 
     let final_connected_avg = result.final_metrics.network_health.avg_connected_peers;
-    let final_locality = result.final_metrics.network_health.gradient_distribution
+    let final_locality = result
+        .final_metrics
+        .network_health
+        .gradient_distribution
         .as_ref()
         .map(|g| g.avg_steepness)
         .unwrap_or(0.0);

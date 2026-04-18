@@ -2,7 +2,6 @@
 ///
 /// Provides deterministic generation of initial Block/Token set for network bootstrapping.
 /// All nodes running genesis with the same config produce identical state.
-
 use crate::ec_interface::{
     BatchedBackend, Block, BlockId, PeerId, TokenBlock, TokenId, TOKENS_PER_BLOCK,
 };
@@ -473,7 +472,11 @@ mod tests {
 
         // Should store approximately 25% of blocks
         // Allow some variance due to hash distribution
-        assert!(stored > 200 && stored < 300, "Expected ~250 blocks, got {}", stored);
+        assert!(
+            stored > 200 && stored < 300,
+            "Expected ~250 blocks, got {}",
+            stored
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub enum BlockState {
 }
 
 pub enum MessageRequest {
+    Block(BlockId),
     Vote(BlockId, TokenId, u8, bool, u8),
     Parent(BlockId, BlockId),
     MissingParent(BlockId),
@@ -73,6 +74,7 @@ fn vote_schedule_state_after_reactive_seed(
 impl MessageRequest {
     pub fn sort_key(&self) -> (TokenId, Reverse<BlockId>, Reverse<bool>) {
         match self {
+            MessageRequest::Block(block_id) => (*block_id, Reverse(0), Reverse(false)),
             // Group equal token_id together, prefer highest block_id first, and for equal block_id
             // let positive votes win the tie. This keeps conflicting token updates deterministic.
             MessageRequest::Vote(block_id, token_id, _, positive, _) => {
@@ -174,9 +176,9 @@ impl PoolBlockState {
 /// Result of evaluating a pending block
 /// Contains only blocks that passed reorg checks and can proceed to voting/commit
 pub struct BlockEvaluation {
-    pub block_id: BlockId,  // Include block_id for future flexibility
+    pub block_id: BlockId, // Include block_id for future flexibility
     pub block: Block,
-    pub vote_mask: u8,  // Pre-calculated vote bits (1 = can verify, 0 = cannot verify)
+    pub vote_mask: u8, // Pre-calculated vote bits (1 = can verify, 0 = cannot verify)
 }
 
 pub struct BlockedConflictTransition {
@@ -449,13 +451,14 @@ impl EcMemPool {
     /// Evaluate all pending blocks and determine which can proceed to commit
     ///
     /// This phase does all token lookups with an immutable borrow and:
+    /// - Requests missing blocks for pending entries that only have vote placeholders
     /// - Calculates vote masks (positive vote only if we can verify the chain)
     /// - Detects reorgs/missing history and generates PARENTCOMMIT requests
     /// - Filters out blocks that cannot commit this tick
     ///
     /// Returns:
     /// - Vec of blocks that can proceed (no reorg detected)
-    /// - Vec of messages for reorg parent requests
+    /// - Vec of block/parent/vote-related follow-up requests
     pub(crate) fn evaluate_pending_blocks(
         &self,
         tokens: &dyn EcTokensV2,
@@ -469,54 +472,57 @@ impl EcMemPool {
             let Some(block_state) = self.pool.get(&block_id) else {
                 continue;
             };
-            if let Some(block) = block_state.block {
-                let mut vote = 0;
-                let mut can_commit = true;
+            let Some(block) = block_state.block else {
+                messages.push(MessageRequest::Block(block_id));
+                continue;
+            };
 
-                // Check each token in the block
-                for i in 0..block.used as usize {
-                    let token_id = block.parts[i].token;
-                    let last_mapping = block.parts[i].last;
-                    let current_mapping = tokens.lookup_current(&token_id).map_or(0, |t| t.block);
+            let mut vote = 0;
+            let mut can_commit = true;
 
-                    if current_mapping == last_mapping {
-                        // Chain is correct - we can verify this
-                        vote |= 1 << i;
-                    } else if current_mapping == 0 {
-                        // We don't have this token - cannot verify
-                        // vote bit stays 0 (negative vote)
-                        // This forces the block to find nodes that CAN verify
-                    } else {
-                        // We have a different mapping!
-                        // Either we're missing history (skip) or client is attempting reorg
-                        // Request parent to build our history / detect reorg
-                        can_commit = false;
+            // Check each token in the block
+            for i in 0..block.used as usize {
+                let token_id = block.parts[i].token;
+                let last_mapping = block.parts[i].last;
+                let current_mapping = tokens.lookup_current(&token_id).map_or(0, |t| t.block);
 
-                        messages.push(MessageRequest::MissingParent(last_mapping));
+                if current_mapping == last_mapping {
+                    // Chain is correct - we can verify this
+                    vote |= 1 << i;
+                } else if current_mapping == 0 {
+                    // We don't have this token - cannot verify
+                    // vote bit stays 0 (negative vote)
+                    // This forces the block to find nodes that CAN verify
+                } else {
+                    // We have a different mapping!
+                    // Either we're missing history (skip) or client is attempting reorg
+                    // Request parent to build our history / detect reorg
+                    can_commit = false;
 
-                        event_sink.log(
-                            time,
-                            id,
-                            Event::Reorg {
-                                block_id,
-                                peer: id,
-                                from: current_mapping,
-                                to: last_mapping,
-                            },
-                        );
-                    }
+                    messages.push(MessageRequest::MissingParent(last_mapping));
+
+                    event_sink.log(
+                        time,
+                        id,
+                        Event::Reorg {
+                            block_id,
+                            peer: id,
+                            from: current_mapping,
+                            to: last_mapping,
+                        },
+                    );
                 }
-
-                // Only add blocks that can potentially commit this tick
-                if can_commit {
-                    evaluations.push(BlockEvaluation {
-                        block_id,
-                        block,
-                        vote_mask: vote,
-                    });
-                }
-                // Blocks with reorg/missing history stay in mempool but won't be processed this tick
             }
+
+            // Only add blocks that can potentially commit this tick
+            if can_commit {
+                evaluations.push(BlockEvaluation {
+                    block_id,
+                    block,
+                    vote_mask: vote,
+                });
+            }
+            // Blocks with reorg/missing history stay in mempool but won't be processed this tick
         }
 
         (evaluations, messages)
@@ -531,7 +537,11 @@ impl EcMemPool {
         event_sink: &mut dyn EventSink,
     ) -> (Option<BlockEvaluation>, Vec<MessageRequest>) {
         let mut messages = Vec::new();
-        let Some(block_state) = self.pool.get(block_id).filter(|state| state.state == Pending) else {
+        let Some(block_state) = self
+            .pool
+            .get(block_id)
+            .filter(|state| state.state == Pending)
+        else {
             return (None, messages);
         };
         let Some(block) = block_state.block else {
@@ -782,16 +792,17 @@ impl EcMemPool {
                 block_state.vote_sequence[i] = 0;
                 continue;
             }
-            if block_state.vote_sequence[i] == PAUSED_VOTE_SEQUENCE || block_state.vote_sequence[i] != 0 {
+            if block_state.vote_sequence[i] == PAUSED_VOTE_SEQUENCE
+                || block_state.vote_sequence[i] != 0
+            {
                 continue;
             }
 
-            block_state.vote_sequence[i] =
-                vote_schedule_state_after_reactive_seed(
-                    seed_pairs_sent,
-                    self.vote_request_active_rounds,
-                    self.vote_request_pairs_per_tick,
-                );
+            block_state.vote_sequence[i] = vote_schedule_state_after_reactive_seed(
+                seed_pairs_sent,
+                self.vote_request_active_rounds,
+                self.vote_request_pairs_per_tick,
+            );
             targets.push(evaluation.block.parts[i].token);
         }
 
@@ -801,12 +812,11 @@ impl EcMemPool {
             && block_state.vote_sequence[witness_idx] != PAUSED_VOTE_SEQUENCE
             && block_state.vote_sequence[witness_idx] == 0
         {
-            block_state.vote_sequence[witness_idx] =
-                vote_schedule_state_after_reactive_seed(
-                    seed_pairs_sent,
-                    self.vote_request_active_rounds,
-                    self.vote_request_pairs_per_tick,
-                );
+            block_state.vote_sequence[witness_idx] = vote_schedule_state_after_reactive_seed(
+                seed_pairs_sent,
+                self.vote_request_active_rounds,
+                self.vote_request_pairs_per_tick,
+            );
             targets.push(evaluation.block_id);
         }
 
@@ -869,7 +879,12 @@ impl EcMemPool {
                         );
 
                         // Update token with parent (block.parts[i].last is the parent block ID)
-                        batch.update_token(&block.parts[i].token, &block.id, &block.parts[i].last, block.time);
+                        batch.update_token(
+                            &block.parts[i].token,
+                            &block.id,
+                            &block.parts[i].last,
+                            block.time,
+                        );
                     }
                 }
 
@@ -889,13 +904,13 @@ impl EcMemPool {
                     if state == PAUSED_VOTE_SEQUENCE {
                         continue;
                     }
-                    let next_state = vote_schedule_next_state(state, self.vote_request_active_rounds);
+                    let next_state =
+                        vote_schedule_next_state(state, self.vote_request_active_rounds);
                     let Some(sequence_start) = vote_schedule_pair_start_for_state(
                         state,
                         self.vote_request_active_rounds,
                         self.vote_request_pairs_per_tick,
-                    )
-                    else {
+                    ) else {
                         block_state.vote_sequence[i] = next_state;
                         continue;
                     };
@@ -925,8 +940,7 @@ impl EcMemPool {
                     state,
                     self.vote_request_active_rounds,
                     self.vote_request_pairs_per_tick,
-                )
-                else {
+                ) else {
                     block_state.vote_sequence[witness_idx] = next_state;
                     continue;
                 };
@@ -954,8 +968,8 @@ mod tests {
     use std::rc::Rc;
 
     use crate::ec_interface::{
-        EcTokens, EcTokensV2, NoOpSink, StorageBatch, TokenBlock, TokenState, TrustedMapping,
-        TrustSource,
+        EcTokens, EcTokensV2, NoOpSink, StorageBatch, TokenBlock, TokenState, TrustSource,
+        TrustedMapping,
     };
     use crate::ec_peers::EcPeers;
     use rand::SeedableRng;
@@ -979,9 +993,7 @@ mod tests {
         }
 
         fn is_local(&self, token: &TokenId) -> bool {
-            self.tokens
-                .get(token)
-                .is_some_and(|state| state.is_local())
+            self.tokens.get(token).is_some_and(|state| state.is_local())
         }
     }
 
@@ -1014,7 +1026,13 @@ mod tests {
             self.saved_blocks.push(block.id);
         }
 
-        fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        fn update_token(
+            &mut self,
+            token: &TokenId,
+            block: &BlockId,
+            parent: &BlockId,
+            time: EcTime,
+        ) {
             self.updated_tokens.push((*token, *block, *parent, time));
         }
 
@@ -1096,11 +1114,28 @@ mod tests {
             .into_iter()
             .map(|request| match request {
                 MessageRequest::Vote(block_id, token_id, _, _, _) => (block_id, token_id),
-                other => panic!("unexpected request in sort test: {:?}", std::mem::discriminant(&other)),
+                other => panic!(
+                    "unexpected request in sort test: {:?}",
+                    std::mem::discriminant(&other)
+                ),
             })
             .collect();
 
         assert_eq!(ordered, vec![(15, 66), (30, 77), (20, 77), (10, 77)]);
+    }
+
+    #[test]
+    fn pending_entry_without_block_requests_block_fetch() {
+        let mut mem_pool = EcMemPool::new();
+        mem_pool.vote(&77, 0, &11, 10, true);
+
+        let tokens = MockTokens::default();
+        let mut sink = NoOpSink;
+        let (evaluations, messages) = mem_pool.evaluate_pending_blocks(&tokens, 10, 55, &mut sink);
+
+        assert!(evaluations.is_empty());
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], MessageRequest::Block(77)));
     }
 
     #[test]
@@ -1111,22 +1146,36 @@ mod tests {
             id: 100,
             time: 10,
             used: 1,
-            parts: [TokenBlock {
-                token,
-                last: parent,
-                key: 1,
-            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            parts: [
+                TokenBlock {
+                    token,
+                    last: parent,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
         let higher_block = Block {
             id: 200,
             time: 10,
             used: 1,
-            parts: [TokenBlock {
-                token,
-                last: parent,
-                key: 2,
-            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            parts: [
+                TokenBlock {
+                    token,
+                    last: parent,
+                    key: 2,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
@@ -1156,8 +1205,7 @@ mod tests {
         );
 
         let mut sink = NoOpSink;
-        let (evaluations, _messages) =
-            mem_pool.evaluate_pending_blocks(&tokens, 10, 55, &mut sink);
+        let (evaluations, _messages) = mem_pool.evaluate_pending_blocks(&tokens, 10, 55, &mut sink);
 
         assert!(matches!(
             mem_pool.status(&lower_block.id, &MockEcBlocks::default_blocks()),
@@ -1173,14 +1221,8 @@ mod tests {
         );
         let mut batch = TestBatch::default();
         let mut sink = NoOpSink;
-        let (_messages, commits) = mem_pool.tick_with_evaluations(
-            &peers,
-            10,
-            55,
-            &mut sink,
-            &evaluations,
-            &mut batch,
-        );
+        let (_messages, commits) =
+            mem_pool.tick_with_evaluations(&peers, 10, 55, &mut sink, &evaluations, &mut batch);
 
         assert_eq!(batch.saved_blocks, vec![higher_block.id]);
         assert_eq!(commits.len(), 1);
@@ -1203,11 +1245,18 @@ mod tests {
             id: 200,
             time: 10,
             used: 1,
-            parts: [TokenBlock {
-                token: 42,
-                last: 7,
-                key: 1,
-            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            parts: [
+                TokenBlock {
+                    token: 42,
+                    last: 7,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
@@ -1258,7 +1307,10 @@ mod tests {
         assert_eq!(seen[4], vec![2]);
         assert!(seen[5].is_empty(), "sixth tick should pause");
         assert_eq!(seen[6], vec![3]);
-        assert!(seen[7].is_empty(), "eighth tick should pause before restarting");
+        assert!(
+            seen[7].is_empty(),
+            "eighth tick should pause before restarting"
+        );
         assert_eq!(seen[8], vec![0]);
     }
 
@@ -1268,11 +1320,18 @@ mod tests {
             id: 300,
             time: 10,
             used: 1,
-            parts: [TokenBlock {
-                token: 42,
-                last: 7,
-                key: 1,
-            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            parts: [
+                TokenBlock {
+                    token: 42,
+                    last: 7,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
@@ -1339,11 +1398,18 @@ mod tests {
             id: 301,
             time: 10,
             used: 1,
-            parts: [TokenBlock {
-                token: 42,
-                last: 7,
-                key: 1,
-            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            parts: [
+                TokenBlock {
+                    token: 42,
+                    last: 7,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
 
@@ -1392,7 +1458,10 @@ mod tests {
         assert_eq!(seen[2], vec![1]);
         assert!(seen[3].is_empty(), "fourth tick should pause");
         assert_eq!(seen[4], vec![2]);
-        assert!(seen[5].is_empty(), "sixth tick should pause before restarting");
+        assert!(
+            seen[5].is_empty(),
+            "sixth tick should pause before restarting"
+        );
         assert_eq!(seen[6], vec![0]);
     }
 
@@ -1402,11 +1471,18 @@ mod tests {
             id: 401,
             time: 10,
             used: 1,
-            parts: [TokenBlock {
-                token: 42,
-                last: 7,
-                key: 1,
-            }, Default::default(), Default::default(), Default::default(), Default::default(), Default::default()],
+            parts: [
+                TokenBlock {
+                    token: 42,
+                    last: 7,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
 

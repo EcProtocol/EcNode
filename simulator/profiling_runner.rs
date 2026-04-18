@@ -5,13 +5,10 @@
 
 mod peer_lifecycle;
 
-use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-};
+use peer_lifecycle::{PeerLifecycleConfig, PeerLifecycleRunner};
+use std::env;
 use std::fs;
 use std::path::Path;
-use std::env;
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -36,11 +33,10 @@ fn main() {
     let load_start = Instant::now();
     println!("Loading scenario from: {}", path.display());
 
-    let yaml_content = fs::read_to_string(path)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read {}: {}", path.display(), e);
-            std::process::exit(1);
-        });
+    let yaml_content = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
 
     let load_time = load_start.elapsed();
     println!("  ✓ File read: {:?}", load_time);
@@ -95,11 +91,10 @@ fn main() {
         100
     }
 
-    let scenario: ScenarioFile = serde_yaml::from_str(&yaml_content)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to parse {}: {}", path.display(), e);
-            std::process::exit(1);
-        });
+    let scenario: ScenarioFile = serde_yaml::from_str(&yaml_content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
 
     let parse_time = parse_start.elapsed();
     println!("  ✓ YAML parsed: {:?}", parse_time);

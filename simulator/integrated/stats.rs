@@ -20,9 +20,7 @@ impl DistributionSummary {
         sorted.sort_unstable();
 
         let len = sorted.len();
-        let percentile_index = |numerator: usize| -> usize {
-            ((len - 1) * numerator) / 100
-        };
+        let percentile_index = |numerator: usize| -> usize { ((len - 1) * numerator) / 100 };
 
         Some(Self {
             samples: len,
@@ -55,9 +53,7 @@ impl FloatDistributionSummary {
         sorted.sort_by(|a, b| a.total_cmp(b));
 
         let len = sorted.len();
-        let percentile_index = |numerator: usize| -> usize {
-            ((len - 1) * numerator) / 100
-        };
+        let percentile_index = |numerator: usize| -> usize { ((len - 1) * numerator) / 100 };
 
         Some(Self {
             samples: len,
@@ -382,7 +378,10 @@ impl SimResult {
         println!("╚════════════════════════════════════════════════════════╝");
         println!("Seed: {:?}", self.seed_used);
         println!("Rounds completed: {}", self.rounds_completed);
-        println!("Peers: {} total, {} active", self.total_peers, self.active_peers);
+        println!(
+            "Peers: {} total, {} active",
+            self.total_peers, self.active_peers
+        );
         println!(
             "Network: base {} rounds, jitter 0..={}, tail {:.1}%, loss {:.2}%",
             self.final_network_base_delay_rounds,
@@ -477,8 +476,14 @@ impl SimResult {
             self.committed_blocks,
             self.pending_blocks
         );
-        println!("Logical messages delivered: {}", self.total_messages_delivered);
-        println!("Wire messages delivered: {}", self.total_wire_messages_delivered);
+        println!(
+            "Logical messages delivered: {}",
+            self.total_messages_delivered
+        );
+        println!(
+            "Wire messages delivered: {}",
+            self.total_wire_messages_delivered
+        );
         println!(
             "Peak in-flight queue: {} messages",
             self.peak_in_flight_messages
@@ -651,8 +656,7 @@ impl SimResult {
         }
         println!(
             "Transaction spread: {} submitted, {} committed blocks analyzed",
-            self.transaction_spread.submitted_blocks,
-            self.transaction_spread.committed_blocks,
+            self.transaction_spread.submitted_blocks, self.transaction_spread.committed_blocks,
         );
         if let Some(reachable) = &self.transaction_spread.reachable_vote_peers {
             println!(
@@ -714,22 +718,36 @@ impl SimResult {
                 ratio.avg, ratio.p50, ratio.p95, ratio.min, ratio.max,
             );
         }
-        if self.transaction_spread.total_ideal_role_sum_lower_bound_messages > 0 {
+        if self
+            .transaction_spread
+            .total_ideal_role_sum_lower_bound_messages
+            > 0
+        {
             println!(
                 "Total block-message factor vs role-sum ideal: {:.2}x ({} actual / {} ideal)",
                 self.transaction_spread.total_actual_block_messages as f64
-                    / self.transaction_spread.total_ideal_role_sum_lower_bound_messages as f64,
+                    / self
+                        .transaction_spread
+                        .total_ideal_role_sum_lower_bound_messages as f64,
                 self.transaction_spread.total_actual_block_messages,
-                self.transaction_spread.total_ideal_role_sum_lower_bound_messages,
+                self.transaction_spread
+                    .total_ideal_role_sum_lower_bound_messages,
             );
         }
-        if self.transaction_spread.total_ideal_coalesced_lower_bound_messages > 0 {
+        if self
+            .transaction_spread
+            .total_ideal_coalesced_lower_bound_messages
+            > 0
+        {
             println!(
                 "Total block-message factor vs coalesced ideal: {:.2}x ({} actual / {} ideal)",
                 self.transaction_spread.total_actual_block_messages as f64
-                    / self.transaction_spread.total_ideal_coalesced_lower_bound_messages as f64,
+                    / self
+                        .transaction_spread
+                        .total_ideal_coalesced_lower_bound_messages as f64,
                 self.transaction_spread.total_actual_block_messages,
-                self.transaction_spread.total_ideal_coalesced_lower_bound_messages,
+                self.transaction_spread
+                    .total_ideal_coalesced_lower_bound_messages,
             );
         }
         println!(
@@ -756,24 +774,14 @@ impl SimResult {
         if let Some(latency) = &self.commit_latency {
             println!(
                 "Commit latency: {} samples, avg {:.1} rounds, p50 {}, p95 {}, min {}, max {}",
-                latency.samples,
-                latency.avg,
-                latency.p50,
-                latency.p95,
-                latency.min,
-                latency.max,
+                latency.samples, latency.avg, latency.p50, latency.p95, latency.min, latency.max,
             );
         }
 
         if let Some(delay) = &self.network_transit_delay {
             println!(
                 "Network transit: {} samples, avg {:.1} rounds, p50 {}, p95 {}, min {}, max {}",
-                delay.samples,
-                delay.avg,
-                delay.p50,
-                delay.p95,
-                delay.min,
-                delay.max,
+                delay.samples, delay.avg, delay.p50, delay.p95, delay.min, delay.max,
             );
         }
 
@@ -812,8 +820,7 @@ impl SimResult {
 
         println!(
             "Rejoiners: {} observed ({} bootstrap-seeded)",
-            self.rejoin_onboarding.observed_peers,
-            self.rejoin_onboarding.bootstrap_seeded_peers,
+            self.rejoin_onboarding.observed_peers, self.rejoin_onboarding.bootstrap_seeded_peers,
         );
 
         if let Some(connected) = &self.rejoin_onboarding.time_to_connected {
@@ -849,14 +856,11 @@ impl SimResult {
                 match recovery.rounds_to_recover() {
                     Some(rounds) => println!(
                         "  - {}: baseline {:.2} commits/round, recovered in {} rounds",
-                        recovery.label,
-                        recovery.baseline_commit_rate,
-                        rounds,
+                        recovery.label, recovery.baseline_commit_rate, rounds,
                     ),
                     None => println!(
                         "  - {}: baseline {:.2} commits/round, not recovered during run",
-                        recovery.label,
-                        recovery.baseline_commit_rate,
+                        recovery.label, recovery.baseline_commit_rate,
                     ),
                 }
             }

@@ -293,8 +293,7 @@ mod tests {
 
     use super::{
         build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
-        build_ring_core_tail_topology,
-        build_ring_gradient_topology,
+        build_ring_core_tail_topology, build_ring_gradient_topology,
     };
 
     #[test]
@@ -404,7 +403,10 @@ mod tests {
                 let rank_distance = clockwise_steps.min(peer_ids.len() - clockwise_steps);
                 rank_distance > 4
             });
-            assert!(has_tail, "peer {peer_id} should keep at least one long-range tail peer");
+            assert!(
+                has_tail,
+                "peer {peer_id} should keep at least one long-range tail peer"
+            );
         }
 
         for (peer_id, peers) in &adjacency {

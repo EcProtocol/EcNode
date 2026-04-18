@@ -5,8 +5,8 @@ use super::stats::{CommitStats, MessageCounts, MessageStats, SimResult, SyncStat
 use ec_rust::ec_commit_chain::TickMessage;
 use ec_rust::ec_interface::{
     BatchRequestItem, Block, BlockId, CommitBlock, EcBlocks, EcCommitChainAccess,
-    EcCommitChainBackend, EcTime, EcTokens, Message, MessageTicket, PeerId,
-    PublicKeyReference, TokenBlock, TokenId, GENESIS_BLOCK_ID, TOKENS_PER_BLOCK,
+    EcCommitChainBackend, EcTime, EcTokens, Message, MessageTicket, PeerId, PublicKeyReference,
+    TokenBlock, TokenId, GENESIS_BLOCK_ID, TOKENS_PER_BLOCK,
 };
 use ec_rust::ec_memory_backend::MemoryBackend;
 use ec_rust::ec_peers::PeerRange;
@@ -212,7 +212,10 @@ impl CommitChainRunner {
     /// Generate a random block for a peer
     fn generate_block(&mut self, _peer_id: PeerId) -> Option<Block> {
         let (min_size, max_size) = self.config.block_injection.block_size_range;
-        let block_size = self.rng.gen_range(min_size..=max_size).min(TOKENS_PER_BLOCK);
+        let block_size = self
+            .rng
+            .gen_range(min_size..=max_size)
+            .min(TOKENS_PER_BLOCK);
 
         if self.token_pool.len() < block_size {
             return None; // Not enough tokens
@@ -264,18 +267,12 @@ impl CommitChainRunner {
 
         for envelope in messages {
             // Apply network simulation
-            if self
-                .rng
-                .gen_bool(self.config.network.loss_fraction)
-            {
+            if self.rng.gen_bool(self.config.network.loss_fraction) {
                 // Message lost
                 continue;
             }
 
-            if self
-                .rng
-                .gen_bool(self.config.network.delay_fraction)
-            {
+            if self.rng.gen_bool(self.config.network.delay_fraction) {
                 // Message delayed
                 self.delayed_messages.push_back(envelope);
                 continue;
@@ -298,16 +295,16 @@ impl CommitChainRunner {
                 self.message_counts.commit_block += 1;
                 self.handle_commit_block(envelope.to, envelope.from, block);
             }
-            Message::QueryBlock { block_id, ticket, .. } => {
+            Message::QueryBlock {
+                block_id, ticket, ..
+            } => {
                 // Route to peer responsible for block-id
                 self.handle_query_block(envelope.to, envelope.from, block_id, ticket);
             }
             Message::RequestBatch { items } => {
                 for item in items {
                     if let BatchRequestItem::QueryBlock {
-                        block_id,
-                        ticket,
-                        ..
+                        block_id, ticket, ..
                     } = item
                     {
                         self.handle_query_block(envelope.to, envelope.from, block_id, ticket);
@@ -395,9 +392,7 @@ impl CommitChainRunner {
             self.messages.push_back(MessageEnvelope {
                 from: owner_peer,
                 to: requester,
-                message: Message::Block {
-                    block,
-                },
+                message: Message::Block { block },
             });
         }
     }

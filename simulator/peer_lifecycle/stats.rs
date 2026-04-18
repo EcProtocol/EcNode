@@ -385,35 +385,56 @@ impl SimulationResult {
         // Final metrics
         let metrics = &self.final_metrics;
         println!("═══ Final State ═══");
-        println!("  Peers: {} total, {} active",
-            metrics.peer_counts.total_peers,
-            metrics.peer_counts.active_peers);
-        println!("  States: {} Identified, {} Pending, {} Connected",
+        println!(
+            "  Peers: {} total, {} active",
+            metrics.peer_counts.total_peers, metrics.peer_counts.active_peers
+        );
+        println!(
+            "  States: {} Identified, {} Pending, {} Connected",
             metrics.peer_counts.identified,
             metrics.peer_counts.pending,
-            metrics.peer_counts.connected);
+            metrics.peer_counts.connected
+        );
         println!();
 
         // Election stats
         println!("═══ Election Performance ═══");
-        println!("  Total Started: {}", metrics.election_stats.total_elections_started);
-        println!("  Completed: {}", metrics.election_stats.total_elections_completed);
-        println!("  Timed Out: {}", metrics.election_stats.total_elections_timed_out);
-        println!("  Split-Brain: {}", metrics.election_stats.total_split_brain_detected);
+        println!(
+            "  Total Started: {}",
+            metrics.election_stats.total_elections_started
+        );
+        println!(
+            "  Completed: {}",
+            metrics.election_stats.total_elections_completed
+        );
+        println!(
+            "  Timed Out: {}",
+            metrics.election_stats.total_elections_timed_out
+        );
+        println!(
+            "  Split-Brain: {}",
+            metrics.election_stats.total_split_brain_detected
+        );
         if metrics.election_stats.total_elections_started > 0 {
             let success_rate = (metrics.election_stats.total_elections_completed as f64
-                / metrics.election_stats.total_elections_started as f64) * 100.0;
+                / metrics.election_stats.total_elections_started as f64)
+                * 100.0;
             println!("  Success Rate: {:.1}%", success_rate);
         }
         println!();
 
         // Network health
         println!("═══ Network Health ═══");
-        println!("  Connected Peers: min={}, max={}, avg={:.1}",
+        println!(
+            "  Connected Peers: min={}, max={}, avg={:.1}",
             metrics.network_health.min_connected_peers,
             metrics.network_health.max_connected_peers,
-            metrics.network_health.avg_connected_peers);
-        println!("  Ring Coverage: {:.1}%", metrics.network_health.ring_coverage_percent);
+            metrics.network_health.avg_connected_peers
+        );
+        println!(
+            "  Ring Coverage: {:.1}%",
+            metrics.network_health.ring_coverage_percent
+        );
         println!();
 
         // Message overhead
@@ -422,7 +443,10 @@ impl SimulationResult {
         println!("  Queries: {}", self.message_overhead.queries_sent);
         println!("  Answers: {}", self.message_overhead.answers_received);
         println!("  Referrals: {}", self.message_overhead.referrals_sent);
-        println!("  Per Peer/Round: {:.2}", self.message_overhead.messages_per_peer_per_round);
+        println!(
+            "  Per Peer/Round: {:.2}",
+            self.message_overhead.messages_per_peer_per_round
+        );
         println!();
 
         // Convergence
@@ -436,18 +460,29 @@ impl SimulationResult {
         }
 
         // Connected Peer Count Distribution
-        if let Some(ref dist) = self.final_metrics.network_health.connected_peer_distribution {
+        if let Some(ref dist) = self
+            .final_metrics
+            .network_health
+            .connected_peer_distribution
+        {
             println!("═══ Connected Peer Count Distribution ═══");
-            println!("  Overall: min={}, max={}, avg={:.1}, median={:.0}",
-                dist.min_connected, dist.max_connected,
-                dist.avg_connected, dist.median_connected);
+            println!(
+                "  Overall: min={}, max={}, avg={:.1}, median={:.0}",
+                dist.min_connected, dist.max_connected, dist.avg_connected, dist.median_connected
+            );
             println!("\n  Distribution by Quartile:");
             for (i, &count) in dist.peer_counts_by_quantile.iter().enumerate() {
                 if count > 0 {
                     let (min, max) = dist.connected_ranges[i];
                     let avg = dist.avg_connected_by_quantile[i];
-                    println!("    Q{}: {:4} peers, connected [{:2}-{:2}], avg={:.1}",
-                        i + 1, count, min, max, avg);
+                    println!(
+                        "    Q{}: {:4} peers, connected [{:2}-{:2}], avg={:.1}",
+                        i + 1,
+                        count,
+                        min,
+                        max,
+                        avg
+                    );
                 } else {
                     println!("    Q{}: {:4} peers (empty)", i + 1, 0);
                 }
@@ -458,18 +493,31 @@ impl SimulationResult {
         // Locality Gradient Distribution
         if let Some(ref gradient) = self.final_metrics.network_health.gradient_distribution {
             println!("═══ Locality Gradient Quality ═══");
-            println!("  Overall Locality: min={:.3}, max={:.3}, avg={:.3}, median={:.3}",
-                gradient.min_steepness, gradient.max_steepness,
-                gradient.avg_steepness, gradient.median_steepness);
-            println!("  Strong Locality (≥ 0.7): {:.1}%", gradient.near_ideal_percent);
+            println!(
+                "  Overall Locality: min={:.3}, max={:.3}, avg={:.3}, median={:.3}",
+                gradient.min_steepness,
+                gradient.max_steepness,
+                gradient.avg_steepness,
+                gradient.median_steepness
+            );
+            println!(
+                "  Strong Locality (≥ 0.7): {:.1}%",
+                gradient.near_ideal_percent
+            );
             println!("\n  Distribution by Quartile:");
             println!("  (1.0 = perfect, peers very close; 0.0 = poor, peers far away)");
             for (i, &count) in gradient.peer_counts_by_quantile.iter().enumerate() {
                 if count > 0 {
                     let (min, max) = gradient.steepness_ranges[i];
                     let avg = gradient.avg_steepness_by_quantile[i];
-                    println!("    Q{}: {:4} peers, locality [{:.3}-{:.3}], avg={:.3}",
-                        i + 1, count, min, max, avg);
+                    println!(
+                        "    Q{}: {:4} peers, locality [{:.3}-{:.3}], avg={:.3}",
+                        i + 1,
+                        count,
+                        min,
+                        max,
+                        avg
+                    );
                 } else {
                     println!("    Q{}: {:4} peers (empty)", i + 1, 0);
                 }
@@ -540,16 +588,20 @@ pub fn calculate_connected_peer_distribution(
     // Convert Option ranges to (usize, usize) with proper defaults
     let final_ranges: Vec<(usize, usize)> = connected_ranges
         .iter()
-        .map(|(min_opt, max_opt)| {
-            (min_opt.unwrap_or(0), max_opt.unwrap_or(0))
-        })
+        .map(|(min_opt, max_opt)| (min_opt.unwrap_or(0), max_opt.unwrap_or(0)))
         .collect();
 
     // Calculate average connected per quantile
     let avg_connected_by_quantile: Vec<f64> = peer_counts_by_quantile
         .iter()
         .zip(sum_by_quantile.iter())
-        .map(|(&count, &sum)| if count > 0 { sum as f64 / count as f64 } else { 0.0 })
+        .map(|(&count, &sum)| {
+            if count > 0 {
+                sum as f64 / count as f64
+            } else {
+                0.0
+            }
+        })
         .collect();
 
     ConnectedPeerDistribution {
@@ -669,9 +721,7 @@ pub fn calculate_gradient_distribution(
     // Convert Option ranges to (f64, f64) with proper defaults
     let steepness_ranges: Vec<(f64, f64)> = locality_ranges
         .iter()
-        .map(|(min_opt, max_opt)| {
-            (min_opt.unwrap_or(0.0), max_opt.unwrap_or(0.0))
-        })
+        .map(|(min_opt, max_opt)| (min_opt.unwrap_or(0.0), max_opt.unwrap_or(0.0)))
         .collect();
 
     // Calculate average locality per quantile
@@ -682,10 +732,7 @@ pub fn calculate_gradient_distribution(
         .collect();
 
     // Calculate strong-locality percentage (>= 0.7 is considered good)
-    let strong_locality_count = locality_values
-        .iter()
-        .filter(|&&l| l >= 0.7)
-        .count();
+    let strong_locality_count = locality_values.iter().filter(|&&l| l >= 0.7).count();
     let strong_locality_percent = (strong_locality_count as f64 / count as f64) * 100.0;
 
     GradientSteepnessDistribution {

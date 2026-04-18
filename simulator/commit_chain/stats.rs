@@ -57,13 +57,9 @@ impl SimResult {
             );
         }
         if let Some(&max_traces) = self.sync_stats.active_traces.iter().max() {
-            let avg_traces: f64 =
-                self.sync_stats.active_traces.iter().sum::<usize>() as f64
-                    / self.sync_stats.active_traces.len() as f64;
-            println!(
-                "  Active traces: max={}, avg={:.1}",
-                max_traces, avg_traces
-            );
+            let avg_traces: f64 = self.sync_stats.active_traces.iter().sum::<usize>() as f64
+                / self.sync_stats.active_traces.len() as f64;
+            println!("  Active traces: max={}, avg={:.1}", max_traces, avg_traces);
         }
         println!();
 

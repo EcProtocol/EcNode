@@ -10,7 +10,7 @@ use crate::ec_interface::{
     BlockId, BlockTime, EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TokenSignature,
     TOKENS_SIGNATURE_SIZE,
 };
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Number of signature chunks (10-bit each = 100 bits total)
@@ -322,14 +322,12 @@ pub fn find_all_consensus_clusters(
     let mut maximal_clusters = remove_subset_clusters(all_clusters);
 
     // Sort clusters by quality: larger size first, then higher avg_agreement
-    maximal_clusters.sort_by(|a, b| {
-        match b.members.len().cmp(&a.members.len()) {
-            std::cmp::Ordering::Equal => b
-                .avg_agreement
-                .partial_cmp(&a.avg_agreement)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            other => other,
-        }
+    maximal_clusters.sort_by(|a, b| match b.members.len().cmp(&a.members.len()) {
+        std::cmp::Ordering::Equal => b
+            .avg_agreement
+            .partial_cmp(&a.avg_agreement)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        other => other,
     });
 
     maximal_clusters
@@ -347,10 +345,7 @@ fn remove_subset_clusters(clusters: Vec<ConsensusCluster>) -> Vec<ConsensusClust
                 return false;
             }
             // Check if candidate is strict subset of other
-            candidate
-                .members
-                .iter()
-                .all(|m| other.members.contains(m))
+            candidate.members.iter().all(|m| other.members.contains(m))
         });
 
         if !is_subset {
@@ -526,7 +521,6 @@ pub enum ElectionError {
     /// Trying to setup a channel for self
     SelfReference,
 }
-
 
 // ============================================================================
 // Peer Election System: Core Election Logic
@@ -706,7 +700,11 @@ impl PeerElection {
     /// * `Err(ChannelAlreadyExists)` - Channel for this first-hop peer already exists
     /// * `Err(PeerAlreadyParticipating)` - Peer has already responded via another channel
     /// * `Err(SelfReference)` - can not setup a channel for self
-    pub fn create_channel(&mut self, first_hop: PeerId, sent_at: EcTime) -> Result<MessageTicket, ElectionError> {
+    pub fn create_channel(
+        &mut self,
+        first_hop: PeerId,
+        sent_at: EcTime,
+    ) -> Result<MessageTicket, ElectionError> {
         // do not a allow a channel to self
         if self.my_peer_id == first_hop {
             return Err(ElectionError::SelfReference);
@@ -879,10 +877,10 @@ impl PeerElection {
         if channel.state == ChannelState::Blocked {
             return Err(ElectionError::ChannelBlocked);
         }
-        
+
         // Get all participating peers to filter suggestions
         let participating = self.get_participating_peers();
-        
+
         // Destroy the channel (no other answer should come for it)
         self.first_hop_peers.remove(&channel.first_hop_peer);
         self.channels.remove(&ticket);
@@ -1186,10 +1184,7 @@ impl ProofOfStorage {
         // Only return a signature if we found all 10 tokens
         if search_result.complete {
             // Build the signature array from found tokens
-            let mut signature = [TokenMapping {
-                id: 0,
-                block: 0,
-            }; TOKENS_SIGNATURE_SIZE];
+            let mut signature = [TokenMapping { id: 0, block: 0 }; TOKENS_SIGNATURE_SIZE];
 
             for (i, &token_id) in search_result.tokens.iter().enumerate() {
                 if let Some(block_time) = backend.lookup(&token_id) {
@@ -1274,7 +1269,14 @@ mod tests {
         }
 
         fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
-            self.tokens.insert(*token, BlockTime { block: *block, parent: *parent, time });
+            self.tokens.insert(
+                *token,
+                BlockTime {
+                    block: *block,
+                    parent: *parent,
+                    time,
+                },
+            );
         }
 
         fn search_signature(
@@ -1429,16 +1431,37 @@ mod tests {
         let sig2 = TokenSignature {
             answer: TokenMapping { id: 1, block: 100 },
             signature: [
-                TokenMapping { id: 10, block: 1 },  // match
-                TokenMapping { id: 20, block: 2 },  // match
-                TokenMapping { id: 30, block: 3 },  // match
-                TokenMapping { id: 999, block: 999 },
-                TokenMapping { id: 999, block: 999 },
-                TokenMapping { id: 999, block: 999 },
-                TokenMapping { id: 999, block: 999 },
-                TokenMapping { id: 999, block: 999 },
-                TokenMapping { id: 999, block: 999 },
-                TokenMapping { id: 999, block: 999 },
+                TokenMapping { id: 10, block: 1 }, // match
+                TokenMapping { id: 20, block: 2 }, // match
+                TokenMapping { id: 30, block: 3 }, // match
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
+                TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
             ],
         };
 
@@ -1466,15 +1489,24 @@ mod tests {
 
         let signatures = vec![
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: perfect_mappings,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: perfect_mappings,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: perfect_mappings,
             },
         ];
@@ -1507,29 +1539,68 @@ mod tests {
         ];
 
         let outlier = [
-            TokenMapping { id: 100, block: 100 },
-            TokenMapping { id: 101, block: 101 },
-            TokenMapping { id: 102, block: 102 },
-            TokenMapping { id: 103, block: 103 },
-            TokenMapping { id: 104, block: 104 },
-            TokenMapping { id: 105, block: 105 },
-            TokenMapping { id: 106, block: 106 },
-            TokenMapping { id: 107, block: 107 },
-            TokenMapping { id: 108, block: 108 },
-            TokenMapping { id: 109, block: 109 },
+            TokenMapping {
+                id: 100,
+                block: 100,
+            },
+            TokenMapping {
+                id: 101,
+                block: 101,
+            },
+            TokenMapping {
+                id: 102,
+                block: 102,
+            },
+            TokenMapping {
+                id: 103,
+                block: 103,
+            },
+            TokenMapping {
+                id: 104,
+                block: 104,
+            },
+            TokenMapping {
+                id: 105,
+                block: 105,
+            },
+            TokenMapping {
+                id: 106,
+                block: 106,
+            },
+            TokenMapping {
+                id: 107,
+                block: 107,
+            },
+            TokenMapping {
+                id: 108,
+                block: 108,
+            },
+            TokenMapping {
+                id: 109,
+                block: 109,
+            },
         ];
 
         let signatures = vec![
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: common,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: common,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: outlier,
             },
         ];
@@ -1581,23 +1652,38 @@ mod tests {
 
         let signatures = vec![
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: group_a_mappings,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: group_a_mappings,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: group_b_mappings,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: group_b_mappings,
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: group_b_mappings,
             },
         ];
@@ -1627,7 +1713,10 @@ mod tests {
         // Create signatures that all disagree significantly
         let signatures = vec![
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: [
                     TokenMapping { id: 1, block: 1 },
                     TokenMapping { id: 2, block: 2 },
@@ -1642,7 +1731,10 @@ mod tests {
                 ],
             },
             TokenSignature {
-                answer: TokenMapping { id: 999, block: 999 },
+                answer: TokenMapping {
+                    id: 999,
+                    block: 999,
+                },
                 signature: [
                     TokenMapping { id: 1, block: 1 },
                     TokenMapping { id: 2, block: 2 },
@@ -1678,7 +1770,10 @@ mod tests {
         use crate::ec_interface::TokenMapping;
 
         let signatures = vec![TokenSignature {
-            answer: TokenMapping { id: 999, block: 999 },
+            answer: TokenMapping {
+                id: 999,
+                block: 999,
+            },
             signature: [TokenMapping { id: 1, block: 1 }; SIGNATURE_CHUNKS],
         }];
 
@@ -1734,11 +1829,17 @@ mod tests {
 
         let mut signature = [TokenMapping { id: 0, block: 0 }; SIGNATURE_CHUNKS];
         for (i, (id, block)) in mappings.iter().enumerate() {
-            signature[i] = TokenMapping { id: *id, block: *block };
+            signature[i] = TokenMapping {
+                id: *id,
+                block: *block,
+            };
         }
 
         TokenSignature {
-            answer: TokenMapping { id: 999, block: 999 },
+            answer: TokenMapping {
+                id: 999,
+                block: 999,
+            },
             signature,
         }
     }
@@ -1751,7 +1852,8 @@ mod tests {
     fn test_election_create_channel() {
         let my_peer_id = 999;
         let challenge_token = 1000;
-        let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
+        let mut election =
+            PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
 
         let ticket = election.create_channel(100, 100).unwrap();
         assert!(ticket > 0, "Ticket should be non-zero");
@@ -1798,13 +1900,17 @@ mod tests {
     fn test_election_handle_answer() {
         let my_peer_id = 999;
         let challenge_token = 1000;
-        let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
+        let mut election =
+            PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
 
         let ticket = election.create_channel(100, 100).unwrap();
 
         // Note: signature verification will fail with test data since we can't easily
         // generate matching signatures. This tests the path up to verification.
-        let answer = TokenMapping { id: challenge_token, block: 42 };
+        let answer = TokenMapping {
+            id: challenge_token,
+            block: 42,
+        };
         let sig = create_test_signature([(1, 10); SIGNATURE_CHUNKS]);
 
         // Will fail signature verification, but that's expected with test data
@@ -1821,7 +1927,10 @@ mod tests {
         let ticket = election.create_channel(100, 100).unwrap();
 
         // Answer for wrong token
-        let answer = TokenMapping { id: 9999, block: 42 };
+        let answer = TokenMapping {
+            id: 9999,
+            block: 42,
+        };
         let sig = create_test_signature([(1, 10); SIGNATURE_CHUNKS]);
 
         let result = election.handle_answer(ticket, &answer, &sig.signature, 101, 200);
@@ -1868,7 +1977,8 @@ mod tests {
     fn test_election_accessors() {
         let challenge_token = 1000;
         let my_peer_id = 999;
-        let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
+        let mut election =
+            PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
 
         assert_eq!(election.challenge_token(), challenge_token);
         assert_eq!(election.valid_response_count(), 0);
@@ -2009,7 +2119,8 @@ mod tests {
         assert_eq!(signature.signature.len(), SIGNATURE_CHUNKS);
 
         // Now validate using PeerElection's verify_signature (via handle_answer)
-        let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
+        let mut election =
+            PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
         let ticket = election.create_channel(100, 100).unwrap();
 
         // handle_answer calls verify_signature internally
@@ -2022,7 +2133,11 @@ mod tests {
         );
 
         // Should succeed - signature is valid
-        assert!(result.is_ok(), "Signature verification should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Signature verification should succeed: {:?}",
+            result
+        );
 
         // Verify channel state updated correctly
         assert_eq!(election.valid_response_count(), 1);
@@ -2032,16 +2147,13 @@ mod tests {
         bad_signature[0].id = bad_signature[0].id ^ 0x3FF; // Change all 10 bits
 
         let ticket2 = election.create_channel(200, 110).unwrap();
-        let result = election.handle_answer(
-            ticket2,
-            &signature.answer,
-            &bad_signature,
-            102,
-            210,
-        );
+        let result = election.handle_answer(ticket2, &signature.answer, &bad_signature, 102, 210);
 
         // Should fail - signature is invalid
-        assert_eq!(result, Err(ElectionError::SignatureVerificationFailed),
-                   "Corrupted signature should fail verification");
+        assert_eq!(
+            result,
+            Err(ElectionError::SignatureVerificationFailed),
+            "Corrupted signature should fail verification"
+        );
     }
 }

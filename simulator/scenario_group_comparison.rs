@@ -7,13 +7,8 @@
 mod peer_lifecycle;
 
 use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-    InitialNetworkState,
-    TokenDistributionConfig,
-    TopologyMode,
-    ScenarioBuilder,
-    BootstrapMethod,
+    BootstrapMethod, InitialNetworkState, PeerLifecycleConfig, PeerLifecycleRunner,
+    ScenarioBuilder, TokenDistributionConfig, TopologyMode,
 };
 
 fn main() {
@@ -37,31 +32,38 @@ fn main() {
     config.initial_state = InitialNetworkState {
         num_peers: 20,
         initial_topology: TopologyMode::RandomIdentified {
-            peers_per_node: 5,  // Each peer knows 5 random others
+            peers_per_node: 5, // Each peer knows 5 random others
         },
         bootstrap_rounds: 100,
     };
 
-    config.rounds = 250;  // Long enough to see all groups stabilize
+    config.rounds = 250; // Long enough to see all groups stabilize
 
     // High token coverage for initial group
     config.token_distribution = TokenDistributionConfig {
         total_tokens: 100_000,
         neighbor_overlap: 10,
-        coverage_fraction: 0.95,  // 95% coverage
+        coverage_fraction: 0.95, // 95% coverage
         genesis_config: None,
         genesis_storage_fraction: 0.25,
     };
 
     // Configure events: peers join at different rounds
     config.events = ScenarioBuilder::new()
-        .at_round(50).report_stats("Initial network baseline")
-        .at_round(100).peers_join(10, 0.90, BootstrapMethod::Random(3), "high-quality")
-        .at_round(120).report_stats("After high-quality joins")
-        .at_round(150).peers_join(10, 0.50, BootstrapMethod::Random(3), "low-quality")
-        .at_round(170).report_stats("After low-quality joins")
-        .at_round(200).report_stats("Mid-integration")
-        .at_round(250).report_stats("Final state")
+        .at_round(50)
+        .report_stats("Initial network baseline")
+        .at_round(100)
+        .peers_join(10, 0.90, BootstrapMethod::Random(3), "high-quality")
+        .at_round(120)
+        .report_stats("After high-quality joins")
+        .at_round(150)
+        .peers_join(10, 0.50, BootstrapMethod::Random(3), "low-quality")
+        .at_round(170)
+        .report_stats("After low-quality joins")
+        .at_round(200)
+        .report_stats("Mid-integration")
+        .at_round(250)
+        .report_stats("Final state")
         .build();
 
     // Run simulation

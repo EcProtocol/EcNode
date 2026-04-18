@@ -12,8 +12,8 @@
 //! - Highest transaction ID wins (deterministic conflict resolution)
 
 use crate::ec_interface::{
-    Block, BlockId, CommitBlock, CommitBlockId, EcBlocks, EcCommitChainBackend, EcTime,
-    EcTokensV2, MessageTicket, PeerId, StorageBatch, TokenId, GENESIS_BLOCK_ID,
+    Block, BlockId, CommitBlock, CommitBlockId, EcBlocks, EcCommitChainBackend, EcTime, EcTokensV2,
+    MessageTicket, PeerId, StorageBatch, TokenId, GENESIS_BLOCK_ID,
 };
 use crate::ec_mempool::EcMemPool;
 use crate::ec_peers::PeerRange;
@@ -211,10 +211,11 @@ impl EcCommitChain {
             }
 
             // Add closest candidate
-            if let Some((candidate, head)) = new_candidates
-                .into_iter()
-                .find_map(|candidate| peers.get_commit_chain_head(&candidate).map(|head| (candidate, head)))
-            {
+            if let Some((candidate, head)) = new_candidates.into_iter().find_map(|candidate| {
+                peers
+                    .get_commit_chain_head(&candidate)
+                    .map(|head| (candidate, head))
+            }) {
                 self.peer_logs
                     .insert(candidate, PeerChainLog::new(candidate, head));
             } else {
@@ -357,9 +358,8 @@ impl EcCommitChain {
                     for &i in &tokens_in_range {
                         let token = block.parts[i].token;
                         if storage.is_local(&token) {
-                            if let Some(current_block) = storage
-                                .lookup_state(&token)
-                                .and_then(|s| s.current_block())
+                            if let Some(current_block) =
+                                storage.lookup_state(&token).and_then(|s| s.current_block())
                             {
                                 if block.id > current_block {
                                     // Local exists and new block is higher
@@ -690,11 +690,7 @@ mod tests {
             );
         }
 
-        fn tokens_signature(
-            &self,
-            _token: &TokenId,
-            _peer: &PeerId,
-        ) -> Option<TokenSignature> {
+        fn tokens_signature(&self, _token: &TokenId, _peer: &PeerId) -> Option<TokenSignature> {
             None
         }
     }
@@ -709,9 +705,7 @@ mod tests {
         }
 
         fn is_local(&self, token: &TokenId) -> bool {
-            self.tokens
-                .get(token)
-                .map_or(false, |s| s.is_local())
+            self.tokens.get(token).map_or(false, |s| s.is_local())
         }
     }
 
@@ -728,7 +722,13 @@ mod tests {
             self.blocks.push(*block);
         }
 
-        fn update_token(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        fn update_token(
+            &mut self,
+            token: &TokenId,
+            block: &BlockId,
+            parent: &BlockId,
+            time: EcTime,
+        ) {
             self.local_updates.push((*token, *block, *parent, time));
         }
 
@@ -740,7 +740,8 @@ mod tests {
             time: EcTime,
             source_peer: PeerId,
         ) {
-            self.sync_updates.push((*token, *block, *parent, time, source_peer));
+            self.sync_updates
+                .push((*token, *block, *parent, time, source_peer));
         }
 
         fn commit(self: Box<Self>) -> Result<(), Box<dyn std::error::Error>> {
@@ -960,10 +961,14 @@ mod tests {
         let (operations, _work) = chain.collect_sync_operations(&storage);
 
         // Should have a SaveBlock operation for the block
-        let save_count = operations.iter().filter(|op| {
-            matches!(op, SyncOperation::SaveBlock(b) if b.id == 50)
-        }).count();
-        assert_eq!(save_count, 1, "Block should be saved since block-id is in range");
+        let save_count = operations
+            .iter()
+            .filter(|op| matches!(op, SyncOperation::SaveBlock(b) if b.id == 50))
+            .count();
+        assert_eq!(
+            save_count, 1,
+            "Block should be saved since block-id is in range"
+        );
     }
 
     #[test]

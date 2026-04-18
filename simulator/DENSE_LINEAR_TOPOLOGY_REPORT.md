@@ -262,7 +262,7 @@ aggressive as a locality control on this dense graph.
 This experiment keeps the paused three-ring schedule and changes only the first
 reactive wave:
 
-- the first reactive wave now sends `InitialVote { block, vote, reply }`
+- the first reactive wave now sends `InitialVote { block, vote }`
 - later protocol stays as before: normal `Vote`, `QueryBlock`, `Block`, and
   terminal replies
 - unsolicited plain `Block` handling is unchanged

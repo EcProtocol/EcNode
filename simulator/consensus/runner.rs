@@ -9,11 +9,11 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, RngCore, SeedableRng};
 
-use ec_rust::ec_memory_backend::MemoryBackend;
 use ec_rust::ec_interface::{
     BatchRequestItem, Block, BlockId, Message, MessageEnvelope, PeerId, PublicKeyReference,
     TokenBlock, TokenId, TOKENS_PER_BLOCK,
 };
+use ec_rust::ec_memory_backend::MemoryBackend;
 use ec_rust::ec_node::EcNode;
 
 use super::hashmap_tokens::HashMapTokens;
@@ -109,7 +109,8 @@ impl SimRunner {
             node_seed[8..].copy_from_slice(&seed[8..]);
             let node_rng = StdRng::from_seed(node_seed);
 
-            let mut node = EcNode::new_with_sink(backend, *peer_id, 0, token_storage, event_sink, node_rng);
+            let mut node =
+                EcNode::new_with_sink(backend, *peer_id, 0, token_storage, event_sink, node_rng);
 
             // Apply topology configuration
             Self::apply_topology(&mut node, peer_id, &peers, &config.topology, &mut rng);
@@ -299,7 +300,9 @@ impl SimRunner {
                             match item {
                                 BatchRequestItem::Vote { .. } => self.message_counters.1 += 1,
                                 BatchRequestItem::QueryBlock { .. }
-                                | BatchRequestItem::QueryToken { .. } => self.message_counters.0 += 1,
+                                | BatchRequestItem::QueryToken { .. } => {
+                                    self.message_counters.0 += 1
+                                }
                             }
                         }
                     }

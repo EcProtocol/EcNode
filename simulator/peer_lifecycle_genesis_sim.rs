@@ -5,18 +5,11 @@
 
 mod peer_lifecycle;
 
-use peer_lifecycle::{
-    PeerLifecycleConfig,
-    PeerLifecycleRunner,
-    InitialNetworkState,
-    TokenDistributionConfig,
-    TopologyMode,
-    EventSchedule,
-    ScheduledEvent,
-    NetworkEvent,
-    BootstrapMethod,
-};
 use ec_rust::ec_genesis::GenesisConfig;
+use peer_lifecycle::{
+    BootstrapMethod, EventSchedule, InitialNetworkState, NetworkEvent, PeerLifecycleConfig,
+    PeerLifecycleRunner, ScheduledEvent, TokenDistributionConfig, TopologyMode,
+};
 
 fn main() {
     println!("╔════════════════════════════════════════════════════════╗");
@@ -46,7 +39,7 @@ fn main() {
         num_peers: 30, // Start with 30 peers (matching random mode)
         // RandomIdentified: Each peer knows 4 random others (bootstrap scenario)
         initial_topology: TopologyMode::RandomIdentified {
-            peers_per_node: 4  // Each peer knows 4 random others initially
+            peers_per_node: 4, // Each peer knows 4 random others initially
         },
         bootstrap_rounds: 0, // No artificial bootstrap - let discovery happen naturally
     };
@@ -87,7 +80,7 @@ fn main() {
             ScheduledEvent {
                 round: 50,
                 event: NetworkEvent::PeerJoin {
-                    count: 5, // 5 new peers join
+                    count: 5,                                     // 5 new peers join
                     coverage_fraction: 0.3, // Same storage fraction as initial peers (90%)
                     bootstrap_method: BootstrapMethod::Random(4), // Each knows 4 random existing peers
                     group_name: Some("late-joiners".to_string()),
@@ -124,7 +117,10 @@ fn main() {
     println!("  Initial peers: {}", config.initial_state.num_peers);
     println!("  Rounds: {}", config.rounds);
     println!("  Topology: {:?}", config.initial_state.initial_topology);
-    println!("  Genesis config: {:?}\n", config.token_distribution.genesis_config);
+    println!(
+        "  Genesis config: {:?}\n",
+        config.token_distribution.genesis_config
+    );
 
     // Run simulation
     let runner = PeerLifecycleRunner::new(config);

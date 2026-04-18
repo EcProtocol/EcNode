@@ -5,7 +5,6 @@
 /// - Performance measurement
 /// - First few generated tokens (for verification)
 /// - Determinism verification
-
 use ec_rust::ec_genesis::{generate_genesis, GenesisConfig};
 use ec_rust::ec_memory_backend::MemoryBackend;
 use ec_rust::ec_peers::EcPeers;
@@ -91,10 +90,7 @@ fn demo_full_genesis() {
     println!("\nPerformance:");
     println!("  Total time: {:?}", duration);
     println!("  Stored: {} blocks", stored);
-    println!(
-        "  Blocks/sec: {:.0}",
-        100_000.0 / duration.as_secs_f64()
-    );
+    println!("  Blocks/sec: {:.0}", 100_000.0 / duration.as_secs_f64());
     println!(
         "  Time per block: {:.2} μs",
         duration.as_micros() as f64 / 100_000.0
@@ -115,15 +111,27 @@ fn demo_determinism() {
     let mut rng1 = StdRng::seed_from_u64(42); // Same RNG seed
     let storage_fraction = 1.0;
 
-    generate_genesis(&mut backend1, config.clone(), &mut peers1, storage_fraction, &mut rng1)
-        .expect("Genesis 1 failed");
+    generate_genesis(
+        &mut backend1,
+        config.clone(),
+        &mut peers1,
+        storage_fraction,
+        &mut rng1,
+    )
+    .expect("Genesis 1 failed");
 
     let mut backend2 = MemoryBackend::new();
     let mut peers2 = EcPeers::new(12345);
     let mut rng2 = StdRng::seed_from_u64(42); // Same RNG seed
 
-    generate_genesis(&mut backend2, config, &mut peers2, storage_fraction, &mut rng2)
-        .expect("Genesis 2 failed");
+    generate_genesis(
+        &mut backend2,
+        config,
+        &mut peers2,
+        storage_fraction,
+        &mut rng2,
+    )
+    .expect("Genesis 2 failed");
 
     println!("✓ Both generations completed successfully");
     println!("✓ Both backends contain identical token/block mappings");

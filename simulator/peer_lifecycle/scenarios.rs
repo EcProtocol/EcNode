@@ -2,9 +2,7 @@
 //
 // Provides a fluent API for defining simulation scenarios with scheduled events
 
-use super::config::{
-    EventSchedule, ScheduledEvent, NetworkEvent, PeerSelection, BootstrapMethod,
-};
+use super::config::{BootstrapMethod, EventSchedule, NetworkEvent, PeerSelection, ScheduledEvent};
 
 // ============================================================================
 // ScenarioBuilder
@@ -18,9 +16,7 @@ pub struct ScenarioBuilder {
 impl ScenarioBuilder {
     /// Create a new empty scenario
     pub fn new() -> Self {
-        Self {
-            events: Vec::new(),
-        }
+        Self { events: Vec::new() }
     }
 
     /// Start defining events for a specific round
@@ -140,41 +136,61 @@ impl ScenarioBuilder {
     /// Demonstrates that shared state knowledge enables rapid bootstrapping
     pub fn bootstrap_shared_state() -> Self {
         Self::new()
-            .at_round(50).report_stats("Early bootstrap")
-            .at_round(100).report_stats("Mid bootstrap")
-            .at_round(150).report_stats("Late bootstrap")
+            .at_round(50)
+            .report_stats("Early bootstrap")
+            .at_round(100)
+            .report_stats("Mid bootstrap")
+            .at_round(150)
+            .report_stats("Late bootstrap")
     }
 
     /// Steady-state join scenario: New peers join with varying coverage
     /// Demonstrates effect of token coverage on connectivity
     pub fn steady_state_joins() -> Self {
         Self::new()
-            .at_round(100).report_stats("Before joins - steady state")
-            .at_round(110).peers_join(5, 0.95, BootstrapMethod::Random(3), "high-coverage")
-            .at_round(120).report_stats("After high-coverage joins")
-            .at_round(130).peers_join(5, 0.50, BootstrapMethod::Random(3), "low-coverage")
-            .at_round(140).report_stats("After low-coverage joins")
-            .at_round(150).report_stats("Final state")
+            .at_round(100)
+            .report_stats("Before joins - steady state")
+            .at_round(110)
+            .peers_join(5, 0.95, BootstrapMethod::Random(3), "high-coverage")
+            .at_round(120)
+            .report_stats("After high-coverage joins")
+            .at_round(130)
+            .peers_join(5, 0.50, BootstrapMethod::Random(3), "low-coverage")
+            .at_round(140)
+            .report_stats("After low-coverage joins")
+            .at_round(150)
+            .report_stats("Final state")
     }
 
     /// Stress test: Network churn with crashes and recoveries
     pub fn network_churn() -> Self {
         Self::new()
-            .at_round(50).report_stats("Baseline")
-            .at_round(75).peers_crash(PeerSelection::Random { count: 10 })
-            .at_round(80).report_stats("After crash")
-            .at_round(100).report_stats("Recovery progress")
-            .at_round(150).report_stats("Final recovery")
+            .at_round(50)
+            .report_stats("Baseline")
+            .at_round(75)
+            .peers_crash(PeerSelection::Random { count: 10 })
+            .at_round(80)
+            .report_stats("After crash")
+            .at_round(100)
+            .report_stats("Recovery progress")
+            .at_round(150)
+            .report_stats("Final recovery")
     }
 
     /// Network partition recovery test
     pub fn partition_recovery() -> Self {
         Self::new()
-            .at_round(50).report_stats("Before partition")
-            .at_round(60).network_conditions(Some(0.8), Some(0.3))
-            .at_round(70).report_stats("During partition")
-            .at_round(100).network_conditions(Some(0.3), Some(0.01))
-            .at_round(110).report_stats("After partition healed")
-            .at_round(150).report_stats("Full recovery")
+            .at_round(50)
+            .report_stats("Before partition")
+            .at_round(60)
+            .network_conditions(Some(0.8), Some(0.3))
+            .at_round(70)
+            .report_stats("During partition")
+            .at_round(100)
+            .network_conditions(Some(0.3), Some(0.01))
+            .at_round(110)
+            .report_stats("After partition healed")
+            .at_round(150)
+            .report_stats("Full recovery")
     }
 }

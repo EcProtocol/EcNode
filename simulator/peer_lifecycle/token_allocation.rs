@@ -6,10 +6,10 @@
 // Peer IDs are allocated from the token pool, ensuring all peer IDs are valid,
 // discoverable tokens that can be found through proof-of-storage elections.
 
+use ec_rust::ec_genesis::GenesisConfig;
 use ec_rust::ec_interface::{BlockId, PeerId, TokenId, GENESIS_BLOCK_ID};
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_proof_of_storage::ring_distance;
-use ec_rust::ec_genesis::GenesisConfig;
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -33,8 +33,8 @@ impl Default for TokenDistributionConfig {
     fn default() -> Self {
         Self {
             total_tokens: 10_000,
-            neighbor_overlap: 5,  // Overlap with 5 neighbors on each side
-            coverage_fraction: 0.8,  // Know 80% of nearby tokens
+            neighbor_overlap: 5,    // Overlap with 5 neighbors on each side
+            coverage_fraction: 0.8, // Know 80% of nearby tokens
         }
     }
 }
@@ -120,7 +120,10 @@ impl GlobalTokenMapping {
         if let Some(&block) = self.mappings.get(&peer_id) {
             mappings.push((peer_id, block, GENESIS_BLOCK_ID, 0)); // parent=GENESIS for initial allocation, time=0
         } else if cfg!(debug_assertions) {
-            eprintln!("[TOKEN_DIST] WARNING: Failed to add peer's own ID {:016x}", peer_id);
+            eprintln!(
+                "[TOKEN_DIST] WARNING: Failed to add peer's own ID {:016x}",
+                peer_id
+            );
         }
 
         // Filter tokens within range and sample by coverage fraction
@@ -357,13 +360,12 @@ impl GenesisTokenSet {
             (half_ring * storage_fraction) as u64
         };
 
-        self
-            .token_ids
+        self.token_ids
             .iter()
             .enumerate()
             .filter_map(|(idx, &token_id)| {
-                let in_range = storage_fraction >= 1.0
-                    || ring_distance(peer_id, token_id) <= max_distance;
+                let in_range =
+                    storage_fraction >= 1.0 || ring_distance(peer_id, token_id) <= max_distance;
                 if in_range {
                     Some((token_id, idx as BlockId + 1))
                 } else {

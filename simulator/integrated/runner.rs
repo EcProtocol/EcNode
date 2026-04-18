@@ -21,15 +21,15 @@ use crate::integrated::{
     OnboardingSummary, RecoverySummary, RoundMetrics, SimResult, TransactionSourcePolicy,
     TransactionSpreadSummary, TransactionWorkloadSummary, VoteIngressSummary,
 };
+use crate::peer_lifecycle::stats::calculate_gradient_steepness;
+use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
+use crate::peer_lifecycle::topology::{
+    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
+    build_ring_core_tail_topology, build_ring_gradient_topology,
+};
 use crate::peer_lifecycle::{
     BootstrapMethod, GlobalTokenMapping, NetworkEvent, PeerSelection, ScheduledEvent, TopologyMode,
 };
-use crate::peer_lifecycle::stats::calculate_gradient_steepness;
-use crate::peer_lifecycle::topology::{
-    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
-    build_ring_gradient_topology,
-};
-use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
 
 const RECOVERY_WINDOW: usize = 12;
 const RECOVERY_THRESHOLD: f64 = 0.90;
@@ -380,7 +380,9 @@ impl IntegratedRunner {
         let view_width = self.view_width(peer_count);
 
         match &mut self.token_space {
-            TokenSpace::Random(mapping) => mapping.get_peer_view(peer_id, view_width, coverage_fraction),
+            TokenSpace::Random(mapping) => {
+                mapping.get_peer_view(peer_id, view_width, coverage_fraction)
+            }
             TokenSpace::Genesis(set) => set.get_peer_view(
                 peer_id,
                 self.config.token_distribution.genesis_storage_fraction,
@@ -465,7 +467,8 @@ impl IntegratedRunner {
         let token_storage = self.build_token_storage(peer_id, coverage_fraction);
         let mut node = self.build_node(peer_id, backend.clone(), token_storage.clone(), 0);
         self.seed_genesis_samples(&mut node);
-        self.last_vote_diagnostics.insert(peer_id, VoteIngressDiagnostics::default());
+        self.last_vote_diagnostics
+            .insert(peer_id, VoteIngressDiagnostics::default());
 
         SimPeer {
             backend,
@@ -699,11 +702,7 @@ impl IntegratedRunner {
         );
     }
 
-    fn handle_peer_return(
-        &mut self,
-        selection: PeerSelection,
-        bootstrap_method: BootstrapMethod,
-    ) {
+    fn handle_peer_return(&mut self, selection: PeerSelection, bootstrap_method: BootstrapMethod) {
         let inactive_peers = self.inactive_peer_ids();
         let bootstrap_peers = match bootstrap_method {
             BootstrapMethod::Random(n) => self
@@ -719,13 +718,15 @@ impl IntegratedRunner {
         let mut rejoined = 0;
 
         for peer_id in selected {
-            let Some((backend, token_storage, restart_count)) = self.peers.get(&peer_id).map(|peer| {
-                (
-                    peer.backend.clone(),
-                    peer.token_storage.clone(),
-                    peer.restart_count + 1,
-                )
-            }) else {
+            let Some((backend, token_storage, restart_count)) =
+                self.peers.get(&peer_id).map(|peer| {
+                    (
+                        peer.backend.clone(),
+                        peer.token_storage.clone(),
+                        peer.restart_count + 1,
+                    )
+                })
+            else {
                 continue;
             };
 
@@ -766,7 +767,11 @@ impl IntegratedRunner {
         );
     }
 
-    fn select_peers_by_activity(&mut self, selection: PeerSelection, active_only: bool) -> Vec<PeerId> {
+    fn select_peers_by_activity(
+        &mut self,
+        selection: PeerSelection,
+        active_only: bool,
+    ) -> Vec<PeerId> {
         let mut active: Vec<PeerId> = self
             .peers
             .iter()
@@ -781,7 +786,11 @@ impl IntegratedRunner {
             }
             PeerSelection::Specific { peer_ids } => peer_ids
                 .into_iter()
-                .filter(|peer_id| self.peers.get(peer_id).is_some_and(|peer| peer.active == active_only))
+                .filter(|peer_id| {
+                    self.peers
+                        .get(peer_id)
+                        .is_some_and(|peer| peer.active == active_only)
+                })
                 .collect(),
             PeerSelection::ByQuality { count, worst } => {
                 let mut ranked: Vec<_> = self
@@ -849,7 +858,9 @@ impl IntegratedRunner {
                 let latency = self.current_round.saturating_sub(tracked.submitted_round);
                 self.commit_latencies.push(latency);
                 let bucket = Self::entry_hop_bucket(tracked.max_entry_hops);
-                self.neighborhood_buckets[bucket].commit_latencies.push(latency);
+                self.neighborhood_buckets[bucket]
+                    .commit_latencies
+                    .push(latency);
                 self.neighborhood_buckets[bucket].committed_blocks += 1;
                 self.transaction_spread
                     .settled_peer_spread
@@ -866,10 +877,13 @@ impl IntegratedRunner {
                 self.transaction_spread
                     .ideal_coalesced_lower_bound_messages
                     .push(tracked.ideal_coalesced_lower_bound_messages);
-                self.transaction_spread.total_actual_block_messages += tracked.delivered_block_messages;
-                self.transaction_spread.total_ideal_role_sum_lower_bound_messages +=
+                self.transaction_spread.total_actual_block_messages +=
+                    tracked.delivered_block_messages;
+                self.transaction_spread
+                    .total_ideal_role_sum_lower_bound_messages +=
                     tracked.ideal_role_sum_lower_bound_messages;
-                self.transaction_spread.total_ideal_coalesced_lower_bound_messages +=
+                self.transaction_spread
+                    .total_ideal_coalesced_lower_bound_messages +=
                     tracked.ideal_coalesced_lower_bound_messages;
                 if tracked.ideal_role_sum_lower_bound_messages > 0 {
                     self.transaction_spread.actual_to_role_sum_ratio.push(
@@ -1072,7 +1086,11 @@ impl IntegratedRunner {
                 if target == 0 {
                     continue;
                 }
-                if !self.peers.get(&target).is_some_and(|candidate| candidate.active) {
+                if !self
+                    .peers
+                    .get(&target)
+                    .is_some_and(|candidate| candidate.active)
+                {
                     continue;
                 }
 
@@ -1185,7 +1203,8 @@ impl IntegratedRunner {
 
     fn build_regular_block(&mut self, target: PeerId) -> Block {
         let used = self.rng.gen_range(
-            self.config.transactions.block_size_range.0..=self.config.transactions.block_size_range.1,
+            self.config.transactions.block_size_range.0
+                ..=self.config.transactions.block_size_range.1,
         );
         let mut block = Block {
             id: self.rng.next_u64(),
@@ -1355,7 +1374,12 @@ impl IntegratedRunner {
                 .unwrap_or(0);
             let entry_is_local = origin_peer.node.local_scope_contains(token);
 
-            token_samples.push((coverage_size, vote_eligible_size, entry_hops, entry_is_local));
+            token_samples.push((
+                coverage_size,
+                vote_eligible_size,
+                entry_hops,
+                entry_is_local,
+            ));
             token_neighborhoods.push(covering_peers);
             role_route_hops.push(route_hops);
             self.extend_vote_graph(
@@ -1381,8 +1405,8 @@ impl IntegratedRunner {
         let max_role_route_hops = role_route_hops.into_iter().max().unwrap_or(0);
         let ideal_role_sum_lower_bound_messages =
             self.role_sum_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
-        let ideal_coalesced_lower_bound_messages = self
-            .coalesced_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
+        let ideal_coalesced_lower_bound_messages =
+            self.coalesced_lower_bound_messages(&token_neighborhoods, &witness_neighborhood);
         for (coverage_size, vote_eligible_size, entry_hops, entry_is_local) in token_samples {
             self.record_neighborhood_sample(
                 coverage_size,
@@ -1450,8 +1474,10 @@ impl IntegratedRunner {
             let additional_delay = self.sample_additional_network_delay();
             let transit_rounds = 1 + additional_delay;
             self.network_transit_samples.push(transit_rounds);
-            self.scheduled_wire_message_types.record_wire(&envelope.message);
-            self.scheduled_message_types.record_logical(&envelope.message);
+            self.scheduled_wire_message_types
+                .record_wire(&envelope.message);
+            self.scheduled_message_types
+                .record_logical(&envelope.message);
             self.in_flight_messages.push(ScheduledMessage {
                 deliver_round: self.current_round + additional_delay,
                 envelope,
@@ -1489,13 +1515,16 @@ impl IntegratedRunner {
             }
 
             self.total_wire_messages_delivered += 1;
-            self.delivered_wire_message_types.record_wire(&message.message);
+            self.delivered_wire_message_types
+                .record_wire(&message.message);
             self.total_messages_delivered += message_logical_count(&message.message);
-            self.delivered_message_types.record_logical(&message.message);
+            self.delivered_message_types
+                .record_logical(&message.message);
             self.track_delivered_block_message(&message);
             self.record_conflict_signal_delivery(&message);
             if let Some(peer) = self.peers.get_mut(&message.receiver) {
-                peer.node.handle_message(&message, &mut self.outbound_messages);
+                peer.node
+                    .handle_message(&message, &mut self.outbound_messages);
             }
         }
     }
@@ -1522,7 +1551,9 @@ impl IntegratedRunner {
             if progress.connected_round.is_none() && peer.node.num_connected_peers() > 0 {
                 progress.connected_round = Some(self.current_round);
             }
-            if progress.known_head_round.is_none() && peer.node.num_peers_with_commit_chain_heads() > 0 {
+            if progress.known_head_round.is_none()
+                && peer.node.num_peers_with_commit_chain_heads() > 0
+            {
                 progress.known_head_round = Some(self.current_round);
             }
             if progress.sync_trace_round.is_none()
@@ -1696,7 +1727,9 @@ impl IntegratedRunner {
                 .filter(|candidate| index_by_peer.contains_key(candidate))
                 .collect::<HashSet<_>>();
 
-            let peer_idx = *index_by_peer.get(peer_id).expect("active peer should be indexed");
+            let peer_idx = *index_by_peer
+                .get(peer_id)
+                .expect("active peer should be indexed");
             let mut expected_degree = 0.0;
             let mut absolute_error = 0.0;
             let mut comparisons = 0usize;
@@ -1828,7 +1861,9 @@ impl IntegratedRunner {
                 .filter(|candidate| index_by_peer.contains_key(candidate))
                 .collect::<HashSet<_>>();
 
-            let peer_idx = *index_by_peer.get(peer_id).expect("active peer should be indexed");
+            let peer_idx = *index_by_peer
+                .get(peer_id)
+                .expect("active peer should be indexed");
             let mut absolute_error = 0.0;
             let mut comparisons = 0usize;
 
@@ -1874,40 +1909,46 @@ impl IntegratedRunner {
         let eligible_transaction_sources = self.eligible_transaction_sources().len();
         let gradient_shape = self.calculate_gradient_shape_metrics(&active_peers);
 
-        let (avg_known_peers, avg_connected_peers, avg_gradient_locality, avg_identified_peers, avg_pending_peers, avg_known_heads) =
-            if active_count == 0 {
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            } else {
-                let mut known_total = 0.0;
-                let mut connected_total = 0.0;
-                let mut gradient_total = 0.0;
-                let mut identified_total = 0.0;
-                let mut pending_total = 0.0;
-                let mut head_total = 0.0;
+        let (
+            avg_known_peers,
+            avg_connected_peers,
+            avg_gradient_locality,
+            avg_identified_peers,
+            avg_pending_peers,
+            avg_known_heads,
+        ) = if active_count == 0 {
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        } else {
+            let mut known_total = 0.0;
+            let mut connected_total = 0.0;
+            let mut gradient_total = 0.0;
+            let mut identified_total = 0.0;
+            let mut pending_total = 0.0;
+            let mut head_total = 0.0;
 
-                for peer_id in &active_peers {
-                    if let Some(peer) = self.peers.get(peer_id) {
-                        known_total += peer.node.num_peers() as f64;
-                        connected_total += peer.node.num_connected_peers() as f64;
-                        gradient_total += calculate_gradient_steepness(
-                            peer.node.get_peer_id(),
-                            peer.node.connected_peer_ids(),
-                        );
-                        identified_total += peer.node.num_identified_peers() as f64;
-                        pending_total += peer.node.num_pending_peers() as f64;
-                        head_total += peer.node.num_peers_with_commit_chain_heads() as f64;
-                    }
+            for peer_id in &active_peers {
+                if let Some(peer) = self.peers.get(peer_id) {
+                    known_total += peer.node.num_peers() as f64;
+                    connected_total += peer.node.num_connected_peers() as f64;
+                    gradient_total += calculate_gradient_steepness(
+                        peer.node.get_peer_id(),
+                        peer.node.connected_peer_ids(),
+                    );
+                    identified_total += peer.node.num_identified_peers() as f64;
+                    pending_total += peer.node.num_pending_peers() as f64;
+                    head_total += peer.node.num_peers_with_commit_chain_heads() as f64;
                 }
+            }
 
-                (
-                    known_total / active_count as f64,
-                    connected_total / active_count as f64,
-                    gradient_total / active_count as f64,
-                    identified_total / active_count as f64,
-                    pending_total / active_count as f64,
-                    head_total / active_count as f64,
-                )
-            };
+            (
+                known_total / active_count as f64,
+                connected_total / active_count as f64,
+                gradient_total / active_count as f64,
+                identified_total / active_count as f64,
+                pending_total / active_count as f64,
+                head_total / active_count as f64,
+            )
+        };
 
         let active_traces: usize = active_peers
             .iter()
@@ -2314,7 +2355,9 @@ impl IntegratedRunner {
 
             let visible_candidates = candidate_counts.len();
             let candidate_coverers = candidate_counts.values().sum::<usize>();
-            let highest_coverers = *candidate_counts.get(&family.highest_candidate).unwrap_or(&0);
+            let highest_coverers = *candidate_counts
+                .get(&family.highest_candidate)
+                .unwrap_or(&0);
             let majority_coverers = candidate_counts.values().copied().max().unwrap_or(0);
             let participant_peers = self
                 .peers
@@ -2361,7 +2404,9 @@ impl IntegratedRunner {
                 families_stalled_without_majority += 1;
             }
             if visible_candidates > 0
-                && candidate_counts.keys().any(|block_id| *block_id != family.highest_candidate)
+                && candidate_counts
+                    .keys()
+                    .any(|block_id| *block_id != family.highest_candidate)
             {
                 families_with_any_lower_candidate_visible += 1;
             }
@@ -2440,10 +2485,16 @@ impl IntegratedRunner {
                 peak_pending_without_block: peak_of(|round| round.pending_without_block),
                 avg_pending_no_trusted_votes: average_of(|round| round.pending_no_trusted_votes),
                 peak_pending_no_trusted_votes: peak_of(|round| round.pending_no_trusted_votes),
-                avg_pending_waiting_validation: average_of(|round| round.pending_waiting_validation),
+                avg_pending_waiting_validation: average_of(|round| {
+                    round.pending_waiting_validation
+                }),
                 peak_pending_waiting_validation: peak_of(|round| round.pending_waiting_validation),
-                avg_pending_waiting_token_votes: average_of(|round| round.pending_waiting_token_votes),
-                peak_pending_waiting_token_votes: peak_of(|round| round.pending_waiting_token_votes),
+                avg_pending_waiting_token_votes: average_of(|round| {
+                    round.pending_waiting_token_votes
+                }),
+                peak_pending_waiting_token_votes: peak_of(|round| {
+                    round.pending_waiting_token_votes
+                }),
                 avg_pending_waiting_witness: average_of(|round| round.pending_waiting_witness),
                 peak_pending_waiting_witness: peak_of(|round| round.pending_waiting_witness),
                 avg_pending_age_50_plus: average_of(|round| round.pending_age_50_plus),
@@ -2465,13 +2516,14 @@ impl IntegratedRunner {
                 vote_eligible_size: DistributionSummary::from_samples(
                     &self.neighborhood_vote_eligible_samples,
                 ),
-                entry_hops: DistributionSummary::from_samples(
-                    &self.neighborhood_entry_hop_samples,
-                ),
+                entry_hops: DistributionSummary::from_samples(&self.neighborhood_entry_hop_samples),
                 buckets: neighborhood_buckets,
             },
             transaction_workload: TransactionWorkloadSummary {
-                configured_existing_token_fraction: self.config.transactions.existing_token_fraction,
+                configured_existing_token_fraction: self
+                    .config
+                    .transactions
+                    .existing_token_fraction,
                 existing_token_parts: self.existing_token_parts_generated,
                 new_token_parts: self.new_token_parts_generated,
                 blocks_with_existing_tokens: self.blocks_with_existing_tokens,
