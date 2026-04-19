@@ -91,12 +91,13 @@ impl GlobalTokenMapping {
         let avg_peer_distance = ring_size / num_peers as u64;
 
         // Width should cover neighbor_overlap peers on each side
-        // Add 20% margin to ensure coverage despite uniform distribution variance
-        // Use saturating_mul to prevent overflow
-        let base_width = avg_peer_distance.saturating_mul(neighbor_overlap as u64);
-        let width = base_width.saturating_mul(12) / 10;
+        // Add 20% margin to ensure coverage despite uniform distribution variance.
+        // Do the multiplication in u128 so we keep the intended rounding behavior
+        // instead of truncating additional precision away to avoid overflow.
+        let base_width = avg_peer_distance as u128 * neighbor_overlap as u128;
+        let width = base_width * 12 / 10;
 
-        width.min(u64::MAX / 2) // Cap at half the ring
+        width.min((u64::MAX / 2) as u128) as u64 // Cap at half the ring
     }
 
     /// Get a view of tokens for a specific peer as MemTokens
@@ -469,12 +470,12 @@ mod tests {
     fn test_view_width_calculation() {
         // With 10 peers and 2 neighbor overlap, should cover ~20% of ring on each side
         let width = GlobalTokenMapping::calculate_view_width(10, 2);
-        let expected = u64::MAX / 100 * 24; // (avg_distance * overlap * 1.2) avoiding overflow
+        let expected = ((u64::MAX / 10) as u128 * 2 * 12 / 10) as u64;
         assert_eq!(width, expected);
 
         // With 100 peers and 5 neighbor overlap
         let width = GlobalTokenMapping::calculate_view_width(100, 5);
-        let expected = (u64::MAX / 100) * 5 * 12 / 10;
+        let expected = ((u64::MAX / 100) as u128 * 5 * 12 / 10) as u64;
         assert_eq!(width, expected);
     }
 

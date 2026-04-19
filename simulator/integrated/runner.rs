@@ -1104,6 +1104,7 @@ impl IntegratedRunner {
 
     fn block_ids_for_message(message: &Message) -> Vec<BlockId> {
         match message {
+            Message::InitialVote { block, .. } => vec![block.id],
             Message::Vote { block_id, .. } => vec![*block_id],
             Message::QueryBlock { block_id, .. } => vec![*block_id],
             Message::Block { block } => vec![block.id],
@@ -1140,6 +1141,11 @@ impl IntegratedRunner {
         let mut lower_signal_blocks = Vec::new();
 
         match &envelope.message {
+            Message::InitialVote { block, vote } => {
+                if *vote == 0 {
+                    lower_signal_blocks.push(block.id);
+                }
+            }
             Message::Vote { block_id, vote, .. } => {
                 if *vote == 0 {
                     lower_signal_blocks.push(*block_id);

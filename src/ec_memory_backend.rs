@@ -48,8 +48,9 @@ use crate::ec_proof_of_storage::{ProofOfStorage, TokenStorageBackend};
 /// let mut storage = MemTokens::new();
 /// let token_id = 123u64;
 /// let block_id = 456u64;
+/// let parent_id = 0u64;
 /// let time = 789u64;
-/// TokenStorageBackend::set(&mut storage, &token_id, &block_id, time);
+/// TokenStorageBackend::set(&mut storage, &token_id, &block_id, &parent_id, time);
 ///
 /// // Verify the token was stored
 /// assert!(TokenStorageBackend::lookup(&storage, &token_id).is_some());
@@ -589,9 +590,10 @@ impl EcBlocks for MemBlocks {
 /// // Access tokens
 /// let token_id = 123u64;
 /// let block_id = 456u64;
+/// let parent_id = 0u64;
 /// let time = 789u64;
 /// let tokens = backend.tokens_mut();
-/// TokenStorageBackend::set(tokens, &token_id, &block_id, time);
+/// TokenStorageBackend::set(tokens, &token_id, &block_id, &parent_id, time);
 ///
 /// // Access blocks
 /// let block = Block {

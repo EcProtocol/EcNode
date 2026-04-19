@@ -540,8 +540,8 @@ pub enum ElectionError {
 /// let mut election = PeerElection::new(challenge_token, my_peer_id, ElectionConfig::default());
 ///
 /// // Create channels
-/// let ticket1 = election.create_channel(100).unwrap();
-/// let ticket2 = election.create_channel(200).unwrap();
+/// let ticket1 = election.create_channel(100, 0).unwrap();
+/// let ticket2 = election.create_channel(200, 0).unwrap();
 ///
 /// // When Answer received, verify and submit
 /// // election.handle_answer(ticket, answer, signature, responder_peer).unwrap();
@@ -1163,6 +1163,7 @@ impl ProofOfStorage {
     ///     let msg = Message::Answer {
     ///         answer: signature.answer,
     ///         signature: signature.signature,
+    ///         head_of_chain: 0,
     ///     };
     /// }
     /// ```

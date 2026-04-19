@@ -696,11 +696,12 @@ pub trait EcCommitChainAccess {
 /// };
 /// let token_id = 456u64;
 /// let block_id = 123u64;
+/// let parent_id = 0u64;
 /// let time = 1000u64;
 ///
 /// // Mempool adds blocks and tokens during tick
 /// batch.save_block(&block);
-/// batch.update_token(&token_id, &block_id, time);
+/// batch.update_token(&token_id, &block_id, &parent_id, time);
 ///
 /// // End of tick: commit everything atomically
 /// batch.commit().unwrap();

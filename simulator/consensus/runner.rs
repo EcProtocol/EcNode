@@ -294,6 +294,7 @@ impl SimRunner {
                 match m.message {
                     Message::QueryBlock { .. } => self.message_counters.0 += 1,
                     Message::QueryToken { .. } => self.message_counters.0 += 1,
+                    Message::InitialVote { .. } => self.message_counters.1 += 1,
                     Message::Vote { .. } => self.message_counters.1 += 1,
                     Message::RequestBatch { ref items } => {
                         for item in items {
