@@ -1,3 +1,4 @@
+use hashbrown::{HashSet};
 // track the state of transactions
 use indexmap::IndexMap;
 use std::cmp::Reverse;
@@ -130,30 +131,6 @@ impl PoolBlockState {
             self.updated = true;
         }
     }
-
-    fn put_block<F>(&mut self, block: &Block, validate: F) -> bool
-    where
-        F: Fn() -> (bool, u8, u8),
-    {
-        if self.block.is_none() {
-            let (valid, matching, validated) = validate();
-
-            // TODO if not - a "better" block could show up (correct signature etc) ?
-            if valid {
-                self.updated = true;
-                self.block = Some(*block);
-                self.vote = matching;
-                self.validate = validated;
-            } else {
-                // TODO check
-                self.state = BlockState::Blocked
-            }
-
-            return true;
-        }
-
-        return false;
-    }
 }
 
 /// Result of evaluating a pending block
@@ -168,6 +145,19 @@ pub struct CommitTransition {
     pub committed_block_id: BlockId,
     pub competing_block_id: Option<BlockId>,
     pub interested_voters: Vec<PeerId>,
+}
+
+/// Request produced when a newly learned block should trigger immediate `InitialVote`
+/// handling outside the periodic tick flow.
+///
+/// `competing_block` carries any known higher conflicting block ID for the request.
+/// `None` means the request is just seeding awareness of `block`, while `Some(id)`
+/// means `block` is known to conflict with a higher competing block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InitialVoteRequest {
+    pub receiver: PeerId,
+    pub block: Block,
+    pub vote: u8,
 }
 
 pub struct EcMemPool {
@@ -467,24 +457,196 @@ impl EcMemPool {
         }
     }
 
-    pub(crate) fn block(&mut self, block: &Block, time: EcTime) -> bool {
-        self.pool
-            .entry(block.id)
-            .or_insert_with(|| PoolBlockState::new(time))
-            .put_block(block, || {
-                // out-of-bounds or too-far-into-the-future
-                if block.used as usize >= TOKENS_PER_BLOCK
-                    || block.time > time + SOME_STEPS_INTO_THE_FUTURE
-                {
-                    return (false, 0, 1);
-                }
-
+    fn add_block(&mut self, block: &Block, time: EcTime) -> &mut PoolBlockState {
+        self.pool.entry(block.id).or_insert_with(|| {
+            let mut state = PoolBlockState::new(time);
+            if block.used as usize >= TOKENS_PER_BLOCK
+                || block.time > time + SOME_STEPS_INTO_THE_FUTURE
+            {
                 // TODO same token only once
 
                 // TODO verify that block-id is the SHA of block content INCL signatures)
 
-                (true, 0, 0)
-            })
+                state.state = BlockState::Blocked;
+            } else {
+                state.block = Some(*block);
+            }
+            state
+        })
+    }
+
+    pub(crate) fn block(&mut self, block: &Block, time: EcTime) -> bool {
+        self.add_block(block, time).time == time
+    }
+
+    fn blocks_conflict(existing: &Block, new_block: &Block) -> bool {
+        for existing_idx in 0..existing.used as usize {
+            for new_idx in 0..new_block.used as usize {
+                if existing.parts[existing_idx].token == new_block.parts[new_idx].token
+                    && existing.parts[existing_idx].last == new_block.parts[new_idx].last
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn vote_mask_for_block(block: &Block, tokens: &dyn EcTokensV2) -> u8 {
+        let mut vote = 0;
+
+        for i in 0..block.used as usize {
+            let token_id = block.parts[i].token;
+            let last_mapping = block.parts[i].last;
+            let current_mapping = tokens.lookup_current(&token_id).map_or(0, |t| t.block);
+
+            if current_mapping == last_mapping {
+                vote |= 1 << i;
+            }
+        }
+
+        vote
+    }
+
+    fn schedule_closest_peer_requests(
+        requests: &mut HashSet<PeerId>,
+        peers: &EcPeers,
+        target_tokens: &Block,
+        count: usize,
+    ) {
+        for i in 0..target_tokens.used as usize {
+            for receiver in peers.find_closest_active_peers(target_tokens.parts[i].token, count) {
+                requests.insert(receiver);
+            }
+        }
+    }
+
+    /// Add a newly learned block through the reactive path and describe the
+    /// immediate `InitialVote` work that should happen before the next tick.
+    ///
+    /// Behavior:
+    /// - Returns an empty request list if the block already has a concrete
+    ///   mempool entry or fails basic shape/time validation.
+    /// - Reuses an existing vote-only placeholder entry for `block` when present,
+    ///   preserving its votes while filling in the concrete block body.
+    /// - Compares `block` against existing concrete blocks in the pool. Two
+    ///   blocks conflict when they update the same token from the same parent.
+    /// - Tracks the highest competing block ID for both the new state and any
+    ///   conflicting existing state, marking whichever side loses the ID race as
+    ///   `Blocked`.
+    /// - Emits `InitialVoteRequest`s for:
+    ///   - each recorded voter of an existing block newly blocked by `block`
+    ///   - the 2 closest active peers to each target token of such blocked blocks
+    ///   - the 4 closest active peers to each target token of `block`
+    ///
+    /// The returned requests are deduplicated by receiver because the same peer
+    /// can be reached through multiple target tokens.
+    pub(crate) fn reactive_add_block(
+        &mut self,
+        block: &Block,
+        peers: &EcPeers,
+        tokens: &dyn EcTokensV2,
+        time: EcTime,
+    ) -> Vec<InitialVoteRequest> {
+        let block_id = block.id;
+
+        // Phase 1: Add block, check if already known or invalid
+        {
+            let state = self.add_block(block, time);
+            // add_block marks invalid blocks as Blocked without setting state.block
+            if state.block.is_none() {
+                return Vec::new();
+            }
+        }
+
+        let mut requests = HashSet::new();
+        let mut blocked_by_id: Option<BlockId> = None;
+
+        // Phase 2: Find conflicts and update existing blocks
+        for (&existing_block_id, existing_state) in &mut self.pool {
+            if existing_block_id == block_id {
+                continue;
+            }
+            let Some(existing_block) = existing_state.block else {
+                continue;
+            };
+
+            if !Self::blocks_conflict(&existing_block, block) {
+                continue;
+            }
+
+            // new block loses
+            if existing_block_id > block_id {
+                blocked_by_id = Some(existing_block_id);
+                continue;
+            }
+
+            // existing block loses (and new block replaces competing-block)
+            if block_id > existing_block_id
+                && block_id > existing_state.competing_block.unwrap_or(0)
+            {
+                existing_state.competing_block = Some(block_id);
+                if existing_state.state == Pending {
+                    existing_state.state = BlockState::Blocked;
+                    existing_state.updated = false;
+
+                    // those that voted for it
+                    for &receiver in existing_state.votes.keys() {
+                        requests.insert(receiver);
+                    }
+
+                    // its neighborhoods
+                    Self::schedule_closest_peer_requests(&mut requests, peers, &existing_block, 2);
+                }
+            }
+        }
+
+        let vote = if blocked_by_id.is_some() {
+            0
+        } else {
+            Self::vote_mask_for_block(block, tokens)
+        };
+
+        // Phase 3: Update new block's state
+        let pending_voters: Vec<PeerId> = {
+            let state = self.pool.get_mut(&block_id).unwrap();
+
+            state.state = if blocked_by_id.is_none() {
+                BlockState::Pending
+            } else {
+                BlockState::Blocked
+            };
+            state.competing_block = blocked_by_id;
+            state.vote = vote;
+            state.votes.keys().copied().collect()
+        };
+
+        Self::schedule_closest_peer_requests(&mut requests, peers, block, 4);
+
+        let mut responses: Vec<InitialVoteRequest> = Vec::new();
+
+        // Notify voters of the new block if it got blocked
+        if let Some(blocked_by_id) = blocked_by_id {
+            let blocker = self.pool.get(&blocked_by_id).unwrap();
+            for receiver in pending_voters {
+                responses.push(InitialVoteRequest {
+                    receiver,
+                    block: blocker.block.unwrap(),
+                    vote: blocker.vote,
+                });
+            }
+        }
+
+        for &receiver in &requests {
+            responses.push(InitialVoteRequest {
+                receiver,
+                block: *block,
+                vote,
+            });
+        }
+
+        responses
     }
 
     fn refresh_pending_vote_state(
@@ -701,7 +863,7 @@ mod tests {
     use crate::ec_interface::{
         EcTokens, EcTokensV2, NoOpSink, StorageBatch, TokenBlock, TokenState, TrustedMapping,
     };
-    use crate::ec_peers::EcPeers;
+    use crate::ec_peers::{EcPeers, PeerManagerConfig};
     use rand::SeedableRng;
 
     struct MockEcBlocks {
@@ -800,6 +962,39 @@ mod tests {
         }
     }
 
+    fn test_block(id: BlockId, token: TokenId, last: BlockId) -> Block {
+        Block {
+            id,
+            time: 10,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token,
+                    last,
+                    key: 1,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; TOKENS_PER_BLOCK],
+        }
+    }
+
+    fn test_peers() -> EcPeers {
+        let mut peers = EcPeers::with_config_and_rng(
+            55,
+            PeerManagerConfig::default(),
+            rand::rngs::StdRng::from_seed([41u8; 32]),
+        );
+        for peer_id in [100, 200, 300, 400, 500] {
+            peers.update_peer(&peer_id, 0);
+        }
+        peers
+    }
+
     #[test]
     fn test_query() {
         let block_id = 1;
@@ -869,18 +1064,53 @@ mod tests {
     }
 
     #[test]
-    fn vote_sequence_interleaves_pauses_between_four_steps() {
+    fn reactive_add_block_seeds_new_block_to_innermost_peers() {
+        let block = test_block(200, 250, 7);
+        let mut mem_pool = EcMemPool::new();
+        let peers = test_peers();
+        let mut tokens = MockTokens::default();
+        tokens.tokens.insert(
+            250,
+            TokenState {
+                current: Some(TrustedMapping {
+                    block: 7,
+                    parent: 0,
+                    time: 0,
+                    source: crate::ec_interface::TrustSource::Confirmed,
+                }),
+                pending: None,
+            },
+        );
+
+        let requests = mem_pool.reactive_add_block(&block, &peers, &tokens, 10);
+
+        assert_eq!(requests.len(), 4);
+        assert!(requests
+            .iter()
+            .all(|request| { request.block.id == block.id && request.vote == 0b0000_0001 }));
+        assert!(matches!(
+            mem_pool.pool.get(&block.id).map(|state| &state.state),
+            Some(BlockState::Pending)
+        ));
+    }
+
+    #[test]
+    fn reactive_add_block_deduplicates_receivers_across_targets() {
         let block = Block {
-            id: 200,
+            id: 210,
             time: 10,
-            used: 1,
+            used: 2,
             parts: [
                 TokenBlock {
-                    token: 42,
+                    token: 250,
                     last: 7,
                     key: 1,
                 },
-                Default::default(),
+                TokenBlock {
+                    token: 260,
+                    last: 8,
+                    key: 1,
+                },
                 Default::default(),
                 Default::default(),
                 Default::default(),
@@ -888,59 +1118,159 @@ mod tests {
             ],
             signatures: [None; TOKENS_PER_BLOCK],
         };
-
-        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 4, 1);
-        assert!(mem_pool.block(&block, 10));
-
-        let evaluation = BlockEvaluation {
-            block_id: block.id,
-            block: block.clone(),
-            vote_mask: 0b0000_0001,
-        };
-        let peers = EcPeers::with_config_and_rng(
-            55,
-            crate::ec_peers::PeerManagerConfig::default(),
-            rand::rngs::StdRng::from_seed([8u8; 32]),
+        let mut mem_pool = EcMemPool::new();
+        let peers = test_peers();
+        let mut tokens = MockTokens::default();
+        tokens.tokens.insert(
+            250,
+            TokenState {
+                current: Some(TrustedMapping {
+                    block: 7,
+                    parent: 0,
+                    time: 0,
+                    source: crate::ec_interface::TrustSource::Confirmed,
+                }),
+                pending: None,
+            },
         );
-        let mut batch = TestBatch::default();
-        let mut sink = NoOpSink;
+        tokens.tokens.insert(
+            260,
+            TokenState {
+                current: Some(TrustedMapping {
+                    block: 8,
+                    parent: 0,
+                    time: 0,
+                    source: crate::ec_interface::TrustSource::Confirmed,
+                }),
+                pending: None,
+            },
+        );
 
-        let mut seen = Vec::new();
-        for time in 10..19 {
-            let (messages, _) = mem_pool.tick_with_evaluations(
-                &peers,
-                time,
-                55,
-                &mut sink,
-                std::slice::from_ref(&evaluation),
-                &mut batch,
+        let requests = mem_pool.reactive_add_block(&block, &peers, &tokens, 10);
+        let unique_receivers: HashSet<PeerId> =
+            requests.iter().map(|request| request.receiver).collect();
+
+        assert_eq!(requests.len(), unique_receivers.len());
+        assert!(requests
+            .iter()
+            .all(|request| request.block.id == block.id && request.vote == 0b0000_0011));
+    }
+
+    #[test]
+    fn reactive_add_block_marks_new_block_blocked_by_higher_existing_conflict() {
+        let existing = test_block(300, 250, 7);
+        let new_block = test_block(200, 250, 7);
+        let mut mem_pool = EcMemPool::new();
+        let peers = test_peers();
+        let mut tokens = MockTokens::default();
+        tokens.tokens.insert(
+            250,
+            TokenState {
+                current: Some(TrustedMapping {
+                    block: 7,
+                    parent: 0,
+                    time: 0,
+                    source: crate::ec_interface::TrustSource::Confirmed,
+                }),
+                pending: None,
+            },
+        );
+
+        assert!(mem_pool.block(&existing, 10));
+
+        let requests = mem_pool.reactive_add_block(&new_block, &peers, &tokens, 10);
+
+        assert_eq!(requests.len(), 4);
+        assert!(requests
+            .iter()
+            .all(|request| { request.block.id == new_block.id && request.vote == 0 }));
+
+        let new_state = mem_pool.pool.get(&new_block.id).unwrap();
+        assert_eq!(new_state.state, BlockState::Blocked);
+        assert_eq!(new_state.competing_block, Some(existing.id));
+    }
+
+    #[test]
+    fn reactive_add_block_blocks_lower_existing_conflict_and_notifies_voters() {
+        let existing = test_block(100, 250, 7);
+        let new_block = test_block(200, 250, 7);
+        let mut mem_pool = EcMemPool::new();
+        let peers = test_peers();
+        let mut tokens = MockTokens::default();
+        tokens.tokens.insert(
+            250,
+            TokenState {
+                current: Some(TrustedMapping {
+                    block: 7,
+                    parent: 0,
+                    time: 0,
+                    source: crate::ec_interface::TrustSource::Confirmed,
+                }),
+                pending: None,
+            },
+        );
+
+        assert!(mem_pool.block(&existing, 10));
+        mem_pool.vote(&existing.id, 0b0000_0001, &999, 10, true);
+
+        let requests = mem_pool.reactive_add_block(&new_block, &peers, &tokens, 10);
+
+        // All requests now contain the new_block (winning block)
+        assert!(requests
+            .iter()
+            .all(|request| request.block.id == new_block.id && request.vote == 0b0000_0001));
+
+        // Voter 999 (who voted for existing) should be notified about the new block
+        assert!(requests.iter().any(|request| request.receiver == 999));
+
+        // Should have requests for: existing block voter (999) + 2 closest peers for
+        // existing block + 4 closest peers for new block (deduplicated)
+        assert!(requests.len() >= 4);
+
+        let existing_state = mem_pool.pool.get(&existing.id).unwrap();
+        assert_eq!(existing_state.state, BlockState::Blocked);
+        assert_eq!(existing_state.competing_block, Some(new_block.id));
+    }
+
+    #[test]
+    fn reactive_add_block_does_not_notify_terminal_losing_blocks() {
+        for existing_state_kind in [BlockState::Blocked, BlockState::Commit] {
+            let existing = test_block(100, 250, 7);
+            let new_block = test_block(200, 250, 7);
+            let mut mem_pool = EcMemPool::new();
+            let peers = test_peers();
+            let mut tokens = MockTokens::default();
+            tokens.tokens.insert(
+                250,
+                TokenState {
+                    current: Some(TrustedMapping {
+                        block: 7,
+                        parent: 0,
+                        time: 0,
+                        source: crate::ec_interface::TrustSource::Confirmed,
+                    }),
+                    pending: None,
+                },
             );
-            let token_sequences: Vec<u8> = messages
-                .iter()
-                .filter_map(|message| match message {
-                    MessageRequest::Vote(block_id, token_id, _, true, sequence)
-                        if *block_id == block.id && *token_id == 42 =>
-                    {
-                        Some(*sequence)
-                    }
-                    _ => None,
-                })
-                .collect();
-            seen.push(token_sequences);
-        }
 
-        assert_eq!(seen[0], vec![0]);
-        assert!(seen[1].is_empty(), "second tick should pause");
-        assert_eq!(seen[2], vec![1]);
-        assert!(seen[3].is_empty(), "fourth tick should pause");
-        assert_eq!(seen[4], vec![2]);
-        assert!(seen[5].is_empty(), "sixth tick should pause");
-        assert_eq!(seen[6], vec![3]);
-        assert!(
-            seen[7].is_empty(),
-            "eighth tick should pause before restarting"
-        );
-        assert_eq!(seen[8], vec![0]);
+            assert!(mem_pool.block(&existing, 10));
+            mem_pool.vote(&existing.id, 0b0000_0001, &999, 10, true);
+            let existing_state = mem_pool.pool.get_mut(&existing.id).unwrap();
+            existing_state.state = existing_state_kind.clone();
+
+            let requests = mem_pool.reactive_add_block(&new_block, &peers, &tokens, 10);
+
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.block.id != existing.id),
+                "terminal losing blocks should not emit reactive InitialVote requests",
+            );
+
+            let existing_state = mem_pool.pool.get(&existing.id).unwrap();
+            assert_eq!(existing_state.state, existing_state_kind);
+            assert_eq!(existing_state.competing_block, Some(new_block.id));
+        }
     }
 
     #[test]
@@ -1019,78 +1349,5 @@ mod tests {
             )),
             "once balance rises back above the negative pause threshold, polling should resume"
         );
-    }
-
-    #[test]
-    fn vote_sequence_can_use_three_active_rounds_with_interleaved_pauses() {
-        let block = Block {
-            id: 301,
-            time: 10,
-            used: 1,
-            parts: [
-                TokenBlock {
-                    token: 42,
-                    last: 7,
-                    key: 1,
-                },
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-            ],
-            signatures: [None; TOKENS_PER_BLOCK],
-        };
-
-        let mut mem_pool = EcMemPool::with_vote_policy(2, 0, 3, 1);
-        assert!(mem_pool.block(&block, 10));
-
-        let evaluation = BlockEvaluation {
-            block_id: block.id,
-            block: block.clone(),
-            vote_mask: 0b0000_0001,
-        };
-        let peers = EcPeers::with_config_and_rng(
-            55,
-            crate::ec_peers::PeerManagerConfig::default(),
-            rand::rngs::StdRng::from_seed([28u8; 32]),
-        );
-        let mut batch = TestBatch::default();
-        let mut sink = NoOpSink;
-
-        let mut seen = Vec::new();
-        for time in 10..17 {
-            let (messages, _) = mem_pool.tick_with_evaluations(
-                &peers,
-                time,
-                55,
-                &mut sink,
-                std::slice::from_ref(&evaluation),
-                &mut batch,
-            );
-            let token_sequences: Vec<u8> = messages
-                .iter()
-                .filter_map(|message| match message {
-                    MessageRequest::Vote(block_id, token_id, _, true, sequence)
-                        if *block_id == block.id && *token_id == 42 =>
-                    {
-                        Some(*sequence)
-                    }
-                    _ => None,
-                })
-                .collect();
-            seen.push(token_sequences);
-        }
-
-        assert_eq!(seen[0], vec![0]);
-        assert!(seen[1].is_empty(), "second tick should pause");
-        assert_eq!(seen[2], vec![1]);
-        assert!(seen[3].is_empty(), "fourth tick should pause");
-        assert_eq!(seen[4], vec![2]);
-        assert!(
-            seen[5].is_empty(),
-            "sixth tick should pause before restarting"
-        );
-        assert_eq!(seen[6], vec![0]);
     }
 }

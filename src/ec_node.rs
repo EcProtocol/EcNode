@@ -7,7 +7,7 @@ use crate::ec_interface::{
     EcTime, EcTokensV2, Event, EventSink, Message, MessageEnvelope, MessageTicket, NoOpSink,
     PeerId, TokenId,
 };
-use crate::ec_mempool::{BlockState, EcMemPool, MempoolDiagnostics};
+use crate::ec_mempool::{BlockState, EcMemPool, InitialVoteRequest, MempoolDiagnostics};
 use crate::ec_peers::{EcPeers, PeerAction, PeerManagerConfig};
 use crate::ec_proof_of_storage::TokenStorageBackend;
 use crate::ec_ticket_manager::TicketManager;
@@ -183,16 +183,15 @@ impl<
     }
 
     pub fn block(&mut self, block: &Block) {
-        let mut ignored = Vec::new();
-        self.accept_mempool_block(block, None, &mut ignored);
+        let _ = self.mem_pool.block(block, self.time);
     }
 
     pub fn submit_local_block(
         &mut self,
         block: &Block,
-        outbound_messages: &mut Vec<MessageEnvelope>,
+        _outbound_messages: &mut Vec<MessageEnvelope>,
     ) {
-        self.accept_mempool_block(block, None, outbound_messages);
+        let _ = self.mem_pool.block(block, self.time);
     }
 
     pub fn committed_block(&self, block_id: &BlockId) -> Option<Block> {
@@ -461,7 +460,7 @@ impl<
         Block not in mem-pool
             IF trusted peer - record vote placeholder and fetch block on tick
             ELSE IF client ticket - record vote placeholder and fetch block on tick
-            InitialVote also tries to supply the block directly via accept_mempool_block
+            InitialVote also tries to supply the block directly via reactive_add_block
     */
 
     /// Validate an identity-block (test mode)
@@ -505,48 +504,52 @@ impl<
         outbound_messages.extend(local_responses);
     }
 
-    fn accept_mempool_block(
+    fn emit_reactive_initial_vote_requests(
+        &self,
+        requests: &[InitialVoteRequest],
+        responses: &mut Vec<MessageEnvelope>,
+    ) {
+        for request in requests {
+            if request.receiver == self.peer_id {
+                continue;
+            }
+
+            responses.push(MessageEnvelope {
+                sender: self.peer_id,
+                receiver: request.receiver,
+                ticket: 0,
+                time: self.time,
+                message: Message::InitialVote {
+                    block: request.block,
+                    vote: request.vote,
+                },
+            });
+        }
+    }
+
+    fn reactive_accept_mempool_block(
         &mut self,
         block: &Block,
-        sender: Option<PeerId>,
+        sender: PeerId,
         responses: &mut Vec<MessageEnvelope>,
     ) -> bool {
-        let mut block_was_useful = false;
+        let reactive_requests = {
+            let backend = self.backend.borrow();
+            self.mem_pool
+                .reactive_add_block(block, &self.peers, &*backend, self.time)
+        };
 
-        if self.mem_pool.block(block, self.time) {
-            block_was_useful = true;
+        self.event_sink.log(
+            self.time,
+            self.peer_id,
+            Event::BlockReceived {
+                block_id: block.id,
+                peer: sender,
+                size: block.used,
+            },
+        );
 
-            if let Some(sender) = sender {
-                self.event_sink.log(
-                    self.time,
-                    self.peer_id,
-                    Event::BlockReceived {
-                        block_id: block.id,
-                        peer: sender,
-                        size: block.used,
-                    },
-                );
-            }
-        }
-
-        if !block_was_useful {
-            return false;
-        }
-
-        if matches!(
-            self.mem_pool.status(&block.id, &*self.backend.borrow()),
-            Some(BlockState::Blocked)
-        ) {
-            for early_peer in self.mem_pool.interested_voters(&block.id) {
-                if early_peer != self.peer_id {
-                    responses.push(self.send_blocked_update(early_peer, block.id, None));
-                }
-            }
-        }
-
-        if let Some(sender) = sender {
-            self.peers.add_identified_peer(sender, self.time);
-        }
+        self.emit_reactive_initial_vote_requests(&reactive_requests, responses);
 
         true
     }
@@ -613,30 +616,24 @@ impl<
                     }
                     (None, false) => {
                         self.vote_diagnostics.untrusted_votes_received += 1;
-
-                        // TODO check for client ticket to initiate mempool
-                        if msg.ticket > 0 {
-                            self.mem_pool.vote(block, 0, &msg.sender, msg.time, *reply);
-                        }
                     }
                     _ => {} // discard - do nothing
                 }
             }
             Message::InitialVote { block, vote } => {
-                let synthetic_vote = MessageEnvelope {
-                    sender: msg.sender,
-                    receiver: msg.receiver,
-                    ticket: msg.ticket,
-                    time: msg.time,
-                    message: Message::Vote {
-                        block_id: block.id,
-                        vote: *vote,
-                        reply: true,
-                    },
-                };
+                if self.peers.trusted_peer(&msg.sender).is_none() {
+                    self.vote_diagnostics.untrusted_votes_received += 1;
 
-                self.handle_message_inner(&synthetic_vote, responses);
-                self.accept_mempool_block(block, Some(msg.sender), responses);
+                    // TODO client ticket check
+                    if msg.ticket == 0 {
+                        return;
+                    }
+                }
+
+                self.reactive_accept_mempool_block(block, msg.sender, responses);
+
+                self.mem_pool
+                    .vote(&block.id, 0, &msg.sender, msg.time, true);
             }
             Message::QueryBlock {
                 block_id,
@@ -799,16 +796,16 @@ impl<
                 if msg.ticket == 0 {
                     if self.validate_identity_block_test(&block, msg.sender) {
                         // Submit to mempool like normal blocks
-                        if self.mem_pool.block(block, self.time) {
-                            self.event_sink.log(
-                                self.time,
-                                self.peer_id,
-                                Event::IdentityBlockReceived {
-                                    peer_id: block.parts[0].token,
-                                    sender: msg.sender,
-                                },
-                            );
-                        }
+                        self.reactive_accept_mempool_block(block, msg.sender, responses);
+
+                        self.event_sink.log(
+                            self.time,
+                            self.peer_id,
+                            Event::IdentityBlockReceived {
+                                peer_id: block.parts[0].token,
+                                sender: msg.sender,
+                            },
+                        );
                     } else {
                         log::warn!("Invalid identity-block received from peer {}", msg.sender);
                     }
@@ -818,7 +815,7 @@ impl<
                     // Ticket is valid - route based on use case
                     match use_case {
                         BlockUseCase::MempoolBlock | BlockUseCase::ParentBlock => {
-                            self.accept_mempool_block(block, Some(msg.sender), responses);
+                            self.reactive_accept_mempool_block(block, msg.sender, responses);
                         }
                         BlockUseCase::CommitChain => {
                             // Commit chain block - delegate to backend
@@ -1221,98 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn early_vote_without_reply_interest_does_not_get_terminal_reply_on_block_arrival() {
-        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
-        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
-
-        let rng = rand::rngs::StdRng::from_seed([21u8; 32]);
-        let mut config = PeerManagerConfig::default();
-        config.elections_per_tick = 0;
-        config.enable_request_batching = false;
-        let mut node =
-            EcNode::new_with_peer_config(backend.clone(), 1, 0, MemTokens::new(), config, rng);
-        for peer_id in [2, 3, 4, 5, 6] {
-            node.seed_peer(&peer_id);
-        }
-
-        let block = crate::ec_interface::Block {
-            id: 191,
-            time: 1,
-            used: 1,
-            parts: [
-                TokenBlock {
-                    token: 11,
-                    last: 100,
-                    key: 0,
-                },
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-            ],
-            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
-        };
-
-        let early_vote = MessageEnvelope {
-            sender: 2,
-            receiver: 1,
-            ticket: 0,
-            time: 1,
-            message: Message::Vote {
-                block_id: block.id,
-                vote: 0,
-                reply: false,
-            },
-        };
-
-        let mut responses = Vec::new();
-        node.handle_message(&early_vote, &mut responses);
-
-        assert!(
-            responses.is_empty(),
-            "non-interested early votes should also defer block fetches until the next tick"
-        );
-
-        node.tick(&mut responses);
-
-        let block_ticket = match &responses[0].message {
-            Message::QueryBlock {
-                block_id, ticket, ..
-            } => {
-                assert_eq!(*block_id, block.id);
-                *ticket
-            }
-            other => panic!(
-                "expected block request after early vote, got {:?}",
-                std::mem::discriminant(other)
-            ),
-        };
-
-        let block_arrival = MessageEnvelope {
-            sender: 2,
-            receiver: 1,
-            ticket: block_ticket,
-            time: 2,
-            message: Message::Block { block },
-        };
-
-        let mut responses = Vec::new();
-        node.handle_message(&block_arrival, &mut responses);
-        assert!(
-            !responses.iter().any(|envelope| matches!(
-                envelope.message,
-                Message::Vote {
-                    block_id,
-                    reply: false,
-                    ..
-                } if block_id == block.id
-            )),
-            "non-interested early voters should still avoid terminal replies before Commit or Blocked"
-        );
-    }
-
-    #[test]
     fn untrusted_plain_vote_without_client_ticket_is_ignored() {
         let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
         let rng = rand::rngs::StdRng::from_seed([23u8; 32]);
@@ -1347,105 +1252,6 @@ mod tests {
             "plain untrusted votes without a client ticket should not trigger block fetches",
         );
         assert!(!node.knows_block(&333));
-    }
-
-    #[test]
-    fn untrusted_plain_vote_with_client_ticket_requests_block_on_tick() {
-        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
-        let rng = rand::rngs::StdRng::from_seed([24u8; 32]);
-        let mut node = EcNode::new(backend, 1, 0, MemTokens::new(), rng);
-
-        let mut responses = Vec::new();
-        node.handle_message(
-            &MessageEnvelope {
-                sender: 2,
-                receiver: 1,
-                ticket: 99,
-                time: 1,
-                message: Message::Vote {
-                    block_id: 333,
-                    vote: 0,
-                    reply: true,
-                },
-            },
-            &mut responses,
-        );
-
-        assert!(responses.is_empty());
-        assert_eq!(node.vote_ingress_diagnostics().untrusted_votes_received, 1);
-
-        node.tick(&mut responses);
-
-        assert!(
-            responses.iter().any(|envelope| matches!(
-                envelope.message,
-                Message::QueryBlock { block_id, .. } if block_id == 333
-            )),
-            "ticketed client votes should request the missing block on tick",
-        );
-        assert!(node.knows_block(&333));
-        assert_eq!(node.mempool_diagnostics().pending_without_block, 1);
-    }
-
-    #[test]
-    fn untrusted_initial_vote_introduces_unknown_block() {
-        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
-        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
-
-        let rng = rand::rngs::StdRng::from_seed([25u8; 32]);
-        let mut config = PeerManagerConfig::default();
-        config.elections_per_tick = 0;
-        config.enable_request_batching = false;
-        let mut node =
-            EcNode::new_with_peer_config(backend.clone(), 1, 0, MemTokens::new(), config, rng);
-        for peer_id in [3, 4, 5, 6] {
-            node.seed_peer(&peer_id);
-        }
-
-        let block = crate::ec_interface::Block {
-            id: 193,
-            time: 1,
-            used: 1,
-            parts: [
-                TokenBlock {
-                    token: 11,
-                    last: 100,
-                    key: 0,
-                },
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-            ],
-            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
-        };
-
-        let mut responses = Vec::new();
-        node.handle_message(
-            &MessageEnvelope {
-                sender: 2,
-                receiver: 1,
-                ticket: 0,
-                time: 1,
-                message: Message::InitialVote { block, vote: 0 },
-            },
-            &mut responses,
-        );
-
-        assert!(node.knows_block(&block.id));
-        assert_eq!(node.vote_ingress_diagnostics().untrusted_votes_received, 1);
-        assert!(
-            !responses.iter().any(|envelope| matches!(
-                envelope.message,
-                Message::QueryBlock { block_id, .. } if block_id == block.id
-            )),
-            "untrusted InitialVote should introduce the block directly",
-        );
-        assert!(
-            responses.is_empty(),
-            "untrusted InitialVote should register the block locally without emitting follow-up votes",
-        );
     }
 
     #[test]
@@ -1659,77 +1465,5 @@ mod tests {
         assert_eq!(responses.len(), original.len());
         assert!(matches!(responses[0].message, Message::Vote { .. }));
         assert!(matches!(responses[1].message, Message::QueryBlock { .. }));
-    }
-
-    #[test]
-    fn tick_sends_commit_update_to_interested_voters() {
-        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(55)));
-        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &42, &7, &0, 0);
-
-        let mut config = PeerManagerConfig::default();
-        config.elections_per_tick = 0;
-        config.enable_request_batching = false;
-
-        let rng = rand::rngs::StdRng::from_seed([23u8; 32]);
-        let mut node =
-            EcNode::new_with_peer_config(backend.clone(), 55, 0, MemTokens::new(), config, rng);
-        for peer_id in [11, 12, 13] {
-            node.seed_peer(&peer_id);
-        }
-
-        let block = crate::ec_interface::Block {
-            id: 200,
-            time: 10,
-            used: 1,
-            parts: [
-                TokenBlock {
-                    token: 42,
-                    last: 7,
-                    key: 1,
-                },
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-            ],
-            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
-        };
-
-        node.block(&block);
-
-        for peer_id in [11, 12, 13] {
-            let inbound = MessageEnvelope {
-                sender: peer_id,
-                receiver: 55,
-                ticket: 0,
-                time: 10,
-                message: Message::Vote {
-                    block_id: block.id,
-                    vote: 0b0000_0001,
-                    reply: true,
-                },
-            };
-            let mut ignored = Vec::new();
-            node.handle_message(&inbound, &mut ignored);
-        }
-
-        let mut outbound = Vec::new();
-        node.tick(&mut outbound);
-
-        assert!(
-            outbound.iter().any(|envelope| {
-                envelope.receiver == 11
-                    && matches!(
-                        envelope.message,
-                        Message::Vote {
-                            block_id,
-                            vote: 0xFF,
-                            reply: false,
-                        } if block_id == block.id
-                    )
-            }),
-            "expected commit-state push to interested voter"
-        );
     }
 }
