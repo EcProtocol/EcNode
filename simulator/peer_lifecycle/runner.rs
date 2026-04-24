@@ -405,9 +405,6 @@ impl PeerLifecycleRunner {
                 connected_fraction,
             } => {
                 // Peers know subset of neighbors based on view_width
-                let mut total_known = 0;
-                let mut total_connected = 0;
-
                 for (peer_id, peer) in &mut self.peers {
                     // Get nearby peers within view_width
                     let nearby_peers = global_mapping.get_nearby_peers(*peer_id, view_width);
@@ -420,9 +417,6 @@ impl PeerLifecycleRunner {
 
                     // Of the known peers, make connected_fraction Connected
                     let num_connected = (known_peers.len() as f64 * connected_fraction) as usize;
-
-                    total_known += known_peers.len();
-                    total_connected += num_connected;
 
                     for (idx, &other_id) in known_peers.iter().enumerate() {
                         if idx < num_connected {
@@ -1347,6 +1341,7 @@ impl PeerLifecycleRunner {
         println!("    Started: {}", total_elections_started);
         println!("    Completed: {}", total_elections_completed);
         println!("    Timed Out: {}", total_elections_timeout);
+        println!("    Split-brain detected: {}", total_elections_splitbrain);
         if total_elections_started > 0 {
             let success_rate =
                 (total_elections_completed as f64 / total_elections_started as f64) * 100.0;

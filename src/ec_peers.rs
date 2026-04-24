@@ -71,6 +71,9 @@ pub struct PeerManagerConfig {
     /// envelopes before they leave the local outbox.
     pub enable_request_batching: bool,
 
+    /// Whether periodic commit-chain synchronization should run in node ticks.
+    pub enable_commit_chain_sync: bool,
+
     /// Whether direct vote replies (`reply = false`) may also be packed into
     /// request batches. This extends Phase 1 batching to the fast-reply path.
     pub batch_vote_replies: bool,
@@ -137,6 +140,7 @@ impl Default for PeerManagerConfig {
             first_vote_target_count: 4,
             adaptive_neighborhood: None,
             enable_request_batching: true,
+            enable_commit_chain_sync: true,
             batch_vote_replies: false,
             vote_balance_threshold: VOTE_THRESHOLD,
             vote_request_resend_cooldown: 0,
@@ -907,6 +911,10 @@ impl EcPeers {
     /// Get the configured vote targets for a token.
     pub(crate) fn vote_target_peers_for(&self, key: &TokenId, time: EcTime) -> Vec<PeerId> {
         self.collect_vote_targets(key, time, self.config.vote_target_count)
+    }
+
+    pub(crate) fn first_vote_target_count(&self) -> usize {
+        self.config.first_vote_target_count.max(1)
     }
 
     /// Get one deterministic pair of vote targets for a token, one on each side

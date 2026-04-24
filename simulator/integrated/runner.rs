@@ -16,10 +16,11 @@ use ec_rust::ec_node::{EcNode, VoteIngressDiagnostics};
 use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 
 use crate::integrated::{
-    ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary, IntegratedSimConfig,
-    MempoolPressureSummary, MessageTypeBreakdown, NeighborhoodBucketSummary, NeighborhoodSummary,
-    OnboardingSummary, RecoverySummary, RoundMetrics, SimResult, TransactionSourcePolicy,
-    TransactionSpreadSummary, TransactionWorkloadSummary, VoteIngressSummary,
+    ConflictLineageSummary, ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary,
+    IntegratedSimConfig, MempoolPressureSummary, MessageTypeBreakdown, NeighborhoodBucketSummary,
+    NeighborhoodSummary, OnboardingSummary, RecoverySummary, RoundMetrics, SimResult,
+    TransactionCategorySummary, TransactionSourcePolicy, TransactionSpreadSummary,
+    TransactionWorkloadSummary, VoteIngressSummary,
 };
 use crate::peer_lifecycle::stats::calculate_gradient_steepness;
 use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
@@ -45,6 +46,7 @@ struct SimPeer {
 
 struct TrackedBlock {
     owner: PeerId,
+    lineage: BlockLineage,
     submitted_round: usize,
     max_entry_hops: usize,
     max_role_route_hops: usize,
@@ -57,7 +59,9 @@ struct TrackedBlock {
 struct ConflictFamily {
     token: TokenId,
     parent_block: BlockId,
+    lineage: ConflictFamilyLineage,
     candidate_block_ids: Vec<BlockId>,
+    candidate_owners: BTreeMap<BlockId, PeerId>,
     highest_candidate: BlockId,
     created_round: usize,
     owner_committed_candidates: HashSet<BlockId>,
@@ -118,6 +122,93 @@ struct TransactionSpreadAccumulator {
     total_actual_block_messages: usize,
     total_ideal_role_sum_lower_bound_messages: usize,
     total_ideal_coalesced_lower_bound_messages: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BlockLineage {
+    FreshNonConflicted,
+    ExtendsCommittedCleanChain,
+    ExtendsCommittedConflictWinner,
+    ConflictCandidateCleanParent,
+    ConflictCandidateConflictWinner,
+}
+
+impl BlockLineage {
+    fn all() -> [Self; 5] {
+        [
+            Self::FreshNonConflicted,
+            Self::ExtendsCommittedCleanChain,
+            Self::ExtendsCommittedConflictWinner,
+            Self::ConflictCandidateCleanParent,
+            Self::ConflictCandidateConflictWinner,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FreshNonConflicted => "fresh non-conflicted",
+            Self::ExtendsCommittedCleanChain => "extends committed clean chain",
+            Self::ExtendsCommittedConflictWinner => "extends committed conflict winner",
+            Self::ConflictCandidateCleanParent => "conflict candidate on clean parent",
+            Self::ConflictCandidateConflictWinner => "conflict candidate on conflict winner",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ConflictFamilyLineage {
+    CleanParent,
+    ConflictWinnerParent,
+}
+
+impl ConflictFamilyLineage {
+    fn all() -> [Self; 2] {
+        [Self::CleanParent, Self::ConflictWinnerParent]
+    }
+
+    fn from_parent_from_conflict(parent_from_conflict: bool) -> Self {
+        if parent_from_conflict {
+            Self::ConflictWinnerParent
+        } else {
+            Self::CleanParent
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CleanParent => "clean-parent conflicts",
+            Self::ConflictWinnerParent => "post-conflict conflicts",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct TransactionCategoryAccumulator {
+    submitted: usize,
+    committed: usize,
+    commit_latencies: Vec<usize>,
+    settled_peer_spread: Vec<usize>,
+    settled_block_messages: Vec<usize>,
+}
+
+#[derive(Default)]
+struct ConflictLineageAccumulator {
+    families: usize,
+    candidate_blocks_submitted: usize,
+    owner_committed_candidates: usize,
+    families_without_visible_candidate: usize,
+    families_with_single_visible_candidate: usize,
+    families_split_across_candidates: usize,
+    families_with_highest_majority: usize,
+    families_with_lower_majority: usize,
+    families_stalled_without_majority: usize,
+    families_with_lower_owner_commit: usize,
+    families_with_multiple_owner_commits: usize,
+    visible_candidates_per_family: Vec<usize>,
+    covering_peers_per_family: Vec<usize>,
+    participant_peers_per_family: Vec<usize>,
+    highest_candidate_coverer_share: Vec<f64>,
+    signal_coverage_among_participants: Vec<f64>,
 }
 
 const LOCAL_ENTRY_MAX_HOPS: usize = 4;
@@ -187,6 +278,8 @@ pub struct IntegratedRunner {
     cumulative_trusted_votes_recorded: usize,
     cumulative_untrusted_votes_received: usize,
     cumulative_vote_block_requests: usize,
+    cumulative_parent_validation_requests: usize,
+    cumulative_missing_parent_requests: usize,
     commit_latencies: Vec<usize>,
     network_transit_samples: Vec<usize>,
     neighborhood_coverage_samples: Vec<usize>,
@@ -195,6 +288,7 @@ pub struct IntegratedRunner {
     local_entry_token_samples: usize,
     neighborhood_buckets: [NeighborhoodBucketAccumulator; 4],
     transaction_spread: TransactionSpreadAccumulator,
+    transaction_categories: BTreeMap<BlockLineage, TransactionCategoryAccumulator>,
     round_commits: Vec<usize>,
     round_metrics: Vec<RoundMetrics>,
     recovery_watches: Vec<RecoveryWatch>,
@@ -265,6 +359,8 @@ impl IntegratedRunner {
             cumulative_trusted_votes_recorded: 0,
             cumulative_untrusted_votes_received: 0,
             cumulative_vote_block_requests: 0,
+            cumulative_parent_validation_requests: 0,
+            cumulative_missing_parent_requests: 0,
             commit_latencies: Vec::new(),
             network_transit_samples: Vec::new(),
             neighborhood_coverage_samples: Vec::new(),
@@ -273,6 +369,7 @@ impl IntegratedRunner {
             local_entry_token_samples: 0,
             neighborhood_buckets: std::array::from_fn(|_| NeighborhoodBucketAccumulator::default()),
             transaction_spread: TransactionSpreadAccumulator::default(),
+            transaction_categories: BTreeMap::new(),
             round_commits: Vec::new(),
             round_metrics: Vec::new(),
             recovery_watches: Vec::new(),
@@ -856,6 +953,18 @@ impl IntegratedRunner {
                     }
                 }
                 let latency = self.current_round.saturating_sub(tracked.submitted_round);
+                let category = self
+                    .transaction_categories
+                    .entry(tracked.lineage)
+                    .or_default();
+                category.committed += 1;
+                category.commit_latencies.push(latency);
+                category
+                    .settled_peer_spread
+                    .push(tracked.touched_peers.len());
+                category
+                    .settled_block_messages
+                    .push(tracked.delivered_block_messages);
                 self.commit_latencies.push(latency);
                 let bucket = Self::entry_hop_bucket(tracked.max_entry_hops);
                 self.neighborhood_buckets[bucket]
@@ -1202,12 +1311,12 @@ impl IntegratedRunner {
             let target = *eligible_peers
                 .choose(&mut self.rng)
                 .expect("eligible peers should not be empty");
-            let block = self.build_regular_block(target);
-            self.submit_block(target, block);
+            let (block, lineage) = self.build_regular_block(target);
+            self.submit_block(target, block, lineage);
         }
     }
 
-    fn build_regular_block(&mut self, target: PeerId) -> Block {
+    fn build_regular_block(&mut self, target: PeerId) -> (Block, BlockLineage) {
         let used = self.rng.gen_range(
             self.config.transactions.block_size_range.0
                 ..=self.config.transactions.block_size_range.1,
@@ -1221,6 +1330,7 @@ impl IntegratedRunner {
         };
         let mut seen_tokens = HashSet::new();
         let mut existing_parts_in_block = 0;
+        let mut extends_conflict_winner = false;
 
         for idx in 0..block.used as usize {
             let prefer_existing = self.rng.gen_bool(
@@ -1247,6 +1357,7 @@ impl IntegratedRunner {
                 block.parts[idx].token = token_id;
                 block.parts[idx].last = last_block;
                 existing_parts_in_block += 1;
+                extends_conflict_winner |= self.conflict_block_to_family.contains_key(&last_block);
                 self.existing_token_parts_generated += 1;
             } else {
                 let token_id = loop {
@@ -1266,7 +1377,15 @@ impl IntegratedRunner {
             self.blocks_with_existing_tokens += 1;
         }
 
-        block
+        let lineage = if existing_parts_in_block == 0 {
+            BlockLineage::FreshNonConflicted
+        } else if extends_conflict_winner {
+            BlockLineage::ExtendsCommittedConflictWinner
+        } else {
+            BlockLineage::ExtendsCommittedCleanChain
+        };
+
+        (block, lineage)
     }
 
     fn inject_conflict_family(&mut self, eligible_peers: &[PeerId]) -> bool {
@@ -1310,8 +1429,16 @@ impl IntegratedRunner {
         let Some((token_id, parent_block)) = existing_mapping else {
             return false;
         };
+        let parent_from_conflict = self.conflict_block_to_family.contains_key(&parent_block);
+        let family_lineage = ConflictFamilyLineage::from_parent_from_conflict(parent_from_conflict);
+        let block_lineage = if parent_from_conflict {
+            BlockLineage::ConflictCandidateConflictWinner
+        } else {
+            BlockLineage::ConflictCandidateCleanParent
+        };
 
         let mut candidate_block_ids = Vec::with_capacity(targets.len());
+        let mut candidate_owners = BTreeMap::new();
         for target in targets {
             let mut block = Block {
                 id: self.rng.next_u64(),
@@ -1330,7 +1457,8 @@ impl IntegratedRunner {
             self.existing_token_parts_generated += 1;
             self.blocks_with_existing_tokens += 1;
             candidate_block_ids.push(block.id);
-            self.submit_block(target, block);
+            candidate_owners.insert(block.id, target);
+            self.submit_block(target, block, block_lineage);
         }
 
         let highest_candidate = *candidate_block_ids
@@ -1341,7 +1469,9 @@ impl IntegratedRunner {
         self.conflict_families.push(ConflictFamily {
             token: token_id,
             parent_block,
+            lineage: family_lineage,
             candidate_block_ids: candidate_block_ids.clone(),
+            candidate_owners,
             highest_candidate,
             created_round: self.current_round,
             owner_committed_candidates: HashSet::new(),
@@ -1354,7 +1484,7 @@ impl IntegratedRunner {
         true
     }
 
-    fn submit_block(&mut self, target: PeerId, block: Block) {
+    fn submit_block(&mut self, target: PeerId, block: Block, lineage: BlockLineage) {
         let graph_time = self.current_round as u64 + 1;
         let Some(origin_peer) = self.peers.get(&target) else {
             return;
@@ -1441,6 +1571,7 @@ impl IntegratedRunner {
                 block.id,
                 TrackedBlock {
                     owner: target,
+                    lineage,
                     submitted_round: self.current_round,
                     max_entry_hops,
                     max_role_route_hops,
@@ -1450,6 +1581,10 @@ impl IntegratedRunner {
                     touched_peers,
                 },
             );
+            self.transaction_categories
+                .entry(lineage)
+                .or_default()
+                .submitted += 1;
             self.submitted_blocks += 1;
         }
         self.outbound_messages.extend(local_outbound);
@@ -1606,6 +1741,12 @@ impl IntegratedRunner {
             self.cumulative_vote_block_requests += current
                 .block_requests_triggered
                 .saturating_sub(previous.block_requests_triggered);
+            self.cumulative_parent_validation_requests += current
+                .parent_validation_requests_triggered
+                .saturating_sub(previous.parent_validation_requests_triggered);
+            self.cumulative_missing_parent_requests += current
+                .missing_parent_requests_triggered
+                .saturating_sub(previous.missing_parent_requests_triggered);
 
             *previous = current;
         }
@@ -2026,6 +2167,8 @@ impl IntegratedRunner {
             trusted_votes_recorded: self.cumulative_trusted_votes_recorded,
             untrusted_votes_received: self.cumulative_untrusted_votes_received,
             block_requests_triggered_by_votes: self.cumulative_vote_block_requests,
+            parent_validation_requests_triggered: self.cumulative_parent_validation_requests,
+            missing_parent_requests_triggered: self.cumulative_missing_parent_requests,
         }
     }
 
@@ -2328,11 +2471,16 @@ impl IntegratedRunner {
         let mut families_split_across_candidates = 0;
         let mut families_unanimous_highest_candidate = 0;
         let mut families_with_highest_majority = 0;
+        let mut families_with_lower_majority = 0;
         let mut families_with_any_majority = 0;
         let mut families_stalled_without_majority = 0;
         let mut families_with_any_lower_candidate_visible = 0;
         let mut families_with_lower_owner_commit = 0;
         let mut families_with_multiple_owner_commits = 0;
+        let mut lower_majority_no_owner_commit = 0;
+        let mut lower_majority_highest_owner_commit = 0;
+        let mut lower_majority_lower_owner_commit = 0;
+        let mut lower_majority_multiple_owner_commits = 0;
         let mut owner_committed_candidates = 0;
         let mut visible_candidates_per_family = Vec::new();
         let mut covering_peers_per_family = Vec::new();
@@ -2341,30 +2489,39 @@ impl IntegratedRunner {
         let mut candidate_coverers_per_family = Vec::new();
         let mut highest_candidate_coverer_share = Vec::new();
         let mut signal_coverage_among_participants = Vec::new();
+        let mut conflict_lineages: BTreeMap<ConflictFamilyLineage, ConflictLineageAccumulator> =
+            BTreeMap::new();
 
         for family in &self.conflict_families {
             let covering_peers = self.collect_covering_peers(family.token);
             let mut candidate_counts: BTreeMap<BlockId, usize> = BTreeMap::new();
+            let mut candidate_coverers = 0usize;
 
             for peer_id in &covering_peers {
                 let Some(peer) = self.peers.get(peer_id) else {
                     continue;
                 };
-                let backend = peer.backend.borrow();
-                let Some(mapping) = TokenStorageBackend::lookup(&*backend, &family.token) else {
-                    continue;
-                };
-                if family.candidate_block_ids.contains(&mapping.block()) {
-                    *candidate_counts.entry(mapping.block()).or_insert(0) += 1;
+                let mut committed_any_candidate = false;
+                for block_id in &family.candidate_block_ids {
+                    if peer.node.committed_block(block_id).is_some() {
+                        *candidate_counts.entry(*block_id).or_insert(0) += 1;
+                        committed_any_candidate = true;
+                    }
+                }
+                if committed_any_candidate {
+                    candidate_coverers += 1;
                 }
             }
 
             let visible_candidates = candidate_counts.len();
-            let candidate_coverers = candidate_counts.values().sum::<usize>();
             let highest_coverers = *candidate_counts
                 .get(&family.highest_candidate)
                 .unwrap_or(&0);
             let majority_coverers = candidate_counts.values().copied().max().unwrap_or(0);
+            let dominant_candidate = candidate_counts
+                .iter()
+                .max_by_key(|(block_id, count)| (*count, *block_id))
+                .map(|(block_id, _)| *block_id);
             let participant_peers = self
                 .peers
                 .values()
@@ -2396,18 +2553,69 @@ impl IntegratedRunner {
                     .push(signaled_participants as f64 / participant_peers.len() as f64);
             }
 
+            let lineage = conflict_lineages.entry(family.lineage).or_default();
+            lineage.families += 1;
+            lineage.candidate_blocks_submitted += family.candidate_block_ids.len();
+            lineage.owner_committed_candidates += family.owner_committed_candidates.len();
+            lineage
+                .visible_candidates_per_family
+                .push(visible_candidates);
+            lineage.covering_peers_per_family.push(covering_peers.len());
+            lineage
+                .participant_peers_per_family
+                .push(participant_peers.len());
+            if !covering_peers.is_empty() {
+                lineage
+                    .highest_candidate_coverer_share
+                    .push(highest_coverers as f64 / covering_peers.len() as f64);
+            }
+            if !participant_peers.is_empty() {
+                lineage
+                    .signal_coverage_among_participants
+                    .push(signaled_participants as f64 / participant_peers.len() as f64);
+            }
+
             match visible_candidates {
-                0 => families_without_visible_candidate += 1,
-                1 => families_with_single_visible_candidate += 1,
-                _ => families_split_across_candidates += 1,
+                0 => {
+                    families_without_visible_candidate += 1;
+                    lineage.families_without_visible_candidate += 1;
+                }
+                1 => {
+                    families_with_single_visible_candidate += 1;
+                    lineage.families_with_single_visible_candidate += 1;
+                }
+                _ => {
+                    families_split_across_candidates += 1;
+                    lineage.families_split_across_candidates += 1;
+                }
             }
             if majority_coverers * 2 > covering_peers.len() {
                 families_with_any_majority += 1;
                 if highest_coverers * 2 > covering_peers.len() {
                     families_with_highest_majority += 1;
+                    lineage.families_with_highest_majority += 1;
+                } else if dominant_candidate
+                    .is_some_and(|candidate| candidate != family.highest_candidate)
+                {
+                    families_with_lower_majority += 1;
+                    lineage.families_with_lower_majority += 1;
+                    let has_highest_owner_commit = family
+                        .owner_committed_candidates
+                        .contains(&family.highest_candidate);
+                    let has_lower_owner_commit = family
+                        .owner_committed_candidates
+                        .iter()
+                        .any(|block_id| *block_id != family.highest_candidate);
+                    match (has_highest_owner_commit, has_lower_owner_commit) {
+                        (false, false) => lower_majority_no_owner_commit += 1,
+                        (true, false) => lower_majority_highest_owner_commit += 1,
+                        (false, true) => lower_majority_lower_owner_commit += 1,
+                        (true, true) => lower_majority_multiple_owner_commits += 1,
+                    }
                 }
             } else {
                 families_stalled_without_majority += 1;
+                lineage.families_stalled_without_majority += 1;
             }
             if visible_candidates > 0
                 && candidate_counts
@@ -2427,11 +2635,86 @@ impl IntegratedRunner {
                 .any(|block_id| *block_id != family.highest_candidate)
             {
                 families_with_lower_owner_commit += 1;
+                lineage.families_with_lower_owner_commit += 1;
             }
             if family.owner_committed_candidates.len() > 1 {
                 families_with_multiple_owner_commits += 1;
+                lineage.families_with_multiple_owner_commits += 1;
             }
         }
+
+        let mut pending_by_lineage = BTreeMap::new();
+        for tracked in self.tracked_blocks.values() {
+            *pending_by_lineage.entry(tracked.lineage).or_insert(0usize) += 1;
+        }
+
+        let transaction_categories = BlockLineage::all()
+            .into_iter()
+            .filter_map(|lineage| {
+                let accumulator = self.transaction_categories.get(&lineage);
+                let pending = pending_by_lineage.get(&lineage).copied().unwrap_or(0);
+                if accumulator.is_none() && pending == 0 {
+                    return None;
+                }
+
+                let accumulator = accumulator.cloned().unwrap_or_default();
+                Some(TransactionCategorySummary {
+                    label: lineage.label().to_string(),
+                    submitted: accumulator.submitted,
+                    committed: accumulator.committed,
+                    pending,
+                    commit_latency: DistributionSummary::from_samples(
+                        &accumulator.commit_latencies,
+                    ),
+                    settled_peer_spread: DistributionSummary::from_samples(
+                        &accumulator.settled_peer_spread,
+                    ),
+                    settled_block_messages: DistributionSummary::from_samples(
+                        &accumulator.settled_block_messages,
+                    ),
+                })
+            })
+            .collect();
+
+        let conflict_lineages = ConflictFamilyLineage::all()
+            .into_iter()
+            .filter_map(|lineage_kind| {
+                let accumulator = conflict_lineages.get(&lineage_kind)?;
+                Some(ConflictLineageSummary {
+                    label: lineage_kind.label().to_string(),
+                    families: accumulator.families,
+                    candidate_blocks_submitted: accumulator.candidate_blocks_submitted,
+                    owner_committed_candidates: accumulator.owner_committed_candidates,
+                    families_without_visible_candidate: accumulator
+                        .families_without_visible_candidate,
+                    families_with_single_visible_candidate: accumulator
+                        .families_with_single_visible_candidate,
+                    families_split_across_candidates: accumulator.families_split_across_candidates,
+                    families_with_highest_majority: accumulator.families_with_highest_majority,
+                    families_with_lower_majority: accumulator.families_with_lower_majority,
+                    families_stalled_without_majority: accumulator
+                        .families_stalled_without_majority,
+                    families_with_lower_owner_commit: accumulator.families_with_lower_owner_commit,
+                    families_with_multiple_owner_commits: accumulator
+                        .families_with_multiple_owner_commits,
+                    visible_candidates_per_family: DistributionSummary::from_samples(
+                        &accumulator.visible_candidates_per_family,
+                    ),
+                    covering_peers_per_family: DistributionSummary::from_samples(
+                        &accumulator.covering_peers_per_family,
+                    ),
+                    participant_peers_per_family: DistributionSummary::from_samples(
+                        &accumulator.participant_peers_per_family,
+                    ),
+                    highest_candidate_coverer_share: FloatDistributionSummary::from_samples(
+                        &accumulator.highest_candidate_coverer_share,
+                    ),
+                    signal_coverage_among_participants: FloatDistributionSummary::from_samples(
+                        &accumulator.signal_coverage_among_participants,
+                    ),
+                })
+            })
+            .collect();
 
         SimResult {
             seed_used: self.seed_used,
@@ -2512,6 +2795,8 @@ impl IntegratedRunner {
                 trusted_votes_recorded: self.cumulative_trusted_votes_recorded,
                 untrusted_votes_received: self.cumulative_untrusted_votes_received,
                 block_requests_triggered_by_votes: self.cumulative_vote_block_requests,
+                parent_validation_requests_triggered: self.cumulative_parent_validation_requests,
+                missing_parent_requests_triggered: self.cumulative_missing_parent_requests,
             },
             neighborhoods: NeighborhoodSummary {
                 token_samples: self.neighborhood_entry_hop_samples.len(),
@@ -2534,6 +2819,7 @@ impl IntegratedRunner {
                 new_token_parts: self.new_token_parts_generated,
                 blocks_with_existing_tokens: self.blocks_with_existing_tokens,
             },
+            transaction_categories,
             conflict_workload: ConflictWorkloadSummary {
                 configured_family_fraction: self.config.transactions.conflicts.family_fraction,
                 configured_contenders: self.config.transactions.conflicts.contenders,
@@ -2545,6 +2831,7 @@ impl IntegratedRunner {
                     .sum(),
                 owner_committed_candidates,
                 families_with_highest_majority,
+                families_with_lower_majority,
                 families_with_any_majority,
                 families_stalled_without_majority,
                 families_without_visible_candidate,
@@ -2554,6 +2841,10 @@ impl IntegratedRunner {
                 families_with_any_lower_candidate_visible,
                 families_with_lower_owner_commit,
                 families_with_multiple_owner_commits,
+                lower_majority_no_owner_commit,
+                lower_majority_highest_owner_commit,
+                lower_majority_lower_owner_commit,
+                lower_majority_multiple_owner_commits,
                 visible_candidates_per_family: DistributionSummary::from_samples(
                     &visible_candidates_per_family,
                 ),
@@ -2576,6 +2867,7 @@ impl IntegratedRunner {
                     &signal_coverage_among_participants,
                 ),
             },
+            conflict_lineages,
             transaction_spread: TransactionSpreadSummary {
                 submitted_blocks: self.transaction_spread.reachable_vote_peers.len(),
                 committed_blocks: self.transaction_spread.settled_block_messages.len(),

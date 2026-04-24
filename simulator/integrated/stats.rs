@@ -157,6 +157,8 @@ pub struct VoteIngressSummary {
     pub trusted_votes_recorded: usize,
     pub untrusted_votes_received: usize,
     pub block_requests_triggered_by_votes: usize,
+    pub parent_validation_requests_triggered: usize,
+    pub missing_parent_requests_triggered: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +199,8 @@ pub struct RoundMetrics {
     pub trusted_votes_recorded: usize,
     pub untrusted_votes_received: usize,
     pub block_requests_triggered_by_votes: usize,
+    pub parent_validation_requests_triggered: usize,
+    pub missing_parent_requests_triggered: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +289,38 @@ impl TransactionWorkloadSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct TransactionCategorySummary {
+    pub label: String,
+    pub submitted: usize,
+    pub committed: usize,
+    pub pending: usize,
+    pub commit_latency: Option<DistributionSummary>,
+    pub settled_peer_spread: Option<DistributionSummary>,
+    pub settled_block_messages: Option<DistributionSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictLineageSummary {
+    pub label: String,
+    pub families: usize,
+    pub candidate_blocks_submitted: usize,
+    pub owner_committed_candidates: usize,
+    pub families_without_visible_candidate: usize,
+    pub families_with_single_visible_candidate: usize,
+    pub families_split_across_candidates: usize,
+    pub families_with_highest_majority: usize,
+    pub families_with_lower_majority: usize,
+    pub families_stalled_without_majority: usize,
+    pub families_with_lower_owner_commit: usize,
+    pub families_with_multiple_owner_commits: usize,
+    pub visible_candidates_per_family: Option<DistributionSummary>,
+    pub covering_peers_per_family: Option<DistributionSummary>,
+    pub participant_peers_per_family: Option<DistributionSummary>,
+    pub highest_candidate_coverer_share: Option<FloatDistributionSummary>,
+    pub signal_coverage_among_participants: Option<FloatDistributionSummary>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ConflictWorkloadSummary {
     pub configured_family_fraction: f64,
     pub configured_contenders: usize,
@@ -292,6 +328,7 @@ pub struct ConflictWorkloadSummary {
     pub candidate_blocks_submitted: usize,
     pub owner_committed_candidates: usize,
     pub families_with_highest_majority: usize,
+    pub families_with_lower_majority: usize,
     pub families_with_any_majority: usize,
     pub families_stalled_without_majority: usize,
     pub families_without_visible_candidate: usize,
@@ -301,6 +338,10 @@ pub struct ConflictWorkloadSummary {
     pub families_with_any_lower_candidate_visible: usize,
     pub families_with_lower_owner_commit: usize,
     pub families_with_multiple_owner_commits: usize,
+    pub lower_majority_no_owner_commit: usize,
+    pub lower_majority_highest_owner_commit: usize,
+    pub lower_majority_lower_owner_commit: usize,
+    pub lower_majority_multiple_owner_commits: usize,
     pub visible_candidates_per_family: Option<DistributionSummary>,
     pub covering_peers_per_family: Option<DistributionSummary>,
     pub participant_peers_per_family: Option<DistributionSummary>,
@@ -363,7 +404,9 @@ pub struct SimResult {
     pub vote_ingress: VoteIngressSummary,
     pub neighborhoods: NeighborhoodSummary,
     pub transaction_workload: TransactionWorkloadSummary,
+    pub transaction_categories: Vec<TransactionCategorySummary>,
     pub conflict_workload: ConflictWorkloadSummary,
+    pub conflict_lineages: Vec<ConflictLineageSummary>,
     pub transaction_spread: TransactionSpreadSummary,
     pub late_joiner_onboarding: OnboardingSummary,
     pub rejoin_onboarding: OnboardingSummary,
@@ -413,21 +456,29 @@ impl SimResult {
         );
         if self.conflict_workload.families_created > 0 {
             println!(
-                "Conflict outcomes: {} no-visible, {} single-visible, {} split, {} unanimous-highest, {} highest-majority, {} any-majority, {} stalled-no-majority, {} any-lower-visible, {} lower-owner-commits, {} multi-owner-commits",
+                "Conflict committed-candidate outcomes: {} no-committed, {} single-committed, {} split-committed, {} unanimous-highest, {} highest-majority, {} lower-majority, {} any-majority, {} stalled-no-majority, {} any-lower-committed, {} lower-owner-commits, {} multi-owner-commits",
                 self.conflict_workload.families_without_visible_candidate,
                 self.conflict_workload.families_with_single_visible_candidate,
                 self.conflict_workload.families_split_across_candidates,
                 self.conflict_workload.families_unanimous_highest_candidate,
                 self.conflict_workload.families_with_highest_majority,
+                self.conflict_workload.families_with_lower_majority,
                 self.conflict_workload.families_with_any_majority,
                 self.conflict_workload.families_stalled_without_majority,
                 self.conflict_workload.families_with_any_lower_candidate_visible,
                 self.conflict_workload.families_with_lower_owner_commit,
                 self.conflict_workload.families_with_multiple_owner_commits,
             );
+            println!(
+                "Lower-majority owner outcomes: {} no-owner-commit, {} highest-owner-only, {} lower-owner-present, {} multi-owner",
+                self.conflict_workload.lower_majority_no_owner_commit,
+                self.conflict_workload.lower_majority_highest_owner_commit,
+                self.conflict_workload.lower_majority_lower_owner_commit,
+                self.conflict_workload.lower_majority_multiple_owner_commits,
+            );
             if let Some(summary) = &self.conflict_workload.visible_candidates_per_family {
                 println!(
-                    "Conflict visible candidates/family: avg {:.2}, p50 {}, p95 {}, min {}, max {}",
+                    "Conflict committed candidates among coverers/family: avg {:.2}, p50 {}, p95 {}, min {}, max {}",
                     summary.avg, summary.p50, summary.p95, summary.min, summary.max,
                 );
             }
@@ -451,7 +502,7 @@ impl SimResult {
             }
             if let Some(summary) = &self.conflict_workload.candidate_coverers_per_family {
                 println!(
-                    "Conflict coverers on candidate states/family: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
+                    "Conflict coverers with any candidate committed/family: avg {:.1}, p50 {}, p95 {}, min {}, max {}",
                     summary.avg, summary.p50, summary.p95, summary.min, summary.max,
                 );
             }
@@ -465,6 +516,86 @@ impl SimResult {
                 println!(
                     "Conflict signal coverage among participants: avg {:.2}, p50 {:.2}, p95 {:.2}, min {:.2}, max {:.2}",
                     summary.avg, summary.p50, summary.p95, summary.min, summary.max,
+                );
+            }
+        }
+        if !self.transaction_categories.is_empty() {
+            println!("Commit spread by transaction type:");
+            for category in &self.transaction_categories {
+                let latency = category
+                    .commit_latency
+                    .as_ref()
+                    .map(|summary| format!("avg {:.1}, p95 {}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let spread = category
+                    .settled_peer_spread
+                    .as_ref()
+                    .map(|summary| format!("avg {:.1}, p95 {}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let messages = category
+                    .settled_block_messages
+                    .as_ref()
+                    .map(|summary| format!("avg {:.1}, p95 {}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                println!(
+                    "  - {}: {} submitted, {} committed, {} pending, latency {}, settled spread {}, block messages {}",
+                    category.label,
+                    category.submitted,
+                    category.committed,
+                    category.pending,
+                    latency,
+                    spread,
+                    messages,
+                );
+            }
+        }
+        if !self.conflict_lineages.is_empty() {
+            println!("Conflict family lineage:");
+            for lineage in &self.conflict_lineages {
+                let visible = lineage
+                    .visible_candidates_per_family
+                    .as_ref()
+                    .map(|summary| format!("avg {:.2}, p95 {}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let coverers = lineage
+                    .covering_peers_per_family
+                    .as_ref()
+                    .map(|summary| format!("avg {:.1}, p95 {}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let participants = lineage
+                    .participant_peers_per_family
+                    .as_ref()
+                    .map(|summary| format!("avg {:.1}, p95 {}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let highest_share = lineage
+                    .highest_candidate_coverer_share
+                    .as_ref()
+                    .map(|summary| format!("avg {:.2}, p95 {:.2}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let signal_coverage = lineage
+                    .signal_coverage_among_participants
+                    .as_ref()
+                    .map(|summary| format!("avg {:.2}, p95 {:.2}", summary.avg, summary.p95))
+                    .unwrap_or_else(|| "n/a".to_string());
+                println!(
+                    "  - {}: {} families, {} candidate blocks, {} owner commits, {} no-committed, {} single-committed, {} split-committed, {} highest-majority, {} lower-majority, {} stalled, {} lower-owner, {} multi-owner, committed candidates {}, covering peers {}, participants {}, highest-cover share {}, signal coverage {}",
+                    lineage.label,
+                    lineage.families,
+                    lineage.candidate_blocks_submitted,
+                    lineage.owner_committed_candidates,
+                    lineage.families_without_visible_candidate,
+                    lineage.families_with_single_visible_candidate,
+                    lineage.families_split_across_candidates,
+                    lineage.families_with_highest_majority,
+                    lineage.families_with_lower_majority,
+                    lineage.families_stalled_without_majority,
+                    lineage.families_with_lower_owner_commit,
+                    lineage.families_with_multiple_owner_commits,
+                    visible,
+                    coverers,
+                    participants,
+                    highest_share,
+                    signal_coverage,
                 );
             }
         }
@@ -586,10 +717,12 @@ impl SimResult {
             self.delivered_wire_message_types.commit_block,
         );
         println!(
-            "Vote ingress: trusted recorded {}, untrusted received {}, block fetches from votes {}",
+            "Vote ingress: trusted recorded {}, untrusted received {}, block fetches from votes {}, parent-validation fetches {}, missing-parent fetches {}",
             self.vote_ingress.trusted_votes_recorded,
             self.vote_ingress.untrusted_votes_received,
             self.vote_ingress.block_requests_triggered_by_votes,
+            self.vote_ingress.parent_validation_requests_triggered,
+            self.vote_ingress.missing_parent_requests_triggered,
         );
         println!(
             "Neighborhoods: {} token samples, {:.1}% local-entry",

@@ -29,6 +29,7 @@ pub struct EcNode<
     rng: rand::rngs::StdRng,
     vote_diagnostics: VoteIngressDiagnostics,
     enable_request_batching: bool,
+    enable_commit_chain_sync: bool,
     batch_vote_replies: bool,
 }
 
@@ -37,6 +38,8 @@ pub struct VoteIngressDiagnostics {
     pub trusted_votes_recorded: usize,
     pub untrusted_votes_received: usize,
     pub block_requests_triggered: usize,
+    pub parent_validation_requests_triggered: usize,
+    pub missing_parent_requests_triggered: usize,
 }
 
 impl<
@@ -112,6 +115,7 @@ impl<
         rng: rand::rngs::StdRng,
     ) -> Self {
         let enable_request_batching = peer_config.enable_request_batching;
+        let enable_commit_chain_sync = peer_config.enable_commit_chain_sync;
         let batch_vote_replies = peer_config.batch_vote_replies;
         let vote_balance_threshold = peer_config.vote_balance_threshold;
         let vote_request_resend_cooldown = peer_config.vote_request_resend_cooldown;
@@ -134,6 +138,7 @@ impl<
             rng,
             vote_diagnostics: VoteIngressDiagnostics::default(),
             enable_request_batching,
+            enable_commit_chain_sync,
             batch_vote_replies,
         }
     }
@@ -189,9 +194,15 @@ impl<
     pub fn submit_local_block(
         &mut self,
         block: &Block,
-        _outbound_messages: &mut Vec<MessageEnvelope>,
+        outbound_messages: &mut Vec<MessageEnvelope>,
     ) {
-        let _ = self.mem_pool.block(block, self.time);
+        let reactive_requests = {
+            let backend = self.backend.borrow();
+            self.mem_pool
+                .reactive_add_block(block, &self.peers, &*backend, self.time)
+        };
+
+        self.emit_reactive_initial_vote_requests(&reactive_requests, outbound_messages);
     }
 
     pub fn committed_block(&self, block_id: &BlockId) -> Option<Block> {
@@ -347,7 +358,10 @@ impl<
                     }
                 }
                 MessageRequest::Block(block_id) => {
-                    let peer_id = self.peers.peer_for(&block_id, self.time);
+                    let peer_id = self
+                        .mem_pool
+                        .last_interested_voter(&block_id)
+                        .unwrap_or_else(|| self.peers.peer_for(&block_id, self.time));
                     self.vote_diagnostics.block_requests_triggered += 1;
                     responses.push(self.request_block(
                         &peer_id,
@@ -356,28 +370,10 @@ impl<
                     ));
                 }
                 MessageRequest::Parent(block_id, parent_id) => {
-                    // TODO a work around. Should be handled in mem_pool
-                    let backend = self.backend.borrow();
-                    if let Some(parent) = self.mem_pool.query(&parent_id, &*backend) {
-                        self.mem_pool.validate_with(&parent, &block_id);
-                    } else {
-                        let peer_id = self.peers.peer_for(&parent_id, self.time);
-
-                        responses.push(self.request_block(
-                            &peer_id,
-                            &block_id,
-                            BlockUseCase::ValidateWith,
-                        ))
-                    }
+                    self.emit_parent_validation_request(*block_id, *parent_id, responses);
                 }
                 MessageRequest::MissingParent(block_id) => {
-                    let peer_id = self.peers.peer_for(&block_id, self.time);
-
-                    responses.push(self.request_block(
-                        &peer_id,
-                        &block_id,
-                        BlockUseCase::ParentBlock,
-                    ))
+                    self.emit_missing_parent_request(*block_id, responses);
                 }
             }
         }
@@ -388,9 +384,11 @@ impl<
 
         // Phase 5: Commit chain sync
         // Periodically query nearby peers to keep our commit chain up to date
-        let sync_actions = {
+        let sync_actions = if self.enable_commit_chain_sync {
             let mut backend = self.backend.borrow_mut();
             backend.commit_chain_tick(&self.peers, &mut self.mem_pool, self.time)
+        } else {
+            Vec::new()
         };
 
         let head_of_chain = self.backend.borrow().get_commit_chain_head().unwrap_or(0);
@@ -517,7 +515,7 @@ impl<
             responses.push(MessageEnvelope {
                 sender: self.peer_id,
                 receiver: request.receiver,
-                ticket: 0,
+                ticket: 1,
                 time: self.time,
                 message: Message::InitialVote {
                     block: request.block,
@@ -525,6 +523,34 @@ impl<
                 },
             });
         }
+    }
+
+    fn emit_parent_validation_request(
+        &mut self,
+        block_id: BlockId,
+        parent_id: BlockId,
+        responses: &mut Vec<MessageEnvelope>,
+    ) {
+        let backend = self.backend.borrow();
+        if let Some(parent) = self.mem_pool.query(&parent_id, &*backend) {
+            drop(backend);
+            self.mem_pool.validate_with(&parent, &block_id);
+        } else {
+            drop(backend);
+            let peer_id = self.peers.peer_for(&parent_id, self.time);
+            self.vote_diagnostics.parent_validation_requests_triggered += 1;
+            responses.push(self.request_block(&peer_id, &block_id, BlockUseCase::ValidateWith));
+        }
+    }
+
+    fn emit_missing_parent_request(
+        &mut self,
+        parent_block_id: BlockId,
+        responses: &mut Vec<MessageEnvelope>,
+    ) {
+        let peer_id = self.peers.peer_for(&parent_block_id, self.time);
+        self.vote_diagnostics.missing_parent_requests_triggered += 1;
+        responses.push(self.request_block(&peer_id, &parent_block_id, BlockUseCase::ParentBlock));
     }
 
     fn reactive_accept_mempool_block(
@@ -610,12 +636,16 @@ impl<
                     }
                     (None, true) => {
                         self.vote_diagnostics.trusted_votes_recorded += 1;
-                        // TODO check load-balancing count for this peer
                         self.mem_pool
                             .vote(block, *vote, &msg.sender, msg.time, *reply);
                     }
                     (None, false) => {
                         self.vote_diagnostics.untrusted_votes_received += 1;
+
+                        if msg.ticket > 0 {
+                            self.mem_pool
+                                .vote(block, *vote, &msg.sender, msg.time, *reply);
+                        }
                     }
                     _ => {} // discard - do nothing
                 }
@@ -630,10 +660,10 @@ impl<
                     }
                 }
 
-                self.reactive_accept_mempool_block(block, msg.sender, responses);
-
                 self.mem_pool
-                    .vote(&block.id, 0, &msg.sender, msg.time, true);
+                    .vote(&block.id, *vote, &msg.sender, msg.time, true);
+
+                self.reactive_accept_mempool_block(block, msg.sender, responses);
             }
             Message::QueryBlock {
                 block_id,
@@ -1101,7 +1131,7 @@ mod tests {
 
     use rand::SeedableRng;
 
-    use crate::ec_interface::{Message, MessageEnvelope, TokenBlock};
+    use crate::ec_interface::{BatchRequestItem, Message, MessageEnvelope, TokenBlock};
     use crate::ec_memory_backend::{MemTokens, MemoryBackend};
     use crate::ec_peers::PeerManagerConfig;
     use crate::ec_proof_of_storage::TokenStorageBackend;
@@ -1317,6 +1347,113 @@ mod tests {
                 .iter()
                 .any(|envelope| matches!(envelope.message, Message::QueryBlock { block_id, .. } if block_id == block.id)),
             "once the block arrived through InitialVote, the pending missing-block fetch should be skipped",
+        );
+    }
+
+    #[test]
+    fn trusted_missing_block_fetch_prefers_last_interested_voter_on_tick() {
+        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
+        let rng = rand::rngs::StdRng::from_seed([29u8; 32]);
+        let mut node = EcNode::new(backend, 1, 0, MemTokens::new(), rng);
+        for peer_id in [2, 3, 4] {
+            node.seed_peer(&peer_id);
+        }
+
+        let mut responses = Vec::new();
+        for (sender, reply) in [(2, true), (3, false), (4, true)] {
+            node.handle_message(
+                &MessageEnvelope {
+                    sender,
+                    receiver: 1,
+                    ticket: 0,
+                    time: 1,
+                    message: Message::Vote {
+                        block_id: 333,
+                        vote: 0,
+                        reply,
+                    },
+                },
+                &mut responses,
+            );
+        }
+
+        assert!(responses.is_empty());
+
+        node.tick(&mut responses);
+
+        assert!(responses.iter().any(|envelope| {
+            if envelope.receiver != 4 {
+                return false;
+            }
+
+            match &envelope.message {
+                Message::QueryBlock { block_id, .. } => *block_id == 333,
+                Message::RequestBatch { items } => items.iter().any(|item| {
+                    matches!(item, BatchRequestItem::QueryBlock { block_id, .. } if *block_id == 333)
+                }),
+                _ => false,
+            }
+        }));
+        assert!(!responses.iter().any(|envelope| {
+            if envelope.receiver != 3 {
+                return false;
+            }
+
+            match &envelope.message {
+                Message::QueryBlock { block_id, .. } => *block_id == 333,
+                Message::RequestBatch { items } => items.iter().any(|item| {
+                    matches!(item, BatchRequestItem::QueryBlock { block_id, .. } if *block_id == 333)
+                }),
+                _ => false,
+            }
+        }));
+    }
+
+    #[test]
+    fn submit_local_block_emits_reactive_initial_votes() {
+        let backend = Rc::new(RefCell::new(MemoryBackend::new_with_peer_id(1)));
+        TokenStorageBackend::set(backend.borrow_mut().tokens_mut(), &11, &100, &0, 0);
+
+        let rng = rand::rngs::StdRng::from_seed([32u8; 32]);
+        let mut node = EcNode::new(backend, 1, 0, MemTokens::new(), rng);
+        for peer_id in [2, 3, 4, 5, 6] {
+            node.seed_peer(&peer_id);
+        }
+
+        let block = crate::ec_interface::Block {
+            id: 194,
+            time: 1,
+            used: 1,
+            parts: [
+                TokenBlock {
+                    token: 11,
+                    last: 100,
+                    key: 0,
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            signatures: [None; crate::ec_interface::TOKENS_PER_BLOCK],
+        };
+
+        let mut responses = Vec::new();
+        node.submit_local_block(&block, &mut responses);
+
+        assert!(node.knows_block(&block.id));
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope.message,
+                    Message::InitialVote { block: initial_block, vote: 0b0000_0001 }
+                        if initial_block.id == block.id
+                ))
+                .count(),
+            4,
+            "local submission should seed one InitialVote per nearest active peer",
         );
     }
 

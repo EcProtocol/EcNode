@@ -76,6 +76,7 @@ fn main() {
         env_usize("EC_STEADY_STATE_LINEAR_GUARANTEED_NEIGHBORS", 0);
     let neighborhood_width = env_usize("EC_STEADY_STATE_NEIGHBORHOOD_WIDTH", 6);
     let vote_target_count = env_usize("EC_STEADY_STATE_VOTE_TARGETS", 2);
+    let first_vote_target_count = env_usize("EC_STEADY_STATE_FIRST_VOTE_TARGETS", 4);
     let vote_active_rounds =
         env_usize("EC_STEADY_STATE_VOTE_ACTIVE_ROUNDS", 4).min(u8::MAX as usize) as u8;
     let vote_pairs_per_tick =
@@ -83,10 +84,13 @@ fn main() {
     let adaptive_far_width = env_usize("EC_STEADY_STATE_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_STEADY_STATE_ADAPTIVE_HOP_THRESHOLD", 0);
     let blocks_per_round = env_usize("EC_STEADY_STATE_BLOCKS_PER_ROUND", 3);
+    let block_size_min = env_usize("EC_STEADY_STATE_BLOCK_SIZE_MIN", 1).max(1);
+    let block_size_max = env_usize("EC_STEADY_STATE_BLOCK_SIZE_MAX", 3).max(block_size_min);
     let existing_token_fraction = env_f64("EC_STEADY_STATE_EXISTING_TOKEN_FRACTION", 0.5);
     let conflict_family_fraction = env_f64("EC_STEADY_STATE_CONFLICT_FAMILY_FRACTION", 0.0);
     let conflict_contenders = env_usize("EC_STEADY_STATE_CONFLICT_CONTENDERS", 2);
     let enable_batching = env_bool("EC_STEADY_STATE_BATCHING", true);
+    let enable_commit_chain_sync = env_bool("EC_STEADY_STATE_COMMIT_CHAIN_SYNC", false);
     let batch_vote_replies = env_bool("EC_STEADY_STATE_BATCH_VOTE_REPLIES", false);
     let vote_balance_threshold = env_string("EC_STEADY_STATE_VOTE_BALANCE_THRESHOLD", "2")
         .parse::<i64>()
@@ -131,7 +135,11 @@ fn main() {
     println!("Neighborhood width: {}", neighborhood_width);
     println!("Vote targets per request: {}", vote_target_count);
     println!(
-        "Vote request pattern: deterministic outward pairs, {} pair slots/tick, {} active slots with one pause between each",
+        "Immediate InitialVote targets per role path: {}",
+        first_vote_target_count
+    );
+    println!(
+        "Vote request pattern: deterministic outward pairs, {} pair slots/tick, {} active Vote slots with two pauses between each; no scheduled InitialVote retries",
         vote_pairs_per_tick,
         vote_active_rounds
     );
@@ -149,8 +157,20 @@ fn main() {
         }
     );
     println!(
+        "Commit-chain sync: {}",
+        if enable_commit_chain_sync {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!(
         "Existing-token workload target: {:.0}%",
         existing_token_fraction * 100.0
+    );
+    println!(
+        "Block parts per transaction: {}..={}",
+        block_size_min, block_size_max
     );
     println!(
         "Conflict families: {:.0}% of slots, {} contenders",
@@ -209,6 +229,7 @@ fn main() {
     };
     config.peer_config.neighborhood_width = neighborhood_width;
     config.peer_config.vote_target_count = vote_target_count;
+    config.peer_config.first_vote_target_count = first_vote_target_count;
     config.peer_config.vote_request_active_rounds = vote_active_rounds;
     config.peer_config.vote_request_pairs_per_tick = vote_pairs_per_tick;
     config.peer_config.vote_balance_threshold = vote_balance_threshold;
@@ -216,6 +237,7 @@ fn main() {
     config.peer_config.prune_protection_time = prune_protection_time;
     config.peer_config.connection_timeout = connection_timeout;
     config.peer_config.enable_request_batching = enable_batching;
+    config.peer_config.enable_commit_chain_sync = enable_commit_chain_sync;
     config.peer_config.batch_vote_replies = batch_vote_replies;
     if connected_target > 0 {
         config.peer_config.connected_target = Some(connected_target);
@@ -240,7 +262,7 @@ fn main() {
     };
     config.transactions = TransactionFlowConfig {
         blocks_per_round,
-        block_size_range: (1, 3),
+        block_size_range: (block_size_min, block_size_max),
         source_policy: TransactionSourcePolicy::ConnectedOnly,
         existing_token_fraction,
         conflicts: ConflictWorkloadConfig {

@@ -62,7 +62,7 @@ enum TraceState {
 /// Tracks a single peer's commit chain
 #[derive(Debug, Clone)]
 struct PeerChainLog {
-    peer_id: PeerId,
+    _peer_id: PeerId,
     /// Current head we know about
     known_head: Option<CommitBlockId>,
     /// Active trace (if any)
@@ -75,7 +75,7 @@ struct PeerChainLog {
 impl PeerChainLog {
     fn new(peer_id: PeerId, head: CommitBlockId) -> Self {
         Self {
-            peer_id,
+            _peer_id: peer_id,
             known_head: Some(head),
             current_trace: None,
             first_commit_time: None,
@@ -946,7 +946,7 @@ mod tests {
         chain.peer_logs.insert(
             100,
             PeerChainLog {
-                peer_id: 100,
+                _peer_id: 100,
                 known_head: Some(999),
                 current_trace: Some(TraceState::FetchingBlocks {
                     commit_block,
@@ -996,7 +996,7 @@ mod tests {
         chain.peer_logs.insert(
             42,
             PeerChainLog {
-                peer_id: 42,
+                _peer_id: 42,
                 known_head: Some(commit_block.id),
                 current_trace: Some(TraceState::FetchingBlocks {
                     commit_block: commit_block.clone(),
