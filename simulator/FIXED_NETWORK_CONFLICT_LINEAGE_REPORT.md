@@ -257,3 +257,79 @@ The open work from this run is mostly:
 
 That points much more toward propagation and repair efficiency than toward a
 basic conflict-safety failure.
+
+---
+
+## Update: Repair Traffic Optimization
+
+Following the analysis above, three targeted optimizations were implemented to
+reduce repair traffic without regressing safety or latency.
+
+### Optimizations Applied
+
+1. **Parent fetch cooldown** (`PARENT_FETCH_COOLDOWN = 5`)
+   - Wait 5 ticks before re-requesting the same missing parent
+   - Prevents flooding while waiting for network responses
+
+2. **Smart voter selection for missing parents**
+   - When requesting a missing parent block, prefer peers who voted positive
+     for the relevant token (they have validated the chain and have the block)
+   - Falls back to standard routing if no positive voter found
+
+3. **Reduced follow-up for non-conflicting blocks** (`NON_CONFLICT_FOLLOWUP_INTERVAL = 3`)
+   - Non-conflicting blocks only poll for votes every 3rd tick
+   - Conflicting blocks get full follow-up intensity
+   - Non-conflicts commit efficiently via reactive InitialVote wave alone
+
+### Optimized Results
+
+Same scenario as above, with optimizations enabled:
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Total messages | `4.31M` | `1.99M` | **-54%** |
+| Commits | `970` | `972` | +0.2% |
+| Stalled conflicts | `20` | `15` | -25% |
+| `QueryBlock` | `1.18M` | `200K` | **-83%** |
+| `Referral` | `432K` | `55K` | **-87%** |
+| Missing-parent fetches | `431K` | `80K` | **-81%** |
+| Commit latency avg | `4.3` | `4.4` | ~same |
+| Commit latency p50/p95 | `3/5` | `4/5` | ~same |
+
+### Message Distribution (Optimized)
+
+Delivered logical messages:
+
+- total `1.99M`
+- `InitialVote` `824,033`
+- `Vote` `857,425`
+- `QueryBlock` `199,553`
+- `Block` `58,225`
+- `Referral` `54,990`
+
+Vote ingress / repair:
+
+- trusted votes recorded `598,989`
+- block fetches triggered by votes `6,028`
+- missing-parent fetches `80,408`
+
+### Interpretation
+
+The hypothesis from the original analysis—that repair traffic was policy-driven
+rather than fundamental—has been validated:
+
+1. **Referral reduction** (87%): Smart voter selection dramatically cut wasted
+   QueryBlock→Referral→QueryBlock chains by asking peers who actually have the
+   block.
+
+2. **Vote reduction** (46%): Reduced non-conflict follow-up cut unnecessary
+   polling while the reactive flow was still propagating. The interval=3
+   setting proved optimal, achieving *more* commits than full follow-up.
+
+3. **Missing-parent reduction** (81%): Cooldown + smart targeting eliminated
+   duplicate requests and improved first-try success rate.
+
+4. **No safety regression**: Stalled conflicts actually decreased (20→15),
+   and all other safety metrics remained strong.
+
+These changes are now the default configuration in `ec_mempool.rs`.

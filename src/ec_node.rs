@@ -374,8 +374,8 @@ impl<
                 MessageRequest::Parent(block_id, parent_id) => {
                     self.emit_parent_validation_request(*block_id, *parent_id, responses);
                 }
-                MessageRequest::MissingParent(block_id) => {
-                    self.emit_missing_parent_request(*block_id, responses);
+                MessageRequest::MissingParent(parent_id, child_id, token_idx) => {
+                    self.emit_missing_parent_request(*parent_id, *child_id, *token_idx, responses);
                 }
             }
         }
@@ -548,9 +548,19 @@ impl<
     fn emit_missing_parent_request(
         &mut self,
         parent_block_id: BlockId,
+        child_block_id: BlockId,
+        token_idx: usize,
         responses: &mut Vec<MessageEnvelope>,
     ) {
-        let peer_id = self.peers.peer_for(&parent_block_id, self.time);
+        // Try to find a voter who voted positive for this token - they have the parent
+        let peer_id = self
+            .mem_pool
+            .positive_voter_for_token(&child_block_id, token_idx)
+            .unwrap_or_else(|| self.peers.peer_for(&parent_block_id, self.time));
+
+        // Mark that we've requested parents for cooldown tracking
+        self.mem_pool.mark_parent_fetch(&child_block_id, self.time);
+
         self.vote_diagnostics.missing_parent_requests_triggered += 1;
         responses.push(self.request_block(&peer_id, &parent_block_id, BlockUseCase::ParentBlock));
     }
@@ -874,7 +884,7 @@ impl<
                     // Valid ticket for MempoolBlock or ParentBlock requests
                     if matches!(
                         use_case,
-                        BlockUseCase::MempoolBlock | BlockUseCase::ParentBlock
+                        BlockUseCase::MempoolBlock | BlockUseCase::ParentBlock | BlockUseCase::ValidateWith
                     ) {
                         let receiver = if self.rng.gen_bool(1.0/2.0) {
                             low
