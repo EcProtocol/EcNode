@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use rand::Rng;
+
 use crate::ec_interface::{
     BatchRequestItem, BatchedBackend, Block, BlockId, BlockUseCase, EcBlocks, EcCommitChainAccess,
     EcTime, EcTokensV2, Event, EventSink, Message, MessageEnvelope, MessageTicket, NoOpSink,
@@ -874,8 +876,7 @@ impl<
                         use_case,
                         BlockUseCase::MempoolBlock | BlockUseCase::ParentBlock
                     ) {
-                        // TODO psudo random - inject common random
-                        let receiver = if (msg.ticket ^ msg.time) & 1 == 0 {
+                        let receiver = if self.rng.gen_bool(1.0/2.0) {
                             low
                         } else {
                             high
