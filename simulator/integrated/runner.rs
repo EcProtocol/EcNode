@@ -1287,6 +1287,10 @@ impl IntegratedRunner {
     }
 
     fn inject_blocks(&mut self) {
+        if self.current_round < self.config.transactions.start_round {
+            return;
+        }
+
         let eligible_peers = self.eligible_transaction_sources();
         if eligible_peers.is_empty() {
             self.submission_attempts += self.config.transactions.blocks_per_round;
@@ -1833,6 +1837,60 @@ impl IntegratedRunner {
     }
 
     fn calculate_gradient_shape_metrics(&self, active_peers: &[PeerId]) -> GradientShapeMetrics {
+        self.calculate_shape_metrics(
+            active_peers,
+            self.target_gradient_neighbors(),
+            |rank_distance, _max_step, guaranteed_steps, fade_steps| {
+                if rank_distance <= guaranteed_steps {
+                    1.0
+                } else if rank_distance < fade_steps && fade_steps > guaranteed_steps {
+                    let span = (fade_steps - guaranteed_steps) as f64;
+                    let remaining = (fade_steps - rank_distance) as f64;
+                    (remaining / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            },
+        )
+    }
+
+    fn calculate_dense_linear_shape_metrics(
+        &self,
+        active_peers: &[PeerId],
+    ) -> GradientShapeMetrics {
+        const FIXED_DENSE_LINEAR_CENTER_PROB: f64 = 1.0;
+        const FIXED_DENSE_LINEAR_FAR_PROB: f64 = 0.2;
+        const FIXED_DENSE_LINEAR_GUARANTEED_NEIGHBORS: usize = 10;
+
+        self.calculate_shape_metrics(
+            active_peers,
+            FIXED_DENSE_LINEAR_GUARANTEED_NEIGHBORS,
+            |rank_distance, max_step, guaranteed_steps, _fade_steps| {
+                if rank_distance <= guaranteed_steps {
+                    1.0
+                } else if max_step == 0 {
+                    FIXED_DENSE_LINEAR_CENTER_PROB
+                } else {
+                    let distance_fraction =
+                        (rank_distance as f64 / max_step as f64).clamp(0.0, 1.0);
+                    (FIXED_DENSE_LINEAR_CENTER_PROB
+                        + ((FIXED_DENSE_LINEAR_FAR_PROB - FIXED_DENSE_LINEAR_CENTER_PROB)
+                            * distance_fraction))
+                        .clamp(0.0, 1.0)
+                }
+            },
+        )
+    }
+
+    fn calculate_shape_metrics<F>(
+        &self,
+        active_peers: &[PeerId],
+        target_neighbors: usize,
+        mut target_for_rank: F,
+    ) -> GradientShapeMetrics
+    where
+        F: FnMut(usize, usize, usize, usize) -> f64,
+    {
         if active_peers.len() < 2 {
             return GradientShapeMetrics::default();
         }
@@ -1851,7 +1909,7 @@ impl IntegratedRunner {
             return GradientShapeMetrics::default();
         }
 
-        let guaranteed_steps = self.target_gradient_neighbors().min(max_step);
+        let guaranteed_steps = target_neighbors.min(max_step);
         let fade_steps = (guaranteed_steps * 2).min(max_step.max(guaranteed_steps));
 
         let mut active_connected_total = 0.0;
@@ -1903,28 +1961,24 @@ impl IntegratedRunner {
                     0.0
                 };
 
-                let target = if rank_distance <= guaranteed_steps {
+                let target = target_for_rank(rank_distance, max_step, guaranteed_steps, fade_steps);
+
+                if rank_distance <= guaranteed_steps {
                     core_possible += 1;
                     if actual > 0.0 {
                         core_connected += 1;
                     }
-                    1.0
                 } else if rank_distance < fade_steps && fade_steps > guaranteed_steps {
                     fade_possible += 1;
                     if actual > 0.0 {
                         fade_connected += 1;
                     }
-                    let span = (fade_steps - guaranteed_steps) as f64;
-                    let remaining = (fade_steps - rank_distance) as f64;
-                    let probability = (remaining / span).clamp(0.0, 1.0);
-                    fade_expected += probability;
-                    probability
+                    fade_expected += target;
                 } else {
                     far_possible += 1;
                     if actual > 0.0 {
                         far_connected += 1;
                     }
-                    0.0
                 };
 
                 expected_degree += target;
@@ -2055,6 +2109,7 @@ impl IntegratedRunner {
         let active_count = active_peers.len();
         let eligible_transaction_sources = self.eligible_transaction_sources().len();
         let gradient_shape = self.calculate_gradient_shape_metrics(&active_peers);
+        let dense_linear_shape = self.calculate_dense_linear_shape_metrics(&active_peers);
 
         let (
             avg_known_peers,
@@ -2145,6 +2200,12 @@ impl IntegratedRunner {
             avg_gradient_fade_target: gradient_shape.avg_fade_target,
             avg_gradient_far_coverage: gradient_shape.avg_far_coverage,
             avg_gradient_expected_active_degree: gradient_shape.avg_expected_active_degree,
+            avg_dense_linear_target_fit: dense_linear_shape.avg_target_fit,
+            avg_dense_linear_core_coverage: dense_linear_shape.avg_core_coverage,
+            avg_dense_linear_fade_coverage: dense_linear_shape.avg_fade_coverage,
+            avg_dense_linear_fade_target: dense_linear_shape.avg_fade_target,
+            avg_dense_linear_far_coverage: dense_linear_shape.avg_far_coverage,
+            avg_dense_linear_expected_active_degree: dense_linear_shape.avg_expected_active_degree,
             avg_identified_peers,
             avg_pending_peers,
             avg_known_heads,
@@ -2367,6 +2428,14 @@ impl IntegratedRunner {
                     / self.round_metrics.len() as f64
             }
         };
+        let average_f64_of = |selector: fn(&RoundMetrics) -> f64| -> f64 {
+            if self.round_metrics.is_empty() {
+                selector(&final_snapshot)
+            } else {
+                self.round_metrics.iter().map(selector).sum::<f64>()
+                    / self.round_metrics.len() as f64
+            }
+        };
         let peak_of = |selector: fn(&RoundMetrics) -> usize| -> usize {
             self.round_metrics
                 .iter()
@@ -2443,6 +2512,14 @@ impl IntegratedRunner {
                 .sum::<f64>()
                 / self.round_metrics.len() as f64
         };
+        let avg_dense_linear_target_fit_over_time =
+            average_f64_of(|round| round.avg_dense_linear_target_fit);
+        let avg_dense_linear_core_coverage_over_time =
+            average_f64_of(|round| round.avg_dense_linear_core_coverage);
+        let avg_dense_linear_fade_coverage_over_time =
+            average_f64_of(|round| round.avg_dense_linear_fade_coverage);
+        let avg_dense_linear_far_coverage_over_time =
+            average_f64_of(|round| round.avg_dense_linear_far_coverage);
         let neighborhood_buckets = self
             .neighborhood_buckets
             .iter()
@@ -2754,6 +2831,17 @@ impl IntegratedRunner {
             avg_gradient_far_coverage_over_time,
             final_avg_gradient_expected_active_degree: final_snapshot
                 .avg_gradient_expected_active_degree,
+            final_avg_dense_linear_target_fit: final_snapshot.avg_dense_linear_target_fit,
+            avg_dense_linear_target_fit_over_time,
+            final_avg_dense_linear_core_coverage: final_snapshot.avg_dense_linear_core_coverage,
+            avg_dense_linear_core_coverage_over_time,
+            final_avg_dense_linear_fade_coverage: final_snapshot.avg_dense_linear_fade_coverage,
+            avg_dense_linear_fade_coverage_over_time,
+            final_avg_dense_linear_fade_target: final_snapshot.avg_dense_linear_fade_target,
+            final_avg_dense_linear_far_coverage: final_snapshot.avg_dense_linear_far_coverage,
+            avg_dense_linear_far_coverage_over_time,
+            final_avg_dense_linear_expected_active_degree: final_snapshot
+                .avg_dense_linear_expected_active_degree,
             final_eligible_transaction_sources: final_snapshot.eligible_transaction_sources,
             avg_eligible_transaction_sources,
             final_recent_commit_rate: final_snapshot.recent_commit_rate,

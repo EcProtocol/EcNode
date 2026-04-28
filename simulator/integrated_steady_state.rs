@@ -261,6 +261,7 @@ fn main() {
         _ => NetworkConfig::cross_dc_normal(),
     };
     config.transactions = TransactionFlowConfig {
+        start_round: 0,
         blocks_per_round,
         block_size_range: (block_size_min, block_size_max),
         source_policy: TransactionSourcePolicy::ConnectedOnly,

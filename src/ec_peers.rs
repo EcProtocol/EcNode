@@ -23,6 +23,21 @@ pub struct AdaptiveNeighborhoodConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerShapeTargetConfig {
+    /// Number of guaranteed rank-neighbors per side in the local core.
+    pub guaranteed_neighbors: usize,
+
+    /// Connection probability at ring distance zero. Usually `1.0`.
+    pub center_probability: f64,
+
+    /// Connection probability at the far side of the ring.
+    pub far_probability: f64,
+
+    /// Degree slack around the shape-derived expected connected count.
+    pub hysteresis: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerManagerConfig {
     // ===== Capacity Limits =====
     /// Maximum number of Connected peers (default: 200)
@@ -37,6 +52,35 @@ pub struct PeerManagerConfig {
     // ===== Election Parameters =====
     /// Number of elections to trigger per tick (default: 3)
     pub elections_per_tick: usize,
+
+    /// Extra random-token elections per tick reserved for graph discovery.
+    ///
+    /// These are intentionally independent of the normal token sample queue:
+    /// random non-existing tokens should produce referrals near arbitrary ring
+    /// positions, helping a node learn candidates before pruning toward shape.
+    pub random_discovery_elections_per_tick: usize,
+
+    /// Optional cutoff for extra random discovery elections.
+    ///
+    /// `None` means extra random discovery remains enabled whenever configured.
+    /// `Some(t)` means it only runs while `time < t`.
+    pub random_discovery_until: Option<EcTime>,
+
+    /// Experimental clean discovery mode: referral probes may use arbitrary
+    /// token positions, but connection elections are only started for known
+    /// peer IDs. This models identity-block-backed discovery where peer IDs are
+    /// valid answerable election tokens.
+    pub peer_id_election_only: bool,
+
+    /// Referral-only probes per tick while clean discovery is enabled.
+    pub referral_probes_per_tick: usize,
+
+    /// Maximum referral hops followed by each referral-only probe.
+    pub referral_probe_hops: usize,
+
+    /// Desired number of locally discovered peer candidates before widening the
+    /// local probe radius.
+    pub local_discovery_target: usize,
 
     /// Minimum time to collect election responses before checking for winner (in ticks, default: 10)
     pub min_collection_time: u64,
@@ -113,6 +157,11 @@ pub struct PeerManagerConfig {
     /// `Some(0)` means skip self-started elections entirely until back inside the band.
     pub elections_per_tick_above_target: Option<usize>,
 
+    /// Optional shape-derived retention target. Unlike `connected_target`, this
+    /// derives the desired degree from known graph size and a rank-probability
+    /// curve, so the policy follows topology shape rather than a fixed count.
+    pub shape_target: Option<PeerShapeTargetConfig>,
+
     // ===== Election Configuration =====
     /// Configuration for PeerElection
     pub election_config: ElectionConfig,
@@ -128,6 +177,12 @@ impl Default for PeerManagerConfig {
 
             // Election parameters
             elections_per_tick: 3,
+            random_discovery_elections_per_tick: 0,
+            random_discovery_until: None,
+            peer_id_election_only: false,
+            referral_probes_per_tick: 0,
+            referral_probe_hops: 5,
+            local_discovery_target: 100,
             min_collection_time: 10,
             election_timeout: 30,
 
@@ -149,6 +204,7 @@ impl Default for PeerManagerConfig {
             connected_target: None,
             connected_target_hysteresis: 0,
             elections_per_tick_above_target: None,
+            shape_target: None,
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -348,6 +404,12 @@ struct OngoingElection {
     started_at: EcTime,
 }
 
+struct DiscoveryProbe {
+    token: TokenId,
+    remaining_hops: usize,
+    started_at: EcTime,
+}
+
 // ============================================================================
 // Token Sample Collection
 // ============================================================================
@@ -426,6 +488,10 @@ impl TokenSampleCollection {
         selected
     }
 
+    fn remove(&mut self, token: &TokenId) {
+        self.samples.remove(token);
+    }
+
     /// Evict random tokens if over capacity
     /// Returns number of tokens evicted
     fn evict_excess<R: rand::Rng>(&mut self, rng: &mut R) -> usize {
@@ -470,6 +536,9 @@ pub struct EcPeers {
 
     /// Ongoing elections indexed by challenge token
     active_elections: HashMap<TokenId, OngoingElection>,
+
+    /// Referral-only discovery probes indexed by message ticket.
+    active_discovery_probes: HashMap<MessageTicket, DiscoveryProbe>,
 
     /// Proof-of-storage system (zero-sized helper, storage passed as parameter)
     proof_system: ProofOfStorage,
@@ -670,8 +739,15 @@ impl EcPeers {
                     // Winner will be detected in process_elections()
                     // Sample tokens from Answer for future discovery
                     // Answer contains: 1 answer token + 10 signature tokens + sender peer ID
-                    self.token_samples
-                        .sample_from_answer(answer, signature, peer_id);
+                    if self.config.peer_id_election_only {
+                        self.token_samples.add_token(peer_id);
+                        if self.peers.contains_key(&answer.id) {
+                            self.token_samples.add_token(answer.id);
+                        }
+                    } else {
+                        self.token_samples
+                            .sample_from_answer(answer, signature, peer_id);
+                    }
                 }
                 Err(_e) => {
                     // Invalid signature or ticket, or channel already blocked
@@ -679,7 +755,10 @@ impl EcPeers {
                 }
             }
         }
-        // If no election found for this token, ignore the answer
+        if self.active_discovery_probes.remove(&ticket).is_some() {
+            self.add_identified_peer(peer_id, time);
+        }
+        // If no election or discovery probe found, ignore the answer.
         Vec::new()
     }
 
@@ -756,6 +835,10 @@ impl EcPeers {
         sender: PeerId,
         time: EcTime,
     ) -> Option<PeerAction> {
+        if self.active_discovery_probes.contains_key(&ticket) {
+            return self.handle_discovery_referral(ticket, token, suggested_peers, sender, time);
+        }
+
         // Find the ongoing election for this token
         let action = if let Some(ongoing) = self.active_elections.get_mut(&token) {
             // Try to handle the referral
@@ -797,6 +880,54 @@ impl EcPeers {
         }
 
         action
+    }
+
+    fn handle_discovery_referral(
+        &mut self,
+        ticket: MessageTicket,
+        token: TokenId,
+        suggested_peers: [PeerId; 2],
+        sender: PeerId,
+        time: EcTime,
+    ) -> Option<PeerAction> {
+        let probe = self.active_discovery_probes.remove(&ticket)?;
+        if probe.token != token {
+            return None;
+        }
+
+        let mut next_candidates = Vec::new();
+        for &peer_id in &suggested_peers {
+            if peer_id != 0 {
+                self.add_identified_peer(peer_id, time);
+                if peer_id != sender {
+                    next_candidates.push(peer_id);
+                }
+            }
+        }
+
+        if probe.remaining_hops == 0 {
+            return None;
+        }
+
+        next_candidates.sort_by_key(|peer_id| Self::ring_distance(*peer_id, token));
+        let receiver = next_candidates
+            .into_iter()
+            .find(|peer_id| self.peers.contains_key(peer_id))?;
+        let new_ticket = self.create_discovery_ticket();
+        self.active_discovery_probes.insert(
+            new_ticket,
+            DiscoveryProbe {
+                token,
+                remaining_hops: probe.remaining_hops.saturating_sub(1),
+                started_at: time,
+            },
+        );
+
+        Some(PeerAction::SendQuery {
+            receiver,
+            token,
+            ticket: new_ticket,
+        })
     }
 
     /// Handle a Query message - gateway to proof-of-storage system
@@ -1293,6 +1424,60 @@ impl EcPeers {
     /// Closer peers have lower probability of being pruned
     fn prune_connected_by_distance(&mut self, time: EcTime) {
         use rand::Rng;
+        if let Some((target, high)) = self.shape_target_bounds() {
+            if self.active.len() <= high {
+                return;
+            }
+
+            let mut candidates = self
+                .peers
+                .iter()
+                .filter_map(|(peer_id, peer)| {
+                    if let PeerState::Connected {
+                        connected_since, ..
+                    } = peer.state
+                    {
+                        self.shape_prune_weight(*peer_id, connected_since, time)
+                            .map(|weight| (*peer_id, weight))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut to_demote = Vec::new();
+            let prune_count = self
+                .active
+                .len()
+                .saturating_sub(target)
+                .min(candidates.len());
+
+            for _ in 0..prune_count {
+                let total_weight = candidates.iter().map(|(_, weight)| *weight).sum::<f64>();
+                if total_weight <= 0.0 {
+                    break;
+                }
+
+                let mut pick = self.rng.gen_range(0.0..total_weight);
+                let mut selected_idx = 0usize;
+                for (idx, (_, weight)) in candidates.iter().enumerate() {
+                    if pick <= *weight {
+                        selected_idx = idx;
+                        break;
+                    }
+                    pick -= *weight;
+                }
+
+                to_demote.push(candidates.swap_remove(selected_idx).0);
+            }
+
+            for peer_id in to_demote {
+                self.demote_from_connected(peer_id, time);
+            }
+
+            return;
+        }
+
         if let Some((_, target, high)) = self.connected_target_bounds() {
             if self.active.len() <= high {
                 return;
@@ -1391,13 +1576,27 @@ impl EcPeers {
         ))
     }
 
+    fn shape_target_bounds(&self) -> Option<(usize, usize)> {
+        let shape = self.config.shape_target.as_ref()?;
+        let target = self.shape_expected_connected_count().round() as usize;
+        Some((target, target.saturating_add(shape.hysteresis)))
+    }
+
     fn is_above_connected_target(&self) -> bool {
+        if let Some((_, high)) = self.shape_target_bounds() {
+            return self.active.len() > high;
+        }
+
         self.connected_target_bounds()
             .map(|(_, _, high)| self.active.len() > high)
             .unwrap_or(false)
     }
 
     fn target_gradient_neighbors(&self) -> usize {
+        if let Some(shape) = &self.config.shape_target {
+            return shape.guaranteed_neighbors.max(1);
+        }
+
         self.connected_target_bounds()
             .map(|(_, target, _)| target.div_ceil(3).max(1))
             .unwrap_or_else(|| self.config.neighborhood_width.max(1))
@@ -1425,6 +1624,33 @@ impl EcPeers {
         rank
     }
 
+    fn shape_probability_for_rank(&self, rank: usize) -> Option<f64> {
+        let shape = self.config.shape_target.as_ref()?;
+        let known_count = self.peers.len().max(1);
+        let max_step = (known_count / 2).max(1);
+        let rank_distance = rank.div_ceil(2).max(1);
+
+        if rank_distance <= shape.guaranteed_neighbors.min(max_step) {
+            return Some(1.0);
+        }
+
+        let center = shape.center_probability.clamp(0.0, 1.0);
+        let far = shape.far_probability.clamp(0.0, center);
+        let distance_fraction = (rank_distance as f64 / max_step as f64).clamp(0.0, 1.0);
+
+        Some((center + ((far - center) * distance_fraction)).clamp(0.0, 1.0))
+    }
+
+    fn shape_expected_connected_count(&self) -> f64 {
+        if self.config.shape_target.is_none() {
+            return 0.0;
+        }
+
+        (1..=self.peers.len())
+            .filter_map(|rank| self.shape_probability_for_rank(rank))
+            .sum()
+    }
+
     fn connected_core_fill_ratio(&self) -> f64 {
         let (core_limit, _) = self.target_gradient_limits();
         let mut closest_known = self.peers.keys().copied().collect::<Vec<_>>();
@@ -1447,6 +1673,310 @@ impl EcPeers {
         connected as f64 / core_candidates.len() as f64
     }
 
+    /// Compute fill ratio for the fade band (between core and far).
+    /// Returns (actual_fill, target_fill) where target_fill is the expected
+    /// fill based on the shape probability curve.
+    fn connected_fade_fill_ratio(&self) -> (f64, f64) {
+        let (core_limit, fade_limit) = self.target_gradient_limits();
+        let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
+        sorted_known
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        // Fade band is ranks (core_limit+1) to fade_limit
+        let fade_candidates: Vec<_> = sorted_known
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= core_limit && *idx < fade_limit)
+            .map(|(_, peer_id)| peer_id)
+            .collect();
+
+        if fade_candidates.is_empty() {
+            return (1.0, 1.0);
+        }
+
+        let connected = fade_candidates
+            .iter()
+            .filter(|peer_id| self.active.binary_search(peer_id).is_ok())
+            .count();
+
+        let actual_fill = connected as f64 / fade_candidates.len() as f64;
+
+        // Compute expected fill from shape probability curve
+        let target_fill = if self.config.shape_target.is_some() {
+            let mut sum_prob = 0.0;
+            for rank in (core_limit + 1)..=fade_limit.min(self.peers.len()) {
+                if let Some(prob) = self.shape_probability_for_rank(rank) {
+                    sum_prob += prob;
+                }
+            }
+            let band_size = fade_limit.saturating_sub(core_limit).max(1) as f64;
+            (sum_prob / band_size).clamp(0.0, 1.0)
+        } else {
+            0.5 // Default target for fade band without shape config
+        };
+
+        (actual_fill, target_fill)
+    }
+
+    /// Count known but disconnected peers in the far band (beyond fade).
+    fn far_band_excess(&self) -> (usize, usize) {
+        let (_, fade_limit) = self.target_gradient_limits();
+        let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
+        sorted_known
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        let far_candidates: Vec<_> = sorted_known
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= fade_limit)
+            .map(|(_, peer_id)| peer_id)
+            .collect();
+
+        let connected_far = far_candidates
+            .iter()
+            .filter(|peer_id| self.active.binary_search(peer_id).is_ok())
+            .count();
+
+        // Target: far_probability * far_candidates.len()
+        let target_far = if let Some(shape) = &self.config.shape_target {
+            (shape.far_probability * far_candidates.len() as f64).ceil() as usize
+        } else {
+            far_candidates.len() / 5 // Default ~20% retention
+        };
+
+        (connected_far, target_far)
+    }
+
+    /// Check if we need discovery in a specific band.
+    /// Returns true if the band is underfilled AND we don't have enough
+    /// known-but-disconnected candidates to fill it.
+    fn band_needs_discovery(&self) -> (bool, bool) {
+        let (core_limit, fade_limit) = self.target_gradient_limits();
+        let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
+        sorted_known
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        // Core band analysis
+        let core_fill = self.connected_core_fill_ratio();
+        let core_disconnected = sorted_known
+            .iter()
+            .take(core_limit)
+            .filter(|peer_id| !self.is_active(peer_id))
+            .filter(|peer_id| !self.active_elections.contains_key(peer_id))
+            .count();
+        let core_hole = ((1.0 - core_fill) * core_limit as f64).ceil() as usize;
+        let core_needs_discovery = core_fill < 0.95 && core_disconnected < core_hole;
+
+        // Fade band analysis
+        let (fade_fill, fade_target) = self.connected_fade_fill_ratio();
+        let fade_candidates: Vec<_> = sorted_known
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= core_limit && *idx < fade_limit)
+            .map(|(_, peer_id)| *peer_id)
+            .collect();
+        let fade_disconnected = fade_candidates
+            .iter()
+            .filter(|peer_id| !self.is_active(peer_id))
+            .filter(|peer_id| !self.active_elections.contains_key(peer_id))
+            .count();
+        let fade_hole = ((fade_target - fade_fill).max(0.0) * fade_candidates.len() as f64).ceil() as usize;
+        let fade_needs_discovery = fade_fill < fade_target * 0.9 && fade_disconnected < fade_hole;
+
+        (core_needs_discovery, fade_needs_discovery)
+    }
+
+    fn core_refill_challenge_tokens(&self, count: usize) -> Vec<TokenId> {
+        if count == 0 || self.connected_core_fill_ratio() >= 0.95 {
+            return Vec::new();
+        }
+
+        let (core_limit, _) = self.target_gradient_limits();
+        let mut closest_known = self.peers.keys().copied().collect::<Vec<_>>();
+        closest_known
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        closest_known
+            .into_iter()
+            .filter(|peer_id| !self.is_active(peer_id))
+            .filter(|peer_id| !self.active_elections.contains_key(peer_id))
+            .take(core_limit)
+            .take(count)
+            .collect()
+    }
+
+    /// Select challenge tokens for fade band refill.
+    /// Only activates when core is healthy (>= 90%) and fade is underfilled.
+    fn fade_refill_challenge_tokens(&self, count: usize, already_selected: &[TokenId]) -> Vec<TokenId> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        // Only refill fade when core is mostly healthy
+        let core_fill = self.connected_core_fill_ratio();
+        if core_fill < 0.90 {
+            return Vec::new();
+        }
+
+        let (fade_fill, fade_target) = self.connected_fade_fill_ratio();
+        // Allow some slack - only refill if significantly below target
+        if fade_fill >= fade_target * 0.85 {
+            return Vec::new();
+        }
+
+        let (core_limit, fade_limit) = self.target_gradient_limits();
+        let already_set: HashSet<_> = already_selected.iter().copied().collect();
+
+        let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
+        sorted_known
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        // Select disconnected peers in fade band, prioritizing closer ones
+        sorted_known
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= core_limit && *idx < fade_limit)
+            .map(|(_, peer_id)| peer_id)
+            .filter(|peer_id| !already_set.contains(peer_id))
+            .filter(|peer_id| !self.is_active(peer_id))
+            .filter(|peer_id| !self.active_elections.contains_key(peer_id))
+            .take(count)
+            .collect()
+    }
+
+    /// Select peers in far band for potential pruning (overfilled far band).
+    /// Returns peer IDs that are beyond the far target and eligible for pruning.
+    fn far_band_prune_candidates(&self, count: usize, time: EcTime) -> Vec<PeerId> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let (connected_far, target_far) = self.far_band_excess();
+        if connected_far <= target_far {
+            return Vec::new();
+        }
+
+        let (_, fade_limit) = self.target_gradient_limits();
+        let mut sorted_active = self.active.clone();
+        sorted_active
+            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        // Far band peers, sorted by distance (farthest first for pruning)
+        let mut far_connected: Vec<_> = sorted_active
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= fade_limit)
+            .map(|(_, peer_id)| peer_id)
+            .collect();
+        far_connected.reverse(); // Farthest first
+
+        // Filter by protection time
+        far_connected
+            .into_iter()
+            .filter(|peer_id| {
+                if let Some(info) = self.peers.get(peer_id) {
+                    if let PeerState::Connected { connected_since, .. } = info.state {
+                        return time.saturating_sub(connected_since) >= self.config.prune_protection_time;
+                    }
+                }
+                false
+            })
+            .take(count)
+            .collect()
+    }
+
+    fn peer_id_challenge_tokens(
+        &mut self,
+        count: usize,
+        already_selected: &[TokenId],
+    ) -> Vec<TokenId> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let already_selected = already_selected.iter().copied().collect::<HashSet<_>>();
+        let mut candidates = self
+            .peers
+            .keys()
+            .copied()
+            .filter(|peer_id| !already_selected.contains(peer_id))
+            .filter(|peer_id| !self.is_active(peer_id))
+            .filter(|peer_id| !self.active_elections.contains_key(peer_id))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+
+        let selected = candidates.into_iter().take(count).collect::<Vec<_>>();
+        for token in &selected {
+            self.token_samples.remove(token);
+        }
+        selected
+    }
+
+    fn focused_discovery_token(&mut self) -> TokenId {
+        use rand::Rng;
+
+        let known = self.peers.len().max(1);
+        let target = self.config.local_discovery_target.max(1);
+        let fill = (known as f64 / target as f64).clamp(0.02, 1.0);
+        let max_radius = (u64::MAX / 2) as f64;
+        let radius = (max_radius * fill).max(1.0) as u64;
+        let offset = self.rng.gen_range(1..=radius);
+
+        if self.rng.gen_bool(0.5) {
+            self.peer_id.wrapping_add(offset)
+        } else {
+            self.peer_id.wrapping_sub(offset)
+        }
+    }
+
+    fn create_discovery_ticket(&mut self) -> MessageTicket {
+        use rand::Rng;
+
+        loop {
+            let ticket = self.rng.gen::<MessageTicket>();
+            if ticket != 0 && !self.active_discovery_probes.contains_key(&ticket) {
+                return ticket;
+            }
+        }
+    }
+
+    fn start_referral_discovery_probes(&mut self, time: EcTime) -> Vec<PeerAction> {
+        if !self.config.peer_id_election_only || self.config.referral_probes_per_tick == 0 {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+        for _ in 0..self.config.referral_probes_per_tick {
+            let token = self.focused_discovery_token();
+            let Some(receiver) = self.find_closest_peers(token, 1).into_iter().next() else {
+                continue;
+            };
+            let ticket = self.create_discovery_ticket();
+            self.active_discovery_probes.insert(
+                ticket,
+                DiscoveryProbe {
+                    token,
+                    remaining_hops: self.config.referral_probe_hops,
+                    started_at: time,
+                },
+            );
+            actions.push(PeerAction::SendQuery {
+                receiver,
+                token,
+                ticket,
+            });
+        }
+
+        actions
+    }
+
+    fn expire_discovery_probes(&mut self, time: EcTime) {
+        let timeout = self.config.election_timeout;
+        self.active_discovery_probes
+            .retain(|_, probe| time.saturating_sub(probe.started_at) < timeout);
+    }
+
+    /// Compute prune weight based on band fill levels (used when shape_target not configured).
     fn target_prune_weight(
         &self,
         peer_id: PeerId,
@@ -1462,22 +1992,91 @@ impl EcPeers {
         let distance_fraction = (distance / ring_size).clamp(0.0, 1.0);
         let (core_limit, fade_limit) = self.target_gradient_limits();
         let rank = self.known_distance_rank(peer_id);
+
         let core_fill = self.connected_core_fill_ratio().clamp(0.0, 1.0);
+        let (fade_fill, fade_target) = self.connected_fade_fill_ratio();
+        let (connected_far, target_far) = self.far_band_excess();
 
         let weight = if rank <= core_limit {
+            // Core band: protect when underfilled
             if core_fill < 0.95 {
                 return None;
             }
             0.05 * distance_fraction.max(0.01)
         } else if rank <= fade_limit {
+            // Fade band: protect when underfilled
+            if fade_fill < fade_target * 0.90 {
+                return None;
+            }
             let fade_weight = (0.25 + 0.75 * distance_fraction).clamp(0.05, 1.0);
-            let preserve_bonus = (1.0 - core_fill) * 0.50;
-            (fade_weight - preserve_bonus).clamp(0.02, 1.0)
+            let fill_ratio = (fade_fill / fade_target.max(0.01)).clamp(0.5, 1.5);
+            (fade_weight * fill_ratio).clamp(0.02, 1.0)
         } else {
-            (1.0 + distance_fraction).clamp(0.10, 2.0)
+            // Far band: aggressive when overfilled
+            let base_weight = (1.0 + distance_fraction).clamp(0.10, 2.0);
+            if connected_far > target_far {
+                let excess_ratio = connected_far as f64 / target_far.max(1) as f64;
+                (base_weight * excess_ratio).clamp(0.5, 3.0)
+            } else {
+                base_weight
+            }
         };
 
         Some(weight.max(0.000_001))
+    }
+
+    /// Compute prune weight based on shape target and band fill levels.
+    /// - Protects underfilled bands (core, fade)
+    /// - Increases weight for overfilled bands (far)
+    fn shape_prune_weight(
+        &self,
+        peer_id: PeerId,
+        connected_since: EcTime,
+        time: EcTime,
+    ) -> Option<f64> {
+        if time.saturating_sub(connected_since) < self.config.prune_protection_time {
+            return None;
+        }
+
+        let rank = self.known_distance_rank(peer_id);
+        let keep_probability = self.shape_probability_for_rank(rank)?;
+        let (core_limit, fade_limit) = self.target_gradient_limits();
+
+        let core_fill = self.connected_core_fill_ratio().clamp(0.0, 1.0);
+        let (fade_fill, fade_target) = self.connected_fade_fill_ratio();
+        let (connected_far, target_far) = self.far_band_excess();
+
+        // Core band: protect when underfilled
+        if rank <= core_limit {
+            if core_fill < 0.95 {
+                return None; // Never prune core when underfilled
+            }
+            // Even when full, core peers have very low prune weight
+            return Some(0.01);
+        }
+
+        // Fade band: protect when underfilled, moderate weight otherwise
+        if rank <= fade_limit {
+            if fade_fill < fade_target * 0.90 {
+                return None; // Protect fade when significantly underfilled
+            }
+            // Base weight from shape probability, reduced if fade is borderline
+            let base_weight = (1.0 - keep_probability).clamp(0.05, 0.5);
+            let fill_ratio = (fade_fill / fade_target.max(0.01)).clamp(0.5, 1.5);
+            // Lower weight when closer to target, higher when overfilled
+            return Some((base_weight * fill_ratio).clamp(0.02, 0.6));
+        }
+
+        // Far band: aggressive pruning when overfilled
+        let base_weight = (1.0 - keep_probability).clamp(0.3, 1.0);
+        if connected_far > target_far {
+            // Overfilled far band: boost prune weight
+            let excess_ratio = connected_far as f64 / target_far.max(1) as f64;
+            return Some((base_weight * excess_ratio).clamp(0.5, 2.0));
+        }
+
+        // Far band at or below target: normal weight
+        Some(base_weight)
     }
 
     fn invitation_acceptance_probability(&self, sender_peer_id: PeerId) -> f64 {
@@ -1485,6 +2084,16 @@ impl EcPeers {
         let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
         let distance_fraction = (distance / ring_size).clamp(0.0, 1.0);
         let base_accept = (1.0 - distance_fraction).clamp(0.0, 1.0);
+
+        if let Some(shape_probability) =
+            self.shape_probability_for_rank(self.known_distance_rank(sender_peer_id))
+        {
+            if !self.is_above_connected_target() || self.active.is_empty() {
+                return base_accept.max(shape_probability).clamp(0.0, 1.0);
+            }
+
+            return base_accept.min(shape_probability).clamp(0.0, 1.0);
+        }
 
         if !self.is_above_connected_target() || self.active.is_empty() {
             return base_accept;
@@ -1508,9 +2117,12 @@ impl EcPeers {
         base_accept.min(0.03).clamp(0.0, 1.0)
     }
 
-    /// Trigger multiple elections per tick (new design)
-    /// Picks N tokens from collection and removes them.
-    /// If collection is low, uses random tokens to bootstrap discovery.
+    /// Trigger multiple elections per tick (band-aware design)
+    /// Priority order:
+    /// 1. Core refill - fill holes in guaranteed neighbor band
+    /// 2. Fade refill - fill holes in fade band (when core is healthy)
+    /// 3. General elections - from token samples or known peers
+    /// 4. Adaptive discovery - only when bands need candidates we don't know
     fn trigger_multiple_elections(
         &mut self,
         _token_storage: &dyn TokenStorageBackend,
@@ -1530,20 +2142,69 @@ impl EcPeers {
             return actions;
         }
 
-        // Pick N challenge tokens and remove them from collection
-        let mut challenge_tokens = self
-            .token_samples
-            .pick_and_remove(elections_per_tick, &mut self.rng);
+        // 1. Core refill - highest priority
+        let mut challenge_tokens = self.core_refill_challenge_tokens(elections_per_tick);
 
-        // If we don't have enough tokens, add random tokens to bootstrap discovery
-        // Random tokens won't exist, so we'll get Referrals that populate Identified
-        while challenge_tokens.len() < elections_per_tick {
-            let random_token: TokenId = self.rng.gen();
-            challenge_tokens.push(random_token);
+        // 2. Fade refill - when core is healthy and fade is underfilled
+        let remaining_for_fade = elections_per_tick.saturating_sub(challenge_tokens.len());
+        if remaining_for_fade > 0 {
+            let fade_tokens = self.fade_refill_challenge_tokens(remaining_for_fade, &challenge_tokens);
+            challenge_tokens.extend(fade_tokens);
+        }
+
+        // 3. General elections from samples or known peers
+        let remaining = elections_per_tick.saturating_sub(challenge_tokens.len());
+        if self.config.peer_id_election_only {
+            let selected = self.peer_id_challenge_tokens(remaining, &challenge_tokens);
+            challenge_tokens.extend(selected);
+        } else {
+            challenge_tokens.extend(self.token_samples.pick_and_remove(remaining, &mut self.rng));
+        }
+
+        // 4. Adaptive discovery - only when bands need candidates we don't already know
+        let (core_needs, fade_needs) = self.band_needs_discovery();
+        let needs_discovery = core_needs || fade_needs;
+
+        // Check if continuous discovery is enabled (legacy mode)
+        let legacy_discovery_enabled = self
+            .config
+            .random_discovery_until
+            .map(|until| time < until)
+            .unwrap_or(true)
+            && self.config.random_discovery_elections_per_tick > 0;
+
+        // Only do random discovery if adaptive need OR legacy mode
+        if needs_discovery || legacy_discovery_enabled {
+            // Use adaptive count based on need, or fall back to configured count
+            let discovery_count = if needs_discovery && !legacy_discovery_enabled {
+                // Adaptive: 1-2 discovery elections when needed
+                if core_needs { 2 } else { 1 }
+            } else {
+                // Legacy: use configured count
+                self.config.random_discovery_elections_per_tick
+            };
+
+            if !self.config.peer_id_election_only {
+                // Random token discovery - will get referrals
+                for _ in 0..discovery_count {
+                    let random_token: TokenId = self.rng.gen();
+                    challenge_tokens.push(random_token);
+                }
+            } else {
+                // Peer-id-only mode: use referral probes instead
+                actions.extend(self.start_referral_discovery_probes(time));
+            }
+        }
+
+        // Fill any remaining slots with random tokens (bootstrap mode)
+        if !self.config.peer_id_election_only {
+            while challenge_tokens.len() < elections_per_tick {
+                let random_token: TokenId = self.rng.gen();
+                challenge_tokens.push(random_token);
+            }
         }
 
         for challenge_token in challenge_tokens {
-            // Start election (which spawns initial channels and returns Query actions)
             let channel_actions = self.start_election(challenge_token, time);
             actions.extend(channel_actions);
         }
@@ -1617,6 +2278,7 @@ impl EcPeers {
             peers: BTreeMap::new(),
             active: Vec::new(),
             active_elections: HashMap::new(),
+            active_discovery_probes: HashMap::new(),
             proof_system,
             token_samples,
             config,
@@ -2009,6 +2671,7 @@ impl EcPeers {
         // TODO before evicting Pending - maybe re-send invite
         self.detect_pending_timeouts(time);
         self.detect_connection_timeouts(time);
+        self.expire_discovery_probes(time);
 
         // Phase 2: Process ongoing elections
         let election_actions = self.process_elections(token_storage, time);
@@ -2480,6 +3143,12 @@ mod tests {
         assert_eq!(config.identified_max_capacity, 5000);
         assert_eq!(config.token_sample_max_capacity, 1000);
         assert_eq!(config.elections_per_tick, 3);
+        assert_eq!(config.random_discovery_elections_per_tick, 0);
+        assert_eq!(config.random_discovery_until, None);
+        assert!(!config.peer_id_election_only);
+        assert_eq!(config.referral_probes_per_tick, 0);
+        assert_eq!(config.referral_probe_hops, 5);
+        assert_eq!(config.local_discovery_target, 100);
         assert_eq!(config.min_collection_time, 10);
         assert_eq!(config.pending_timeout, 10);
         assert_eq!(config.connection_timeout, 300);

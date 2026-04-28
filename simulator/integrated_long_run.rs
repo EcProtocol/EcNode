@@ -7,6 +7,7 @@ use std::env;
 
 use ec_rust::ec_genesis::GenesisConfig;
 use ec_rust::ec_peers::AdaptiveNeighborhoodConfig;
+use ec_rust::ec_peers::PeerShapeTargetConfig;
 
 use integrated::{
     ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig,
@@ -76,8 +77,15 @@ fn main() {
     let network_profile = env_string("EC_LONG_RUN_NETWORK_PROFILE", "cross_dc_normal");
     let neighborhood_width = env_usize("EC_LONG_RUN_NEIGHBORHOOD_WIDTH", 4);
     let vote_target_count = env_usize("EC_LONG_RUN_VOTE_TARGETS", 2);
+    let random_discovery_elections = env_usize("EC_LONG_RUN_RANDOM_DISCOVERY_ELECTIONS", 0);
+    let random_discovery_until = env_u64("EC_LONG_RUN_RANDOM_DISCOVERY_UNTIL", 0);
+    let peer_id_election_only = env_bool("EC_LONG_RUN_PEER_ID_ELECTION_ONLY", false);
+    let referral_probes_per_tick = env_usize("EC_LONG_RUN_REFERRAL_PROBES_PER_TICK", 0);
+    let referral_probe_hops = env_usize("EC_LONG_RUN_REFERRAL_PROBE_HOPS", 5);
+    let local_discovery_target = env_usize("EC_LONG_RUN_LOCAL_DISCOVERY_TARGET", 100);
     let adaptive_far_width = env_usize("EC_LONG_RUN_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_LONG_RUN_ADAPTIVE_HOP_THRESHOLD", 0);
+    let transaction_start_round = env_usize("EC_LONG_RUN_TRANSACTION_START_ROUND", 0);
     let blocks_per_round = env_usize("EC_LONG_RUN_BLOCKS_PER_ROUND", 3);
     let block_size_min = env_usize("EC_LONG_RUN_BLOCK_SIZE_MIN", 1);
     let block_size_max = env_usize("EC_LONG_RUN_BLOCK_SIZE_MAX", 3);
@@ -91,6 +99,10 @@ fn main() {
     let connected_hysteresis = env_usize("EC_LONG_RUN_CONNECTED_HYSTERESIS", 0);
     let elections_when_over_target =
         env_usize("EC_LONG_RUN_ELECTIONS_WHEN_OVER_TARGET", usize::MAX);
+    let enable_dense_shape_target = env_bool("EC_LONG_RUN_DENSE_SHAPE_TARGET", false);
+    let dense_shape_neighbors = env_usize("EC_LONG_RUN_DENSE_SHAPE_NEIGHBORS", 10);
+    let dense_shape_far_prob = env_f64("EC_LONG_RUN_DENSE_SHAPE_FAR_PROB", 0.2);
+    let dense_shape_hysteresis = env_usize("EC_LONG_RUN_DENSE_SHAPE_HYSTERESIS", 4);
     let focus_first_crash = env_bool("EC_LONG_RUN_FOCUS_FIRST_CRASH", false);
     let focus_report_delta = env_usize("EC_LONG_RUN_FOCUS_REPORT_DELTA", 12);
     println!("╔════════════════════════════════════════════════════════╗");
@@ -101,8 +113,28 @@ fn main() {
     println!("Network profile: {}", network_profile);
     println!("Neighborhood width: {}", neighborhood_width);
     println!("Vote targets per request: {}", vote_target_count);
+    if random_discovery_elections > 0 {
+        let until_label = if random_discovery_until == 0 {
+            "always".to_string()
+        } else {
+            format!("until round {}", random_discovery_until)
+        };
+        println!(
+            "Random discovery elections per tick: {} ({})",
+            random_discovery_elections, until_label
+        );
+    }
+    if peer_id_election_only {
+        println!(
+            "Peer-ID election-only discovery: {} referral probes/tick, {} hops, local target {}",
+            referral_probes_per_tick, referral_probe_hops, local_discovery_target
+        );
+    }
     println!("Vote request pattern: deterministic outward pairs, 4 rounds on / 1 round skip");
     println!("Prune protection time: {}", prune_protection_time);
+    if transaction_start_round > 0 {
+        println!("Transaction start round: {}", transaction_start_round);
+    }
     println!(
         "Batching: {}, vote replies: {}",
         if enable_batching { "on" } else { "off" },
@@ -140,6 +172,12 @@ fn main() {
             connected_target, connected_hysteresis, elections_label
         );
     }
+    if enable_dense_shape_target {
+        println!(
+            "Dense shape target: core ±{}, far probability {:.2}, hysteresis {}",
+            dense_shape_neighbors, dense_shape_far_prob, dense_shape_hysteresis
+        );
+    }
 
     let mut config = IntegratedSimConfig::default();
     config.seed = Some(fixed_seed(seed_variant));
@@ -161,6 +199,14 @@ fn main() {
     };
     config.peer_config.neighborhood_width = neighborhood_width;
     config.peer_config.vote_target_count = vote_target_count;
+    config.peer_config.random_discovery_elections_per_tick = random_discovery_elections;
+    if random_discovery_until > 0 {
+        config.peer_config.random_discovery_until = Some(random_discovery_until);
+    }
+    config.peer_config.peer_id_election_only = peer_id_election_only;
+    config.peer_config.referral_probes_per_tick = referral_probes_per_tick;
+    config.peer_config.referral_probe_hops = referral_probe_hops;
+    config.peer_config.local_discovery_target = local_discovery_target;
     config.peer_config.enable_request_batching = enable_batching;
     config.peer_config.batch_vote_replies = batch_vote_replies;
     config.peer_config.prune_protection_time = prune_protection_time;
@@ -170,6 +216,14 @@ fn main() {
         if elections_when_over_target != usize::MAX {
             config.peer_config.elections_per_tick_above_target = Some(elections_when_over_target);
         }
+    }
+    if enable_dense_shape_target {
+        config.peer_config.shape_target = Some(PeerShapeTargetConfig {
+            guaranteed_neighbors: dense_shape_neighbors,
+            center_probability: 1.0,
+            far_probability: dense_shape_far_prob,
+            hysteresis: dense_shape_hysteresis,
+        });
     }
     config.peer_config.adaptive_neighborhood = if adaptive_far_width > 0 {
         Some(AdaptiveNeighborhoodConfig {
@@ -186,6 +240,7 @@ fn main() {
         _ => NetworkConfig::cross_dc_normal(),
     };
     config.transactions = TransactionFlowConfig {
+        start_round: transaction_start_round,
         blocks_per_round,
         block_size_range: (block_size_min, block_size_max.max(block_size_min)),
         source_policy: TransactionSourcePolicy::ConnectedOnly,

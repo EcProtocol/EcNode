@@ -79,6 +79,9 @@ impl NetworkConfig {
 
 #[derive(Debug, Clone)]
 pub struct TransactionFlowConfig {
+    /// Round at which transaction submissions begin.
+    pub start_round: usize,
+
     pub blocks_per_round: usize,
     pub block_size_range: (usize, usize),
     pub source_policy: TransactionSourcePolicy,
@@ -138,6 +141,7 @@ impl Default for NetworkConfig {
 impl Default for TransactionFlowConfig {
     fn default() -> Self {
         Self {
+            start_round: 0,
             blocks_per_round: 2,
             block_size_range: (1, 3),
             source_policy: TransactionSourcePolicy::ConnectedOnly,

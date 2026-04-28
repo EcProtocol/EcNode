@@ -1,13 +1,84 @@
 # Peer Election via Proof-of-Storage: Design Document
 
-**Status**: Implementation Complete
-**Version**: 3.0 (Simplified Integration)
-**Last Updated**: 2025-12-27
-**Major Changes from V2.0**: Removed election caching, added per-peer invitation cooldown, distance-based peer management, continuous elections
+**Status**: Implemented, with active lifecycle/topology tuning
+**Version**: 3.1 (Graph-control and simulator alignment)
+**Last Updated**: 2026-04-27
+**Major Changes from V3.0**: Documented fixed-network topology target, target-aware graph control, and lifecycle simulator expectations under churn
 
 **Previous Major Changes (V2.0)**: Simplified API, added signature verification, user-controlled timing
 
 ---
+
+## 2026-04-27 Lifecycle Update
+
+The election protocol is still the same challenge/answer/referral mechanism, but
+the lifecycle question has become more precise. Recent fixed-network simulator
+work shows that the best steady-state graph is not "as many peers as possible";
+nor is it a small fixed peer count. It is a dense local ring core, a linear
+probability fade across the rest of the ring, and a small far-tail probability.
+The fixed-network reference shape used in the current simulator reports has
+guaranteed local neighbors, center probability `1.0`, and far probability `0.2`.
+
+The current implementation in `src/ec_peers.rs` therefore has two layers:
+
+- **Election and invitation formation**: elections select proof-of-storage
+  winners, then send invitations; invitation receivers may start a reciprocal
+  election before the connection becomes `Connected`.
+- **Graph preservation under churn**: optional fixed-degree controls
+  (`connected_target`, `connected_target_hysteresis`, and
+  `elections_per_tick_above_target`) remain available, but the preferred
+  lifecycle experiments now use a shape target. Shape-aware admission and
+  pruning protect the guaranteed core, retain fade-band peers probabilistically,
+  and limit far-tail retention without forcing all nodes to the same absolute
+  connected count.
+
+The Rust peer-lifecycle simulator (`simulator/peer_lifecycle/runner.rs`) should
+now be read as the first peer-formation test-bed for this layer. It does not run
+transactions; it measures whether peer discovery, invitations, churn, and repair
+preserve the intended graph shape. Its useful graph-shape outputs are:
+
+- `dense-linear target fit`: closeness to the fixed-network probability shape
+- `core coverage`: how much of the local guaranteed band is connected
+- `fade coverage`: how broad the fade band has become
+- `far leakage`: how much connectivity remains beyond the target fade band
+
+The integrated long-run simulator reports the same dense-linear shape metrics
+next to transaction latency and wire-message counts, so topology changes should
+be judged against both viability surfaces at the same time.
+
+This matters because the integrated churn reports showed that the live network
+was not failing from missing connectivity. It was healing by becoming too broad,
+which raises transaction cost and weakens the fixed-topology latency story. At
+the same time, early fixed-degree experiments showed the opposite failure: a
+small absolute target can make the graph look cleaner while increasing
+transaction wire pressure because the retained shape is too thin.
+
+## Formation Thesis
+
+Peer formation depends on four linked mechanisms:
+
+1. Peers create an [identity block](./identity-block-design.md) and mine their
+   address with Argon2 proof-of-work. These mined peer IDs act as evenly spread
+   lampposts around the token ring.
+2. Early networks share a deterministic bootstrap base from
+   [genesis generation](./ec_genesis_design.md), giving honest peers enough
+   aligned storage to answer proof-of-storage challenges.
+3. A node or client can start from a small set of peers and query random,
+   usually non-existing tokens. Referrals for those tokens reveal peers near
+   many ring positions, so repeated random lookups can teach a node a large
+   fraction of the connected graph.
+4. Candidate nodes then use the [commit chain](../Design/commit_chain.md) to
+   learn and stay current with their local neighborhood after the peer set is
+   formed.
+
+The working thesis is therefore:
+
+- discovery should be broad enough that a node can learn far more peers than it
+  ultimately keeps
+- retention should prune from that learned graph toward the fixed-network
+  dense-linear shape
+- the ideal connected set is a dense local core, a controlled fade band, and
+  only a small far tail
 
 ## Table of Contents
 

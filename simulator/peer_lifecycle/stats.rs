@@ -134,6 +134,12 @@ pub struct NetworkHealth {
 
     /// Gradient steepness distribution (connectivity shape quality)
     pub gradient_distribution: Option<GradientSteepnessDistribution>,
+
+    /// Corrected ring-target shape metrics for the live connected graph.
+    pub gradient_shape: Option<GradientShapeMetrics>,
+
+    /// Fixed dense-linear target metrics matching the strongest fixed-network reports.
+    pub dense_linear_shape: Option<GradientShapeMetrics>,
 }
 
 /// Quality score metrics
@@ -231,6 +237,31 @@ pub struct GradientSteepnessDistribution {
 
     /// Quality assessment: percentage of peers with strong locality (>= 0.7)
     pub near_ideal_percent: f64,
+}
+
+/// Average fit against the corrected fixed-network ring-gradient target.
+#[derive(Debug, Clone, Default)]
+pub struct GradientShapeMetrics {
+    /// Connected peers that are also active in the simulator.
+    pub avg_active_connected_peers: f64,
+
+    /// Expected connected degree under the corrected fixed-network target.
+    pub avg_expected_active_degree: f64,
+
+    /// 1.0 is a perfect match against the target adjacency probabilities.
+    pub avg_target_fit: f64,
+
+    /// Fraction of target core-band peers actually connected.
+    pub avg_core_coverage: f64,
+
+    /// Fraction of fade-band peers actually connected.
+    pub avg_fade_coverage: f64,
+
+    /// Expected fade-band coverage under the target.
+    pub avg_fade_target: f64,
+
+    /// Fraction of peers beyond the target fade band that are connected.
+    pub avg_far_coverage: f64,
 }
 
 impl Default for GradientSteepnessDistribution {
@@ -360,6 +391,8 @@ impl RoundMetrics {
                 partition_detected: false,
                 connected_peer_distribution: None,
                 gradient_distribution: None,
+                gradient_shape: None,
+                dense_linear_shape: None,
             },
             quality_metrics: QualityMetrics {
                 min_quality: 0.0,
@@ -522,6 +555,40 @@ impl SimulationResult {
                     println!("    Q{}: {:4} peers (empty)", i + 1, 0);
                 }
             }
+            println!();
+        }
+
+        if let Some(ref shape) = self.final_metrics.network_health.gradient_shape {
+            println!("═══ Corrected Ring Target Shape ═══");
+            println!(
+                "  Active Connected: avg={:.1}, ideal={:.1}",
+                shape.avg_active_connected_peers, shape.avg_expected_active_degree
+            );
+            println!("  Target Fit: {:.3}", shape.avg_target_fit);
+            println!(
+                "  Bands: core={:.3}, fade={:.3} (target {:.3}), far leakage={:.3}",
+                shape.avg_core_coverage,
+                shape.avg_fade_coverage,
+                shape.avg_fade_target,
+                shape.avg_far_coverage
+            );
+            println!();
+        }
+
+        if let Some(ref shape) = self.final_metrics.network_health.dense_linear_shape {
+            println!("═══ Fixed Dense-Linear Target Shape ═══");
+            println!(
+                "  Active Connected: avg={:.1}, ideal={:.1}",
+                shape.avg_active_connected_peers, shape.avg_expected_active_degree
+            );
+            println!("  Target Fit: {:.3}", shape.avg_target_fit);
+            println!(
+                "  Bands: core={:.3}, fade={:.3} (target {:.3}), far={:.3}",
+                shape.avg_core_coverage,
+                shape.avg_fade_coverage,
+                shape.avg_fade_target,
+                shape.avg_far_coverage
+            );
             println!();
         }
     }

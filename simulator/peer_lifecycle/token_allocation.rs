@@ -7,12 +7,15 @@
 // discoverable tokens that can be found through proof-of-storage elections.
 
 use ec_rust::ec_genesis::GenesisConfig;
-use ec_rust::ec_interface::{BlockId, PeerId, TokenId, GENESIS_BLOCK_ID};
+use ec_rust::ec_interface::{BlockId, BlockTime, EcTime, PeerId, TokenId, GENESIS_BLOCK_ID};
 use ec_rust::ec_memory_backend::MemTokens;
-use ec_rust::ec_proof_of_storage::ring_distance;
+use ec_rust::ec_proof_of_storage::{
+    ring_distance, SignatureSearchResult, TokenStorageBackend, SIGNATURE_CHUNKS,
+};
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Configuration for token distribution
 #[derive(Debug, Clone)]
@@ -243,6 +246,152 @@ pub struct GenesisTokenSet {
     rng: StdRng,
 }
 
+#[derive(Clone)]
+pub struct SharedGenesisTokens {
+    mappings: Arc<Vec<(TokenId, BlockId)>>,
+}
+
+#[derive(Clone)]
+pub struct GenesisPeerTokens {
+    peer_id: PeerId,
+    storage_fraction: f64,
+    max_distance: u64,
+    mappings: Arc<Vec<(TokenId, BlockId)>>,
+    len: usize,
+}
+
+impl SharedGenesisTokens {
+    fn new(token_ids: &[TokenId]) -> Self {
+        let mut mappings: Vec<_> = token_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &token_id)| (token_id, idx as BlockId + 1))
+            .collect();
+        mappings.sort_by_key(|(token_id, _)| *token_id);
+        Self {
+            mappings: Arc::new(mappings),
+        }
+    }
+
+    pub fn peer_view(&self, peer_id: PeerId, storage_fraction: f64) -> GenesisPeerTokens {
+        let half_ring = (u64::MAX / 2) as f64;
+        let max_distance = if storage_fraction >= 1.0 {
+            u64::MAX / 2
+        } else {
+            (half_ring * storage_fraction) as u64
+        };
+        let len = self
+            .mappings
+            .iter()
+            .filter(|(token_id, _)| {
+                storage_fraction >= 1.0 || ring_distance(peer_id, *token_id) <= max_distance
+            })
+            .count();
+
+        GenesisPeerTokens {
+            peer_id,
+            storage_fraction,
+            max_distance,
+            mappings: Arc::clone(&self.mappings),
+            len,
+        }
+    }
+}
+
+impl GenesisPeerTokens {
+    #[inline]
+    fn owns(&self, token_id: TokenId) -> bool {
+        self.storage_fraction >= 1.0 || ring_distance(self.peer_id, token_id) <= self.max_distance
+    }
+}
+
+impl TokenStorageBackend for GenesisPeerTokens {
+    fn lookup(&self, token: &TokenId) -> Option<BlockTime> {
+        if !self.owns(*token) {
+            return None;
+        }
+
+        self.mappings
+            .binary_search_by_key(token, |(token_id, _)| *token_id)
+            .ok()
+            .map(|idx| BlockTime::new(self.mappings[idx].1, GENESIS_BLOCK_ID, 0))
+    }
+
+    fn set(&mut self, _token: &TokenId, _block: &BlockId, _parent: &BlockId, _time: EcTime) {
+        // The lifecycle simulator's genesis storage is immutable. Transaction
+        // tests use the integrated simulator with a mutable backend.
+    }
+
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; SIGNATURE_CHUNKS],
+    ) -> SignatureSearchResult {
+        #[inline]
+        fn matches_chunk(token: &TokenId, chunk_value: u16) -> bool {
+            (token & 0x3FF) as u16 == chunk_value
+        }
+
+        let mut found_tokens = Vec::with_capacity(SIGNATURE_CHUNKS);
+        let mut steps = 0;
+        let mut chunk_idx = 0;
+
+        let start_idx = match self
+            .mappings
+            .binary_search_by_key(lookup_token, |(token_id, _)| *token_id)
+        {
+            Ok(idx) => idx + 1,
+            Err(idx) => idx,
+        };
+
+        for offset in 0..self.mappings.len() {
+            let idx = (start_idx + offset) % self.mappings.len();
+            let token_id = self.mappings[idx].0;
+            steps += 1;
+            if self.owns(token_id) && matches_chunk(&token_id, signature_chunks[chunk_idx]) {
+                found_tokens.push(token_id);
+                chunk_idx += 1;
+                if chunk_idx >= SIGNATURE_CHUNKS / 2 {
+                    break;
+                }
+            }
+        }
+
+        chunk_idx = SIGNATURE_CHUNKS / 2;
+        let backward_start = match self
+            .mappings
+            .binary_search_by_key(lookup_token, |(token_id, _)| *token_id)
+        {
+            Ok(idx) => idx.saturating_sub(1),
+            Err(0) => self.mappings.len().saturating_sub(1),
+            Err(idx) => idx - 1,
+        };
+
+        for offset in 0..self.mappings.len() {
+            let idx = (backward_start + self.mappings.len() - offset) % self.mappings.len();
+            let token_id = self.mappings[idx].0;
+            steps += 1;
+            if self.owns(token_id) && matches_chunk(&token_id, signature_chunks[chunk_idx]) {
+                found_tokens.push(token_id);
+                chunk_idx += 1;
+                if chunk_idx >= SIGNATURE_CHUNKS {
+                    break;
+                }
+            }
+        }
+
+        SignatureSearchResult {
+            complete: found_tokens.len() == SIGNATURE_CHUNKS,
+            tokens: found_tokens,
+            steps,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 impl GenesisTokenSet {
     /// Create new genesis token set by pre-generating all token IDs
     ///
@@ -350,6 +499,12 @@ impl GenesisTokenSet {
             .collect();
 
         MemTokens::from_mappings(mappings)
+    }
+
+    /// Build one shared sorted genesis table that can be cheaply referenced by
+    /// all simulated peers.
+    pub fn shared_tokens(&self) -> SharedGenesisTokens {
+        SharedGenesisTokens::new(&self.token_ids)
     }
 
     /// Build the genesis token-to-block mappings a peer should store.

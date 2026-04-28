@@ -2,19 +2,24 @@
 
 use super::config::{BootstrapMethod, PeerLifecycleConfig};
 use super::stats::*;
-use super::token_allocation::GlobalTokenMapping;
+use super::token_allocation::{GenesisPeerTokens, GlobalTokenMapping};
 use super::topology::{
     build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
     build_ring_core_tail_topology, build_ring_gradient_topology,
 };
 use ec_rust::ec_interface::{
-    EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
+    BlockId, BlockTime, EcTime, MessageTicket, PeerId, TokenId, TokenMapping,
+    TOKENS_SIGNATURE_SIZE,
 };
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_peers::{EcPeers, PeerAction};
+use ec_rust::ec_proof_of_storage::{
+    SignatureSearchResult, TokenStorageBackend, SIGNATURE_CHUNKS,
+};
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 // ============================================================================
 // Core Structures
@@ -42,6 +47,9 @@ pub struct PeerLifecycleRunner {
     // Metrics tracking
     metrics_history: Vec<RoundMetrics>,
     total_messages: MessageCounter,
+
+    // Event state
+    elections_paused_until: Option<usize>,
 }
 
 /// A group of peers for tracking and analysis
@@ -57,9 +65,48 @@ pub struct PeerGroup {
 struct SimPeer {
     peer_id: PeerId,
     peer_manager: EcPeers,
-    token_storage: MemTokens,
+    token_storage: SimTokenStorage,
     known_tokens: Vec<TokenId>, // Tokens in this peer's view
     active: bool,
+}
+
+enum SimTokenStorage {
+    Memory(MemTokens),
+    Genesis(GenesisPeerTokens),
+}
+
+impl TokenStorageBackend for SimTokenStorage {
+    fn lookup(&self, token: &TokenId) -> Option<BlockTime> {
+        match self {
+            Self::Memory(storage) => storage.lookup(token),
+            Self::Genesis(storage) => storage.lookup(token),
+        }
+    }
+
+    fn set(&mut self, token: &TokenId, block: &BlockId, parent: &BlockId, time: EcTime) {
+        match self {
+            Self::Memory(storage) => storage.set(token, block, parent, time),
+            Self::Genesis(storage) => storage.set(token, block, parent, time),
+        }
+    }
+
+    fn search_signature(
+        &self,
+        lookup_token: &TokenId,
+        signature_chunks: &[u16; SIGNATURE_CHUNKS],
+    ) -> SignatureSearchResult {
+        match self {
+            Self::Memory(storage) => storage.search_signature(lookup_token, signature_chunks),
+            Self::Genesis(storage) => storage.search_signature(lookup_token, signature_chunks),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(storage) => storage.len(),
+            Self::Genesis(storage) => storage.len(),
+        }
+    }
 }
 
 /// Message envelope for routing
@@ -97,6 +144,18 @@ struct MessageCounter {
     referrals: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ProbeReachSummary {
+    probes: usize,
+    active_peers: usize,
+    avg_found_per_probe: f64,
+    p50_found_per_probe: usize,
+    p95_found_per_probe: usize,
+    max_found_per_probe: usize,
+    cumulative_found: usize,
+    cumulative_fraction: f64,
+}
+
 // ============================================================================
 // Implementation
 // ============================================================================
@@ -125,6 +184,7 @@ impl PeerLifecycleRunner {
             delayed_messages: VecDeque::new(),
             metrics_history: Vec::new(),
             total_messages: MessageCounter::default(),
+            elections_paused_until: None,
         }
     }
 
@@ -226,7 +286,7 @@ impl PeerLifecycleRunner {
             let peer = SimPeer {
                 peer_id,
                 peer_manager,
-                token_storage,
+                token_storage: SimTokenStorage::Memory(token_storage),
                 known_tokens,
                 active: true,
             };
@@ -256,87 +316,81 @@ impl PeerLifecycleRunner {
         }
     }
 
-    /// Initialize network with genesis token allocation (new implementation)
+    /// Initialize network with genesis token allocation (fast simulation mode)
+    ///
+    /// This uses pre-computed token IDs instead of full block generation,
+    /// which is much faster for simulation purposes.
     fn initialize_network_with_genesis(
         &mut self,
         genesis_config: ec_rust::ec_genesis::GenesisConfig,
     ) {
         use super::token_allocation::GenesisTokenSet;
-        use ec_rust::ec_genesis::generate_genesis;
-        use ec_rust::ec_memory_backend::MemoryBackend;
 
         let num_peers = self.config.initial_state.num_peers;
         let storage_fraction = self.config.token_distribution.genesis_storage_fraction;
 
         println!("╔════════════════════════════════════════════════════════╗");
-        println!("║  Genesis Bootstrap Mode                               ║");
+        println!("║  Genesis Bootstrap Mode (Fast Simulation)             ║");
         println!("╚════════════════════════════════════════════════════════╝");
         println!(
-            "Generating {} genesis tokens...",
+            "Pre-generating {} genesis token IDs...",
             genesis_config.block_count
         );
-        println!("Allocating {} peer IDs from genesis tokens...", num_peers);
-        println!(
-            "Each peer stores {:.0}% of the ring",
-            storage_fraction * 100.0
-        );
-        println!();
 
-        // 1. Pre-generate all genesis token IDs
+        // 1. Pre-generate all genesis token IDs (fast - just hashing)
         let mut genesis_set =
             GenesisTokenSet::new(&genesis_config, StdRng::from_seed(self.rng.gen()));
+
+        println!("✓ Genesis token IDs generated");
+        println!("Allocating {} peer IDs from genesis tokens...", num_peers);
 
         // 2. Allocate peer IDs from genesis tokens
         let peer_ids = genesis_set
             .allocate_peer_ids(num_peers)
             .expect("Failed to allocate peer IDs from genesis tokens");
 
-        println!("Allocated {} peer IDs", peer_ids.len());
-        println!("Running genesis generation for each peer...\n");
+        println!("✓ Allocated {} peer IDs", peer_ids.len());
+        println!(
+            "Setting up token ownership ({:.0}% of ring per peer)...",
+            storage_fraction * 100.0
+        );
 
-        // 3. Create each peer with genesis-generated storage
+        let shared_tokens = genesis_set.shared_tokens();
+
+        // 3. Create each peer with lazy token ownership (no full block
+        // generation and no per-peer materialized token table).
+        let expected_tokens_per_peer =
+            (genesis_config.block_count as f64 * storage_fraction) as usize;
+
         for (idx, peer_id) in peer_ids.iter().enumerate() {
-            println!(
-                "  [{}/{}] Starting genesis for peer {:016x}...",
-                idx + 1,
-                peer_ids.len(),
-                peer_id
-            );
-
-            // Create peer manager first (needed for genesis)
+            // Create peer manager
             let peer_rng = StdRng::from_seed(self.rng.gen());
             let mut peer_manager =
                 EcPeers::with_config_and_rng(*peer_id, self.config.peer_config.clone(), peer_rng);
 
-            // Create backend for this peer
-            let mut backend = MemoryBackend::new();
+            let token_storage = shared_tokens.peer_view(*peer_id, storage_fraction);
+            let stored_count = token_storage.len();
 
-            // Generate genesis with selective storage and token seeding (using shared RNG)
-            let stored_count = generate_genesis(
-                &mut backend,
-                genesis_config.clone(),
-                &mut peer_manager,
-                storage_fraction,
-                &mut self.rng,
-            )
-            .expect("Genesis generation failed");
+            // Seed TokenSampleCollection with some genesis tokens for discovery
+            let seed_tokens = genesis_set.sample_seed_tokens(&mut self.rng, 0.01);
+            for token_id in seed_tokens.into_iter().take(100) {
+                peer_manager.seed_genesis_token(token_id);
+            }
 
-            // Extract token storage (using Clone we just added)
-            let token_storage = backend.tokens().clone();
-
-            // Progress reporting - show completion
-            println!(
-                "  [{}/{}] ✓ Peer {:016x} complete ({} tokens stored)",
-                idx + 1,
-                peer_ids.len(),
-                peer_id,
-                stored_count
-            );
+            // Progress reporting (less verbose)
+            if (idx + 1) % 100 == 0 || idx + 1 == peer_ids.len() {
+                println!(
+                    "  [{}/{}] peers initialized (~{} tokens each)",
+                    idx + 1,
+                    peer_ids.len(),
+                    stored_count
+                );
+            }
 
             let peer = SimPeer {
                 peer_id: *peer_id,
                 peer_manager,
-                token_storage,
+                token_storage: SimTokenStorage::Genesis(token_storage),
                 known_tokens: Vec::new(),
                 active: true,
             };
@@ -344,7 +398,11 @@ impl PeerLifecycleRunner {
             self.peers.insert(*peer_id, peer);
         }
 
-        println!("\n✓ All peers initialized with genesis storage");
+        println!(
+            "\n✓ All {} peers initialized with ~{} tokens each (fast mode)",
+            peer_ids.len(),
+            expected_tokens_per_peer
+        );
 
         // 4. Initialize topology for genesis mode
         self.initialize_topology_genesis(&genesis_set);
@@ -700,7 +758,7 @@ impl PeerLifecycleRunner {
                 ticket,
             } => {
                 // Peer received answer - route to election
-                if let Some(peer) = self.peers.get_mut(&envelope.to) {
+                let actions = if let Some(peer) = self.peers.get_mut(&envelope.to) {
                     let current_time = self.current_round as EcTime;
                     peer.peer_manager.handle_answer(
                         &answer,
@@ -710,8 +768,12 @@ impl PeerLifecycleRunner {
                         current_time,
                         &peer.token_storage,
                         0, // head_of_chain not used in peer lifecycle sim
-                    );
-                }
+                    )
+                } else {
+                    Vec::new()
+                };
+
+                self.process_peer_actions(envelope.to, actions);
             }
 
             SimMessage::Referral {
@@ -730,28 +792,7 @@ impl PeerLifecycleRunner {
                         current_time,
                     );
 
-                    // Process the returned action (send new Query message if needed)
-                    let peer_id = envelope.to;
-                    if let Some(action) = actions {
-                        match action {
-                            PeerAction::SendQuery {
-                                receiver,
-                                token,
-                                ticket,
-                            } => {
-                                self.send_message(
-                                    peer_id,
-                                    receiver,
-                                    SimMessage::QueryToken { token, ticket },
-                                );
-                            }
-                            PeerAction::SendAnswer { .. }
-                            | PeerAction::SendReferral { .. }
-                            | PeerAction::SendInvitation { .. } => {
-                                // Ignore for now
-                            }
-                        }
-                    }
+                    self.process_peer_actions(envelope.to, actions.into_iter().collect());
                 }
             }
         }
@@ -769,6 +810,38 @@ impl PeerLifecycleRunner {
             .push_back(MessageEnvelope { from, to, message });
     }
 
+    fn process_peer_actions(&mut self, peer_id: PeerId, actions: Vec<PeerAction>) {
+        for action in actions {
+            match action {
+                PeerAction::SendQuery {
+                    receiver,
+                    token,
+                    ticket,
+                } => {
+                    self.send_message(peer_id, receiver, SimMessage::QueryToken { token, ticket });
+                }
+                PeerAction::SendInvitation {
+                    receiver,
+                    answer,
+                    signature,
+                } => {
+                    self.send_message(
+                        peer_id,
+                        receiver,
+                        SimMessage::Answer {
+                            answer,
+                            signature,
+                            ticket: 0,
+                        },
+                    );
+                }
+                PeerAction::SendAnswer { .. } | PeerAction::SendReferral { .. } => {
+                    panic!("Unexpected direct response action outside query handling")
+                }
+            }
+        }
+    }
+
     /// Tick all active peers
     fn tick_all_peers(&mut self) {
         let current_time = self.current_round as EcTime;
@@ -779,44 +852,17 @@ impl PeerLifecycleRunner {
                 if !peer.active {
                     continue;
                 }
+                if self
+                    .elections_paused_until
+                    .map(|until| self.current_round < until)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
 
                 // Tick peer manager
                 let actions = peer.peer_manager.tick(&peer.token_storage, current_time);
-
-                // Process actions
-                for action in actions {
-                    match action {
-                        PeerAction::SendQuery {
-                            receiver,
-                            token,
-                            ticket,
-                        } => {
-                            self.send_message(
-                                peer_id,
-                                receiver,
-                                SimMessage::QueryToken { token, ticket },
-                            );
-                        }
-                        PeerAction::SendInvitation {
-                            receiver,
-                            answer,
-                            signature,
-                        } => {
-                            self.send_message(
-                                peer_id,
-                                receiver,
-                                SimMessage::Answer {
-                                    answer,
-                                    signature,
-                                    ticket: 0,
-                                },
-                            );
-                        }
-                        _ => {
-                            panic!("Unexpected Action returned from tick")
-                        }
-                    }
-                }
+                self.process_peer_actions(peer_id, actions);
             }
         }
     }
@@ -948,6 +994,8 @@ impl PeerLifecycleRunner {
                 partition_detected: false,
                 connected_peer_distribution,
                 gradient_distribution,
+                gradient_shape: Some(self.calculate_gradient_shape_metrics()),
+                dense_linear_shape: Some(self.calculate_dense_linear_shape_metrics()),
             };
         }
 
@@ -958,6 +1006,535 @@ impl PeerLifecycleRunner {
         metrics.election_stats.total_split_brain_detected = total_elections_splitbrain;
 
         self.metrics_history.push(metrics);
+    }
+
+    fn target_gradient_neighbors(&self) -> usize {
+        self.config
+            .token_distribution
+            .neighbor_overlap
+            .max(self.config.peer_config.neighborhood_width)
+            .max(1)
+    }
+
+    fn active_peer_ids(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter_map(|(peer_id, peer)| peer.active.then_some(*peer_id))
+            .collect()
+    }
+
+    fn calculate_gradient_shape_metrics(&self) -> GradientShapeMetrics {
+        self.calculate_shape_metrics(
+            self.target_gradient_neighbors(),
+            |rank_distance, _max_step, guaranteed_steps, fade_steps| {
+                if rank_distance <= guaranteed_steps {
+                    1.0
+                } else if rank_distance < fade_steps && fade_steps > guaranteed_steps {
+                    let span = (fade_steps - guaranteed_steps) as f64;
+                    let remaining = (fade_steps - rank_distance) as f64;
+                    (remaining / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            },
+        )
+    }
+
+    fn calculate_dense_linear_shape_metrics(&self) -> GradientShapeMetrics {
+        const FIXED_DENSE_LINEAR_CENTER_PROB: f64 = 1.0;
+        const FIXED_DENSE_LINEAR_FAR_PROB: f64 = 0.2;
+        const FIXED_DENSE_LINEAR_GUARANTEED_NEIGHBORS: usize = 10;
+
+        self.calculate_shape_metrics(
+            FIXED_DENSE_LINEAR_GUARANTEED_NEIGHBORS,
+            |rank_distance, max_step, guaranteed_steps, _fade_steps| {
+                if rank_distance <= guaranteed_steps {
+                    1.0
+                } else if max_step == 0 {
+                    FIXED_DENSE_LINEAR_CENTER_PROB
+                } else {
+                    let distance_fraction =
+                        (rank_distance as f64 / max_step as f64).clamp(0.0, 1.0);
+                    (FIXED_DENSE_LINEAR_CENTER_PROB
+                        + ((FIXED_DENSE_LINEAR_FAR_PROB - FIXED_DENSE_LINEAR_CENTER_PROB)
+                            * distance_fraction))
+                        .clamp(0.0, 1.0)
+                }
+            },
+        )
+    }
+
+    fn dense_linear_target_probability(rank_distance: usize, max_step: usize) -> f64 {
+        const FIXED_DENSE_LINEAR_CENTER_PROB: f64 = 1.0;
+        const FIXED_DENSE_LINEAR_FAR_PROB: f64 = 0.2;
+        const FIXED_DENSE_LINEAR_GUARANTEED_NEIGHBORS: usize = 10;
+
+        if rank_distance <= FIXED_DENSE_LINEAR_GUARANTEED_NEIGHBORS.min(max_step.max(1)) {
+            1.0
+        } else if max_step == 0 {
+            FIXED_DENSE_LINEAR_CENTER_PROB
+        } else {
+            let distance_fraction = (rank_distance as f64 / max_step as f64).clamp(0.0, 1.0);
+            (FIXED_DENSE_LINEAR_CENTER_PROB
+                + ((FIXED_DENSE_LINEAR_FAR_PROB - FIXED_DENSE_LINEAR_CENTER_PROB)
+                    * distance_fraction))
+                .clamp(0.0, 1.0)
+        }
+    }
+
+    fn diagnostic_rng(&self, salt: u64) -> StdRng {
+        let mut seed = self.seed;
+        for (idx, byte) in (self.current_round as u64).to_le_bytes().iter().enumerate() {
+            seed[idx] ^= *byte;
+        }
+        for (idx, byte) in salt.to_le_bytes().iter().enumerate() {
+            seed[24 + idx] ^= *byte;
+        }
+        StdRng::from_seed(seed)
+    }
+
+    fn referral_probe_reachability(
+        &self,
+        probes: usize,
+        max_depth: usize,
+        rng: &mut StdRng,
+    ) -> ProbeReachSummary {
+        let active_peers = self.active_peer_ids();
+        if active_peers.is_empty() || probes == 0 {
+            return ProbeReachSummary {
+                probes,
+                ..ProbeReachSummary::default()
+            };
+        }
+
+        let active_peer_set = active_peers.iter().copied().collect::<HashSet<_>>();
+        let mut cumulative_found = HashSet::new();
+        let mut found_per_probe = Vec::with_capacity(probes);
+
+        for _ in 0..probes {
+            let token = rng.gen::<TokenId>();
+            let Some(start_peer) = active_peers.choose(rng).copied() else {
+                continue;
+            };
+
+            let mut found = HashSet::new();
+            let mut queue = VecDeque::new();
+            queue.push_back((start_peer, 0usize));
+
+            while let Some((peer_id, depth)) = queue.pop_front() {
+                if !active_peer_set.contains(&peer_id) || !found.insert(peer_id) {
+                    continue;
+                }
+
+                if depth >= max_depth {
+                    continue;
+                }
+
+                let Some(peer) = self.peers.get(&peer_id) else {
+                    continue;
+                };
+
+                for referral in peer.peer_manager.find_closest_peers(token, 2) {
+                    if active_peer_set.contains(&referral) && !found.contains(&referral) {
+                        queue.push_back((referral, depth + 1));
+                    }
+                }
+            }
+
+            cumulative_found.extend(found.iter().copied());
+            found_per_probe.push(found.len());
+        }
+
+        found_per_probe.sort_unstable();
+        let avg_found_per_probe =
+            found_per_probe.iter().sum::<usize>() as f64 / found_per_probe.len().max(1) as f64;
+        let p50_found_per_probe = Self::percentile_usize(&found_per_probe, 0.50);
+        let p95_found_per_probe = Self::percentile_usize(&found_per_probe, 0.95);
+        let max_found_per_probe = found_per_probe.last().copied().unwrap_or(0);
+        let cumulative_found_count = cumulative_found.len();
+
+        ProbeReachSummary {
+            probes,
+            active_peers: active_peers.len(),
+            avg_found_per_probe,
+            p50_found_per_probe,
+            p95_found_per_probe,
+            max_found_per_probe,
+            cumulative_found: cumulative_found_count,
+            cumulative_fraction: cumulative_found_count as f64 / active_peers.len() as f64,
+        }
+    }
+
+    fn percentile_usize(sorted: &[usize], percentile: f64) -> usize {
+        if sorted.is_empty() {
+            return 0;
+        }
+
+        let idx = ((sorted.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+        sorted[idx]
+    }
+
+    fn report_referral_probe_diagnostics(&self) {
+        let mut rng = self.diagnostic_rng(0xA11C_E5EE_D1A9_051Cu64);
+        let depth = 5;
+
+        println!("\n  Random referral probing (depth {}):", depth);
+        for probes in [20usize, 100, 500] {
+            let summary = self.referral_probe_reachability(probes, depth, &mut rng);
+            if summary.active_peers == 0 {
+                println!("    {} probes: no active peers", summary.probes);
+                continue;
+            }
+
+            println!(
+                "    {:>3} probes: per-probe avg {:.1}, p50 {}, p95 {}, max {}; cumulative {}/{} ({:.1}%)",
+                summary.probes,
+                summary.avg_found_per_probe,
+                summary.p50_found_per_probe,
+                summary.p95_found_per_probe,
+                summary.max_found_per_probe,
+                summary.cumulative_found,
+                summary.active_peers,
+                summary.cumulative_fraction * 100.0
+            );
+        }
+    }
+
+    fn report_peer_set_hole_diagnostics(&self) {
+        let mut active_peers = self.active_peer_ids();
+        if active_peers.len() < 2 {
+            return;
+        }
+
+        active_peers.sort_unstable();
+        let index_by_peer = active_peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer_id)| (*peer_id, idx))
+            .collect::<BTreeMap<_, _>>();
+        let max_step = active_peers.len() / 2;
+
+        let mut rng = self.diagnostic_rng(0x5E7_0F_51A9E_u64);
+        let mut sample_peers = active_peers.clone();
+        sample_peers.shuffle(&mut rng);
+        sample_peers.truncate(3);
+
+        println!("\n  Sample peer-set holes vs fixed dense-linear target:");
+        for peer_id in sample_peers {
+            let Some(peer) = self.peers.get(&peer_id) else {
+                continue;
+            };
+
+            let connected = peer
+                .peer_manager
+                .get_active_peers()
+                .iter()
+                .copied()
+                .filter(|candidate| index_by_peer.contains_key(candidate))
+                .collect::<HashSet<_>>();
+            let peer_idx = *index_by_peer
+                .get(&peer_id)
+                .expect("sample peer should be indexed");
+
+            let mut expected_degree = 0.0;
+            let mut core_holes = Vec::new();
+            let mut high_prob_holes = Vec::new();
+            let mut far_excess = Vec::new();
+            let mut bands = [
+                (1usize, 10usize, 0usize, 0usize, 0.0),
+                (11, 20, 0, 0, 0.0),
+                (21, 40, 0, 0, 0.0),
+                (41, usize::MAX, 0, 0, 0.0),
+            ];
+
+            for other_peer_id in &active_peers {
+                if *other_peer_id == peer_id {
+                    continue;
+                }
+
+                let other_idx = *index_by_peer
+                    .get(other_peer_id)
+                    .expect("active peer should be indexed");
+                let clockwise_steps = peer_idx.abs_diff(other_idx);
+                let counter_clockwise_steps = active_peers.len() - clockwise_steps;
+                let rank_distance = clockwise_steps.min(counter_clockwise_steps);
+                let target_prob = Self::dense_linear_target_probability(rank_distance, max_step);
+                let is_connected = connected.contains(other_peer_id);
+                expected_degree += target_prob;
+
+                for (low, high, possible, actual, target_sum) in &mut bands {
+                    if rank_distance >= *low && rank_distance <= *high {
+                        *possible += 1;
+                        if is_connected {
+                            *actual += 1;
+                        }
+                        *target_sum += target_prob;
+                        break;
+                    }
+                }
+
+                if rank_distance <= 10 && !is_connected {
+                    core_holes.push(rank_distance);
+                } else if target_prob >= 0.75 && !is_connected {
+                    high_prob_holes.push(rank_distance);
+                } else if target_prob <= 0.35 && is_connected {
+                    far_excess.push(rank_distance);
+                }
+            }
+
+            core_holes.sort_unstable();
+            high_prob_holes.sort_unstable();
+            far_excess.sort_unstable();
+
+            println!(
+                "    peer {}: active connected {}, dense ideal {:.1}",
+                peer_id,
+                connected.len(),
+                expected_degree
+            );
+            for (low, high, possible, actual, target_sum) in bands {
+                if possible == 0 {
+                    continue;
+                }
+                let high_label = if high == usize::MAX {
+                    "max".to_string()
+                } else {
+                    high.to_string()
+                };
+                println!(
+                    "      ranks {:>2}-{:>3}: {}/{} connected, target avg {:.3}",
+                    low,
+                    high_label,
+                    actual,
+                    possible,
+                    target_sum / possible as f64
+                );
+            }
+            println!(
+                "      holes: core {} {:?}, high-prob fade {} {:?}, far excess {} {:?}",
+                core_holes.len(),
+                core_holes.iter().take(12).copied().collect::<Vec<_>>(),
+                high_prob_holes.len(),
+                high_prob_holes.iter().take(12).copied().collect::<Vec<_>>(),
+                far_excess.len(),
+                far_excess.iter().take(12).copied().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn calculate_shape_metrics<F>(
+        &self,
+        target_neighbors: usize,
+        mut target_for_rank: F,
+    ) -> GradientShapeMetrics
+    where
+        F: FnMut(usize, usize, usize, usize) -> f64,
+    {
+        let mut sorted_active_peers = self.active_peer_ids();
+        if sorted_active_peers.len() < 2 {
+            return GradientShapeMetrics::default();
+        }
+
+        sorted_active_peers.sort_unstable();
+        let index_by_peer = sorted_active_peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer_id)| (*peer_id, idx))
+            .collect::<BTreeMap<_, _>>();
+
+        let max_step = sorted_active_peers.len() / 2;
+        if max_step == 0 {
+            return GradientShapeMetrics::default();
+        }
+
+        let guaranteed_steps = target_neighbors.max(1).min(max_step);
+        let fade_steps = (guaranteed_steps * 2).min(max_step.max(guaranteed_steps));
+
+        let mut active_connected_total = 0.0;
+        let mut expected_degree_total = 0.0;
+        let mut target_fit_total = 0.0;
+        let mut core_coverage_total = 0.0;
+        let mut fade_coverage_total = 0.0;
+        let mut fade_target_total = 0.0;
+        let mut far_coverage_total = 0.0;
+
+        for peer_id in &sorted_active_peers {
+            let Some(peer) = self.peers.get(peer_id) else {
+                continue;
+            };
+            let active_connected = peer
+                .peer_manager
+                .get_active_peers()
+                .iter()
+                .copied()
+                .filter(|candidate| index_by_peer.contains_key(candidate))
+                .collect::<HashSet<_>>();
+
+            let peer_idx = *index_by_peer
+                .get(peer_id)
+                .expect("active peer should be indexed");
+            let mut expected_degree = 0.0;
+            let mut absolute_error = 0.0;
+            let mut comparisons = 0usize;
+
+            let mut core_possible = 0usize;
+            let mut core_connected = 0usize;
+            let mut fade_possible = 0usize;
+            let mut fade_connected = 0usize;
+            let mut fade_expected = 0.0;
+            let mut far_possible = 0usize;
+            let mut far_connected = 0usize;
+
+            for (other_peer_id, other_idx) in &index_by_peer {
+                if other_peer_id == peer_id {
+                    continue;
+                }
+
+                let clockwise_steps = peer_idx.abs_diff(*other_idx);
+                let counter_clockwise_steps = sorted_active_peers.len() - clockwise_steps;
+                let rank_distance = clockwise_steps.min(counter_clockwise_steps);
+                let actual = if active_connected.contains(other_peer_id) {
+                    1.0
+                } else {
+                    0.0
+                };
+
+                let target = target_for_rank(rank_distance, max_step, guaranteed_steps, fade_steps);
+
+                if rank_distance <= guaranteed_steps {
+                    core_possible += 1;
+                    if actual > 0.0 {
+                        core_connected += 1;
+                    }
+                } else if rank_distance < fade_steps && fade_steps > guaranteed_steps {
+                    fade_possible += 1;
+                    if actual > 0.0 {
+                        fade_connected += 1;
+                    }
+                    fade_expected += target;
+                } else {
+                    far_possible += 1;
+                    if actual > 0.0 {
+                        far_connected += 1;
+                    }
+                }
+
+                expected_degree += target;
+                absolute_error += f64::abs(actual - target);
+                comparisons += 1;
+            }
+
+            active_connected_total += active_connected.len() as f64;
+            expected_degree_total += expected_degree;
+            if comparisons > 0 {
+                target_fit_total += 1.0 - (absolute_error / comparisons as f64);
+            }
+            core_coverage_total += if core_possible == 0 {
+                1.0
+            } else {
+                core_connected as f64 / core_possible as f64
+            };
+            fade_coverage_total += if fade_possible == 0 {
+                0.0
+            } else {
+                fade_connected as f64 / fade_possible as f64
+            };
+            fade_target_total += if fade_possible == 0 {
+                0.0
+            } else {
+                fade_expected / fade_possible as f64
+            };
+            far_coverage_total += if far_possible == 0 {
+                0.0
+            } else {
+                far_connected as f64 / far_possible as f64
+            };
+        }
+
+        let active_count = sorted_active_peers.len() as f64;
+        GradientShapeMetrics {
+            avg_active_connected_peers: active_connected_total / active_count,
+            avg_expected_active_degree: expected_degree_total / active_count,
+            avg_target_fit: target_fit_total / active_count,
+            avg_core_coverage: core_coverage_total / active_count,
+            avg_fade_coverage: fade_coverage_total / active_count,
+            avg_fade_target: fade_target_total / active_count,
+            avg_far_coverage: far_coverage_total / active_count,
+        }
+    }
+
+    fn resolve_bootstrap_peers(&mut self, bootstrap_method: BootstrapMethod) -> Vec<PeerId> {
+        match bootstrap_method {
+            BootstrapMethod::Random(count) => {
+                use rand::seq::SliceRandom;
+                self.active_peer_ids()
+                    .choose_multiple(&mut self.rng, count)
+                    .copied()
+                    .collect()
+            }
+            BootstrapMethod::Specific(peer_ids) => peer_ids,
+            BootstrapMethod::None => Vec::new(),
+        }
+    }
+
+    fn select_peers(
+        &mut self,
+        selection: super::config::PeerSelection,
+        active_only: bool,
+    ) -> Vec<PeerId> {
+        use rand::seq::SliceRandom;
+
+        let mut candidates = self
+            .peers
+            .iter()
+            .filter_map(|(peer_id, peer)| {
+                if active_only && !peer.active {
+                    return None;
+                }
+                if !active_only && peer.active {
+                    return None;
+                }
+                Some(*peer_id)
+            })
+            .collect::<Vec<_>>();
+
+        match selection {
+            super::config::PeerSelection::Random { count } => {
+                candidates.shuffle(&mut self.rng);
+                candidates.truncate(count);
+                candidates
+            }
+            super::config::PeerSelection::Specific { peer_ids } => peer_ids
+                .into_iter()
+                .filter(|peer_id| candidates.contains(peer_id))
+                .collect(),
+            super::config::PeerSelection::ByQuality { count, worst } => {
+                candidates.sort_by_key(|peer_id| {
+                    self.peers
+                        .get(peer_id)
+                        .map(|peer| peer.peer_manager.num_connected())
+                        .unwrap_or(0)
+                });
+                if !worst {
+                    candidates.reverse();
+                }
+                candidates.truncate(count);
+                candidates
+            }
+            super::config::PeerSelection::ByTokenCount { count, most } => {
+                candidates.sort_by_key(|peer_id| {
+                    self.peers
+                        .get(peer_id)
+                        .map(|peer| peer.token_storage.len())
+                        .unwrap_or(0)
+                });
+                if most {
+                    candidates.reverse();
+                }
+                candidates.truncate(count);
+                candidates
+            }
+        }
     }
 
     /// Process scheduled events for the current round
@@ -1008,11 +1585,63 @@ impl PeerLifecycleRunner {
                 } => {
                     self.handle_peer_join(count, coverage_fraction, bootstrap_method, group_name);
                 }
-                // TODO: Implement other events (PeerCrash, PeerLeave, PauseElections)
-                _ => {
+                NetworkEvent::PeerCrash { selection } => {
+                    let crashed = self.select_peers(selection, true);
+                    for peer_id in &crashed {
+                        if let Some(peer) = self.peers.get_mut(peer_id) {
+                            peer.active = false;
+                        }
+                    }
                     println!(
-                        "  [Round {}] Event {:?} not yet implemented",
-                        self.current_round, event
+                        "  [Round {}] {} peers crashed",
+                        self.current_round,
+                        crashed.len()
+                    );
+                }
+                NetworkEvent::PeerLeave { selection } => {
+                    let leaving = self.select_peers(selection, true);
+                    for peer_id in &leaving {
+                        if let Some(peer) = self.peers.get_mut(peer_id) {
+                            peer.active = false;
+                        }
+                    }
+                    println!(
+                        "  [Round {}] {} peers left",
+                        self.current_round,
+                        leaving.len()
+                    );
+                }
+                NetworkEvent::PeerReturn {
+                    selection,
+                    bootstrap_method,
+                } => {
+                    let returning = self.select_peers(selection, false);
+                    let bootstrap_peers = self.resolve_bootstrap_peers(bootstrap_method);
+                    for peer_id in &returning {
+                        if let Some(peer) = self.peers.get_mut(peer_id) {
+                            peer.active = true;
+                            for known_peer_id in &bootstrap_peers {
+                                if known_peer_id != peer_id {
+                                    peer.peer_manager.add_identified_peer(
+                                        *known_peer_id,
+                                        self.current_round as EcTime,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    println!(
+                        "  [Round {}] {} peers returned",
+                        self.current_round,
+                        returning.len()
+                    );
+                }
+                NetworkEvent::PauseElections { duration } => {
+                    let until = self.current_round.saturating_add(duration);
+                    self.elections_paused_until = Some(until);
+                    println!(
+                        "  [Round {}] Peer manager ticks paused until round {}",
+                        self.current_round, until
                     );
                 }
             }
@@ -1122,7 +1751,7 @@ impl PeerLifecycleRunner {
             let peer = SimPeer {
                 peer_id: *peer_id,
                 peer_manager,
-                token_storage,
+                token_storage: SimTokenStorage::Memory(token_storage),
                 known_tokens: Vec::new(),
                 active: true,
             };
@@ -1225,7 +1854,7 @@ impl PeerLifecycleRunner {
             let peer = SimPeer {
                 peer_id,
                 peer_manager,
-                token_storage,
+                token_storage: SimTokenStorage::Memory(token_storage),
                 known_tokens,
                 active: true,
             };
@@ -1259,9 +1888,7 @@ impl PeerLifecycleRunner {
 
     /// Report current statistics (for ReportStats event)
     fn report_current_stats(&mut self, label: Option<String>) {
-        use super::stats::{
-            calculate_gradient_distribution, calculate_gradient_steepness, RoundMetrics,
-        };
+        use super::stats::{calculate_gradient_distribution, calculate_gradient_steepness};
         use std::collections::BTreeMap;
 
         let checkpoint_label = label.unwrap_or_else(|| format!("Round {}", self.current_round));
@@ -1367,6 +1994,39 @@ impl PeerLifecycleRunner {
             );
         }
 
+        let shape = self.calculate_gradient_shape_metrics();
+        println!(
+            "\n  Corrected Ring Target: fit={:.3}, active connected={:.1}, ideal={:.1}",
+            shape.avg_target_fit,
+            shape.avg_active_connected_peers,
+            shape.avg_expected_active_degree
+        );
+        println!(
+            "    Core={:.3}, fade={:.3} (target {:.3}), far leakage={:.3}",
+            shape.avg_core_coverage,
+            shape.avg_fade_coverage,
+            shape.avg_fade_target,
+            shape.avg_far_coverage
+        );
+
+        let dense_shape = self.calculate_dense_linear_shape_metrics();
+        println!(
+            "  Fixed dense-linear target: fit={:.3}, active connected={:.1}, ideal={:.1}",
+            dense_shape.avg_target_fit,
+            dense_shape.avg_active_connected_peers,
+            dense_shape.avg_expected_active_degree
+        );
+        println!(
+            "    Core={:.3}, fade={:.3} (target {:.3}), far={:.3}",
+            dense_shape.avg_core_coverage,
+            dense_shape.avg_fade_coverage,
+            dense_shape.avg_fade_target,
+            dense_shape.avg_far_coverage
+        );
+
+        self.report_referral_probe_diagnostics();
+        self.report_peer_set_hole_diagnostics();
+
         println!(
             "\n  Messages: {} total ({} queries, {} answers, {} referrals)",
             self.total_messages.queries
@@ -1459,7 +2119,7 @@ impl PeerLifecycleRunner {
                 self.config.rounds,
                 self.config.initial_state.initial_topology
             ),
-            seed_used: [0u8; 32], // TODO: Store actual seed
+            seed_used: self.seed,
             total_rounds: self.config.rounds,
             final_metrics,
             metrics_history: self.metrics_history,
