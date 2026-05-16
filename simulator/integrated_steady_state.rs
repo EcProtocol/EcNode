@@ -9,7 +9,8 @@ use ec_rust::ec_peers::AdaptiveNeighborhoodConfig;
 
 use integrated::{
     ConflictWorkloadConfig, IntegratedRunner, IntegratedSimConfig, NetworkConfig,
-    TransactionFlowConfig, TransactionSourcePolicy,
+    PeerIdLocationPatternConfig, TransactionEntryLocationConfig, TransactionFlowConfig,
+    TransactionSourcePolicy,
 };
 use peer_lifecycle::{
     InitialNetworkState, NetworkEvent, ScheduledEvent, TokenDistributionConfig, TopologyMode,
@@ -47,6 +48,29 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_location_pattern(name: &str) -> Option<Vec<u64>> {
+    let value = env::var(name).ok()?;
+    let locations = value
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                None
+            } else if let Some(hex) = trimmed.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                trimmed.parse::<u64>().ok()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if locations.is_empty() {
+        None
+    } else {
+        Some(locations)
+    }
+}
+
 fn fixed_seed(variant: u64) -> [u8; 32] {
     let mut seed = [
         0x45, 0x63, 0x68, 0x6f, 0x2d, 0x53, 0x74, 0x65, 0x61, 0x64, 0x79, 0x2d, 0x53, 0x74, 0x61,
@@ -65,6 +89,9 @@ fn main() {
     let seed_variant = env_u64("EC_STEADY_STATE_SEED_VARIANT", 0);
     let rounds = env_usize("EC_STEADY_STATE_ROUNDS", 800);
     let initial_peers = env_usize("EC_STEADY_STATE_INITIAL_PEERS", 192);
+    let peer_id_location_pattern = env_location_pattern("EC_STEADY_STATE_PEER_ID_LOCATION_PATTERN");
+    let peer_id_location_bits =
+        env_usize("EC_STEADY_STATE_PEER_ID_LOCATION_BITS", 16).min(63) as u8;
     let total_tokens = env_usize("EC_STEADY_STATE_TOTAL_TOKENS", 250_000);
     let network_profile = env_string("EC_STEADY_STATE_NETWORK_PROFILE", "cross_dc_normal");
     let topology = env_string("EC_STEADY_STATE_TOPOLOGY", "ring");
@@ -74,6 +101,11 @@ fn main() {
     let ring_linear_far_prob = env_f64("EC_STEADY_STATE_LINEAR_FAR_PROB", 0.2);
     let ring_linear_guaranteed_neighbors =
         env_usize("EC_STEADY_STATE_LINEAR_GUARANTEED_NEIGHBORS", 0);
+    let location_topology_bits =
+        env_usize("EC_STEADY_STATE_LOCATION_TOPOLOGY_BITS", 16).min(63) as u8;
+    let location_topology_center_prob =
+        env_f64("EC_STEADY_STATE_LOCATION_TOPOLOGY_CENTER_PROB", 1.0);
+    let location_topology_far_prob = env_f64("EC_STEADY_STATE_LOCATION_TOPOLOGY_FAR_PROB", 0.05);
     let neighborhood_width = env_usize("EC_STEADY_STATE_NEIGHBORHOOD_WIDTH", 6);
     let vote_target_count = env_usize("EC_STEADY_STATE_VOTE_TARGETS", 2);
     let first_vote_target_count = env_usize("EC_STEADY_STATE_FIRST_VOTE_TARGETS", 4);
@@ -83,6 +115,9 @@ fn main() {
         env_usize("EC_STEADY_STATE_VOTE_PAIRS_PER_TICK", 1).min(u8::MAX as usize) as u8;
     let adaptive_far_width = env_usize("EC_STEADY_STATE_ADAPTIVE_FAR_WIDTH", 0);
     let adaptive_hop_threshold = env_usize("EC_STEADY_STATE_ADAPTIVE_HOP_THRESHOLD", 0);
+    let entry_locations = env_usize("EC_STEADY_STATE_ENTRY_LOCATIONS", 0);
+    let entry_location_bits = env_usize("EC_STEADY_STATE_ENTRY_LOCATION_BITS", 32) as u8;
+    let entry_location_width = env_f64("EC_STEADY_STATE_ENTRY_LOCATION_WIDTH", 0.05);
     let blocks_per_round = env_usize("EC_STEADY_STATE_BLOCKS_PER_ROUND", 3);
     let block_size_min = env_usize("EC_STEADY_STATE_BLOCK_SIZE_MIN", 1).max(1);
     let block_size_max = env_usize("EC_STEADY_STATE_BLOCK_SIZE_MAX", 3).max(block_size_min);
@@ -109,6 +144,17 @@ fn main() {
     println!("Runs a fixed connected population without joins or churn.");
     println!("Seed variant: {}", seed_variant);
     println!("Initial peers: {}", initial_peers);
+    if let Some(locations) = &peer_id_location_pattern {
+        let labels = locations
+            .iter()
+            .map(|location| format!("0x{:x}", location))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "Synthetic peer-id locations: {} low bits, pattern {}",
+            peer_id_location_bits, labels
+        );
+    }
     println!("Network profile: {}", network_profile);
     println!("Topology: {}", topology);
     if topology == "ring" {
@@ -130,6 +176,11 @@ fn main() {
         println!(
             "Ring topology: full-ring linear probability, center {:.2}, far {:.2}, guaranteed ±{}",
             ring_linear_center_prob, ring_linear_far_prob, ring_linear_guaranteed_neighbors
+        );
+    } else if topology == "location_linear_probability" {
+        println!(
+            "Location topology: {} low bits, center {:.2}, far {:.2}",
+            location_topology_bits, location_topology_center_prob, location_topology_far_prob
         );
     }
     println!("Neighborhood width: {}", neighborhood_width);
@@ -168,6 +219,14 @@ fn main() {
         "Existing-token workload target: {:.0}%",
         existing_token_fraction * 100.0
     );
+    if entry_locations > 0 {
+        println!(
+            "Transaction entry locations: {} cells, {} location bits, {:.1}% cell width",
+            entry_locations,
+            entry_location_bits,
+            entry_location_width * 100.0
+        );
+    }
     println!(
         "Block parts per transaction: {}..={}",
         block_size_min, block_size_max
@@ -198,6 +257,11 @@ fn main() {
     let mut config = IntegratedSimConfig::default();
     config.seed = Some(fixed_seed(seed_variant));
     config.rounds = rounds;
+    config.peer_id_location_pattern =
+        peer_id_location_pattern.map(|locations| PeerIdLocationPatternConfig {
+            location_bits: peer_id_location_bits,
+            locations,
+        });
     config.initial_state = InitialNetworkState {
         num_peers: initial_peers,
         initial_topology: match topology.as_str() {
@@ -209,6 +273,11 @@ fn main() {
                 center_prob: ring_linear_center_prob,
                 far_prob: ring_linear_far_prob,
                 guaranteed_neighbors: ring_linear_guaranteed_neighbors,
+            },
+            "location_linear_probability" => TopologyMode::LocationLinearProbability {
+                location_bits: location_topology_bits,
+                center_prob: location_topology_center_prob,
+                far_prob: location_topology_far_prob,
             },
             "ring_core_tail" => TopologyMode::RingCoreTail {
                 neighbors: ring_neighbors,
@@ -265,6 +334,11 @@ fn main() {
         blocks_per_round,
         block_size_range: (block_size_min, block_size_max),
         source_policy: TransactionSourcePolicy::ConnectedOnly,
+        entry_locations: TransactionEntryLocationConfig {
+            locations: entry_locations,
+            location_bits: entry_location_bits,
+            cell_width_fraction: entry_location_width,
+        },
         existing_token_fraction,
         conflicts: ConflictWorkloadConfig {
             family_fraction: conflict_family_fraction,

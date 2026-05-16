@@ -34,9 +34,11 @@ fn main() {
     };
     config.network = NetworkConfig::cross_dc_normal();
     config.transactions = TransactionFlowConfig {
+        start_round: 0,
         blocks_per_round: 2,
         block_size_range: (1, 3),
         source_policy: TransactionSourcePolicy::ConnectedOnly,
+        entry_locations: Default::default(),
         existing_token_fraction: 0.0,
         conflicts: ConflictWorkloadConfig::default(),
     };

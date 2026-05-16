@@ -5,7 +5,7 @@ mod peer_lifecycle;
 use std::env;
 
 use ec_rust::ec_genesis::GenesisConfig;
-use ec_rust::ec_peers::PeerShapeTargetConfig;
+use ec_rust::ec_peers::{PeerShapeTargetConfig, PeerSmallWorldConfig};
 use peer_lifecycle::{
     EventSchedule, InitialNetworkState, NetworkEvent, PeerLifecycleConfig, PeerLifecycleRunner,
     PeerSelection, ScheduledEvent, TokenDistributionConfig, TopologyMode,
@@ -76,6 +76,20 @@ fn main() {
     let dense_shape_neighbors = env_usize("EC_PEER_LIFECYCLE_DENSE_SHAPE_NEIGHBORS", 10);
     let dense_shape_far_prob = env_f64("EC_PEER_LIFECYCLE_DENSE_SHAPE_FAR_PROB", 0.2);
     let dense_shape_hysteresis = env_usize("EC_PEER_LIFECYCLE_DENSE_SHAPE_HYSTERESIS", 4);
+    let enable_small_world = env_bool("EC_PEER_LIFECYCLE_SMALL_WORLD", false);
+    let small_world_budget = env_usize("EC_PEER_LIFECYCLE_SMALL_WORLD_BUDGET", 0);
+    let small_world_hysteresis = env_usize("EC_PEER_LIFECYCLE_SMALL_WORLD_HYSTERESIS", 16);
+    let small_world_location_bits =
+        env_usize("EC_PEER_LIFECYCLE_SMALL_WORLD_LOCATION_BITS", 32) as u8;
+    let small_world_cell_bits = env_usize("EC_PEER_LIFECYCLE_SMALL_WORLD_CELL_BITS", 0) as u8;
+    let small_world_remote_cell_target =
+        env_usize("EC_PEER_LIFECYCLE_SMALL_WORLD_REMOTE_CELL_TARGET", 0);
+    let small_world_min_local_fraction =
+        env_f64("EC_PEER_LIFECYCLE_SMALL_WORLD_MIN_LOCAL_FRACTION", 0.80);
+    let small_world_far_fraction = env_f64("EC_PEER_LIFECYCLE_SMALL_WORLD_FAR_FRACTION", 0.10);
+    let small_world_far_distance = env_f64("EC_PEER_LIFECYCLE_SMALL_WORLD_FAR_DISTANCE", 0.25);
+    let small_world_distance_exponent =
+        env_f64("EC_PEER_LIFECYCLE_SMALL_WORLD_DISTANCE_EXPONENT", 2.0);
 
     // Genesis mode: use shared genesis tokens instead of random distribution
     let enable_genesis = env_bool("EC_PEER_LIFECYCLE_GENESIS", false);
@@ -113,6 +127,25 @@ fn main() {
             center_probability: 1.0,
             far_probability: dense_shape_far_prob,
             hysteresis: dense_shape_hysteresis,
+        });
+    }
+    if enable_small_world {
+        let peer_budget = if small_world_budget > 0 {
+            small_world_budget
+        } else {
+            initial_peers.saturating_sub(1)
+        };
+        config.peer_config.shape_target = None;
+        config.peer_config.small_world = Some(PeerSmallWorldConfig {
+            peer_budget,
+            hysteresis: small_world_hysteresis,
+            location_bits: small_world_location_bits,
+            cell_bits: small_world_cell_bits,
+            remote_cell_target: small_world_remote_cell_target,
+            min_local_fraction: small_world_min_local_fraction,
+            far_fraction: small_world_far_fraction,
+            far_distance_fraction: small_world_far_distance,
+            distance_exponent: small_world_distance_exponent,
         });
     }
 
@@ -209,6 +242,20 @@ fn main() {
         println!(
             "  Dense shape target: core ±{}, far probability {:.2}, hysteresis {}",
             dense_shape_neighbors, dense_shape_far_prob, dense_shape_hysteresis
+        );
+    }
+    if let Some(small_world) = &config.peer_config.small_world {
+        println!(
+            "  Small-world target: budget {}, hysteresis {}, location bits {}, cell bits {}, remote target {}, local min {:.0}%, far {:.1}% beyond {:.2}, exponent {:.2}",
+            small_world.peer_budget,
+            small_world.hysteresis,
+            small_world.location_bits,
+            small_world.cell_bits,
+            small_world.remote_cell_target,
+            small_world.min_local_fraction * 100.0,
+            small_world.far_fraction * 100.0,
+            small_world.far_distance_fraction,
+            small_world.distance_exponent
         );
     }
     println!("  Prune protection: {}", prune_protection_time);

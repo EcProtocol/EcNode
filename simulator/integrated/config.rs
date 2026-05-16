@@ -12,11 +12,21 @@ pub struct IntegratedSimConfig {
     pub rounds: usize,
     pub seed: Option<[u8; 32]>,
     pub initial_state: InitialNetworkState,
+    pub peer_id_location_pattern: Option<PeerIdLocationPatternConfig>,
     pub token_distribution: TokenDistributionConfig,
     pub peer_config: PeerManagerConfig,
     pub events: EventSchedule,
     pub network: NetworkConfig,
     pub transactions: TransactionFlowConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerIdLocationPatternConfig {
+    /// Number of low peer-id bits overwritten by the synthetic location pattern.
+    pub location_bits: u8,
+
+    /// Low-bit location values assigned in sorted-ring order, repeating.
+    pub locations: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,11 +95,25 @@ pub struct TransactionFlowConfig {
     pub blocks_per_round: usize,
     pub block_size_range: (usize, usize),
     pub source_policy: TransactionSourcePolicy,
+    pub entry_locations: TransactionEntryLocationConfig,
     /// Fraction of block parts that should try to update an existing known token
     /// at the submitting node instead of creating a brand-new token.
     pub existing_token_fraction: f64,
     /// Adversarial conflict workload injected alongside normal traffic.
     pub conflicts: ConflictWorkloadConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionEntryLocationConfig {
+    /// Number of low-bit location cells that may submit transactions.
+    /// `0` means all eligible sources may submit.
+    pub locations: usize,
+
+    /// Number of low peer-id bits used as the location coordinate.
+    pub location_bits: u8,
+
+    /// Width of each entry cell as a fraction of the location ring.
+    pub cell_width_fraction: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +147,7 @@ impl Default for IntegratedSimConfig {
             rounds: 200,
             seed: None,
             initial_state: InitialNetworkState::default(),
+            peer_id_location_pattern: None,
             token_distribution: TokenDistributionConfig::default(),
             peer_config: PeerManagerConfig::default(),
             events: EventSchedule::default(),
@@ -145,8 +170,19 @@ impl Default for TransactionFlowConfig {
             blocks_per_round: 2,
             block_size_range: (1, 3),
             source_policy: TransactionSourcePolicy::ConnectedOnly,
+            entry_locations: TransactionEntryLocationConfig::default(),
             existing_token_fraction: 0.0,
             conflicts: ConflictWorkloadConfig::default(),
+        }
+    }
+}
+
+impl Default for TransactionEntryLocationConfig {
+    fn default() -> Self {
+        Self {
+            locations: 0,
+            location_bits: 32,
+            cell_width_fraction: 0.05,
         }
     }
 }

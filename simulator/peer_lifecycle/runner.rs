@@ -4,18 +4,16 @@ use super::config::{BootstrapMethod, PeerLifecycleConfig};
 use super::stats::*;
 use super::token_allocation::{GenesisPeerTokens, GlobalTokenMapping};
 use super::topology::{
-    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
-    build_ring_core_tail_topology, build_ring_gradient_topology,
+    build_linear_probability_ring_topology, build_location_linear_probability_topology,
+    build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+    build_ring_gradient_topology,
 };
 use ec_rust::ec_interface::{
-    BlockId, BlockTime, EcTime, MessageTicket, PeerId, TokenId, TokenMapping,
-    TOKENS_SIGNATURE_SIZE,
+    BlockId, BlockTime, EcTime, MessageTicket, PeerId, TokenId, TokenMapping, TOKENS_SIGNATURE_SIZE,
 };
 use ec_rust::ec_memory_backend::MemTokens;
 use ec_rust::ec_peers::{EcPeers, PeerAction};
-use ec_rust::ec_proof_of_storage::{
-    SignatureSearchResult, TokenStorageBackend, SIGNATURE_CHUNKS,
-};
+use ec_rust::ec_proof_of_storage::{SignatureSearchResult, TokenStorageBackend, SIGNATURE_CHUNKS};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -555,6 +553,28 @@ impl PeerLifecycleRunner {
                 }
             }
 
+            TopologyMode::LocationLinearProbability {
+                location_bits,
+                center_prob,
+                far_prob,
+            } => {
+                let adjacency = build_location_linear_probability_topology(
+                    &peer_ids,
+                    *location_bits,
+                    *center_prob,
+                    *far_prob,
+                    &mut self.rng,
+                );
+
+                for (peer_id, connected_peers) in adjacency {
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        for other_id in connected_peers {
+                            peer.peer_manager.update_peer(&other_id, 0);
+                        }
+                    }
+                }
+            }
+
             TopologyMode::RandomIdentified { peers_per_node } => {
                 // Bootstrap scenario: Each peer gets N random peers in Identified state
                 use rand::seq::SliceRandom;
@@ -654,7 +674,8 @@ impl PeerLifecycleRunner {
             TopologyMode::Ring { .. }
             | TopologyMode::RingCoreTail { .. }
             | TopologyMode::RingProbabilistic
-            | TopologyMode::RingLinearProbability { .. } => {
+            | TopologyMode::RingLinearProbability { .. }
+            | TopologyMode::LocationLinearProbability { .. } => {
                 println!("WARNING: Ring topology not realistic for genesis mode");
                 println!("         (peers don't know ring positions at genesis)");
                 println!("         Using Isolated instead (peers will discover via elections)");
@@ -996,6 +1017,7 @@ impl PeerLifecycleRunner {
                 gradient_distribution,
                 gradient_shape: Some(self.calculate_gradient_shape_metrics()),
                 dense_linear_shape: Some(self.calculate_dense_linear_shape_metrics()),
+                small_world_shape: self.calculate_small_world_shape_metrics(),
             };
         }
 
@@ -1062,6 +1084,75 @@ impl PeerLifecycleRunner {
                 }
             },
         )
+    }
+
+    fn calculate_small_world_shape_metrics(&self) -> Option<SmallWorldShapeMetrics> {
+        let small_world = self.config.peer_config.small_world.as_ref()?;
+        let active_peers = self.active_peer_ids();
+        if active_peers.is_empty() {
+            return Some(SmallWorldShapeMetrics {
+                target_far_fraction: small_world.far_fraction,
+                ..SmallWorldShapeMetrics::default()
+            });
+        }
+
+        let active_peer_set = active_peers.iter().copied().collect::<HashSet<_>>();
+        let mut total_connected = 0usize;
+        let mut total_distance = 0.0;
+        let mut total_near = 0usize;
+        let mut total_mid = 0usize;
+        let mut total_far = 0usize;
+
+        for peer_id in &active_peers {
+            let Some(peer) = self.peers.get(peer_id) else {
+                continue;
+            };
+
+            for connected_peer_id in peer.peer_manager.get_active_peers() {
+                if !active_peer_set.contains(connected_peer_id) {
+                    continue;
+                }
+
+                let distance = Self::small_world_location_distance_fraction(
+                    *peer_id,
+                    *connected_peer_id,
+                    small_world.location_bits,
+                );
+                total_connected += 1;
+                total_distance += distance;
+
+                if distance < small_world.far_distance_fraction * 0.5 {
+                    total_near += 1;
+                } else if distance < small_world.far_distance_fraction {
+                    total_mid += 1;
+                } else {
+                    total_far += 1;
+                }
+            }
+        }
+
+        let total_connected_f64 = total_connected.max(1) as f64;
+        Some(SmallWorldShapeMetrics {
+            avg_active_connected_peers: total_connected as f64 / active_peers.len() as f64,
+            avg_location_distance: total_distance / total_connected_f64,
+            avg_near_fraction: total_near as f64 / total_connected_f64,
+            avg_mid_fraction: total_mid as f64 / total_connected_f64,
+            avg_far_fraction: total_far as f64 / total_connected_f64,
+            target_far_fraction: small_world.far_fraction,
+        })
+    }
+
+    fn small_world_location_distance_fraction(a: PeerId, b: PeerId, location_bits: u8) -> f64 {
+        let bits = location_bits.clamp(1, 63);
+        let ring = if bits >= 63 { 1u64 << 63 } else { 1u64 << bits };
+        let mask = ring - 1;
+        let a = a & mask;
+        let b = b & mask;
+        let forward = b.wrapping_sub(a) & mask;
+        let backward = a.wrapping_sub(b) & mask;
+        let distance = forward.min(backward) as f64;
+        let max_distance = (ring / 2).max(1) as f64;
+        (distance / max_distance).clamp(0.0, 1.0)
     }
 
     fn dense_linear_target_probability(rank_distance: usize, max_step: usize) -> f64 {
@@ -2023,6 +2114,21 @@ impl PeerLifecycleRunner {
             dense_shape.avg_fade_target,
             dense_shape.avg_far_coverage
         );
+
+        if let Some(small_world_shape) = self.calculate_small_world_shape_metrics() {
+            println!(
+                "  Small-world location: active connected={:.1}, avg distance={:.3}",
+                small_world_shape.avg_active_connected_peers,
+                small_world_shape.avg_location_distance
+            );
+            println!(
+                "    Near={:.3}, mid={:.3}, far={:.3} (target {:.3})",
+                small_world_shape.avg_near_fraction,
+                small_world_shape.avg_mid_fraction,
+                small_world_shape.avg_far_fraction,
+                small_world_shape.target_far_fraction
+            );
+        }
 
         self.report_referral_probe_diagnostics();
         self.report_peer_set_hole_diagnostics();

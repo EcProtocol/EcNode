@@ -38,6 +38,41 @@ pub struct PeerShapeTargetConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSmallWorldConfig {
+    /// Desired connected-peer budget. Below this, nodes may grow freely.
+    pub peer_budget: usize,
+
+    /// Degree slack around `peer_budget` before pruning activates.
+    pub hysteresis: usize,
+
+    /// Number of low peer-id bits used as an experimental location coordinate.
+    pub location_bits: u8,
+
+    /// Number of high-order bits within the location coordinate used as coarse cells.
+    ///
+    /// `0` disables explicit cell-aware retention and falls back to the
+    /// aggregate far-bucket model.
+    pub cell_bits: u8,
+
+    /// Desired minimum peers to retain in each discovered remote cell.
+    ///
+    /// `0` disables explicit remote-cell quotas.
+    pub remote_cell_target: usize,
+
+    /// Minimum fraction of the peer budget reserved for the local cell.
+    pub min_local_fraction: f64,
+
+    /// Fraction of the budget reserved for distant weak ties.
+    pub far_fraction: f64,
+
+    /// Location distance fraction beyond which a peer is counted as a far tie.
+    pub far_distance_fraction: f64,
+
+    /// Larger values make pruning increasingly prefer distant peers.
+    pub distance_exponent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerManagerConfig {
     // ===== Capacity Limits =====
     /// Maximum number of Connected peers (default: 200)
@@ -162,6 +197,12 @@ pub struct PeerManagerConfig {
     /// curve, so the policy follows topology shape rather than a fixed count.
     pub shape_target: Option<PeerShapeTargetConfig>,
 
+    /// Experimental small-world retention target. This is intentionally budget
+    /// based: below the high side of the budget band, the node may connect to
+    /// every peer it can discover; above it, pruning keeps a dense local cell
+    /// plus a reserved set of far weak ties.
+    pub small_world: Option<PeerSmallWorldConfig>,
+
     // ===== Election Configuration =====
     /// Configuration for PeerElection
     pub election_config: ElectionConfig,
@@ -205,6 +246,7 @@ impl Default for PeerManagerConfig {
             connected_target_hysteresis: 0,
             elections_per_tick_above_target: None,
             shape_target: None,
+            small_world: None,
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -1424,6 +1466,60 @@ impl EcPeers {
     /// Closer peers have lower probability of being pruned
     fn prune_connected_by_distance(&mut self, time: EcTime) {
         use rand::Rng;
+        if let Some((target, high)) = self.small_world_target_bounds() {
+            if self.active.len() <= high {
+                return;
+            }
+
+            let mut candidates = self
+                .peers
+                .iter()
+                .filter_map(|(peer_id, peer)| {
+                    if let PeerState::Connected {
+                        connected_since, ..
+                    } = peer.state
+                    {
+                        self.small_world_prune_weight(*peer_id, connected_since, time)
+                            .map(|weight| (*peer_id, weight))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut to_demote = Vec::new();
+            let prune_count = self
+                .active
+                .len()
+                .saturating_sub(target)
+                .min(candidates.len());
+
+            for _ in 0..prune_count {
+                let total_weight = candidates.iter().map(|(_, weight)| *weight).sum::<f64>();
+                if total_weight <= 0.0 {
+                    break;
+                }
+
+                let mut pick = self.rng.gen_range(0.0..total_weight);
+                let mut selected_idx = 0usize;
+                for (idx, (_, weight)) in candidates.iter().enumerate() {
+                    if pick <= *weight {
+                        selected_idx = idx;
+                        break;
+                    }
+                    pick -= *weight;
+                }
+
+                to_demote.push(candidates.swap_remove(selected_idx).0);
+            }
+
+            for peer_id in to_demote {
+                self.demote_from_connected(peer_id, time);
+            }
+
+            return;
+        }
+
         if let Some((target, high)) = self.shape_target_bounds() {
             if self.active.len() <= high {
                 return;
@@ -1576,6 +1672,16 @@ impl EcPeers {
         ))
     }
 
+    fn small_world_target_bounds(&self) -> Option<(usize, usize)> {
+        let small_world = self.config.small_world.as_ref()?;
+        Some((
+            small_world.peer_budget,
+            small_world
+                .peer_budget
+                .saturating_add(small_world.hysteresis),
+        ))
+    }
+
     fn shape_target_bounds(&self) -> Option<(usize, usize)> {
         let shape = self.config.shape_target.as_ref()?;
         let target = self.shape_expected_connected_count().round() as usize;
@@ -1583,6 +1689,10 @@ impl EcPeers {
     }
 
     fn is_above_connected_target(&self) -> bool {
+        if let Some((_, high)) = self.small_world_target_bounds() {
+            return self.active.len() > high;
+        }
+
         if let Some((_, high)) = self.shape_target_bounds() {
             return self.active.len() > high;
         }
@@ -1600,6 +1710,103 @@ impl EcPeers {
         self.connected_target_bounds()
             .map(|(_, target, _)| target.div_ceil(3).max(1))
             .unwrap_or_else(|| self.config.neighborhood_width.max(1))
+    }
+
+    fn small_world_location_bits(&self) -> u8 {
+        self.config
+            .small_world
+            .as_ref()
+            .map(|small_world| small_world.location_bits.clamp(1, 63))
+            .unwrap_or(32)
+    }
+
+    fn small_world_location(&self, peer_id: PeerId) -> u64 {
+        let bits = self.small_world_location_bits();
+        let mask = if bits >= 63 {
+            u64::MAX >> 1
+        } else {
+            (1u64 << bits) - 1
+        };
+        peer_id & mask
+    }
+
+    fn small_world_location_distance_fraction(&self, peer_id: PeerId) -> f64 {
+        let bits = self.small_world_location_bits();
+        let ring = if bits >= 63 { 1u64 << 63 } else { 1u64 << bits };
+        let mine = self.small_world_location(self.peer_id);
+        let other = self.small_world_location(peer_id);
+        let forward = other.wrapping_sub(mine) & (ring - 1);
+        let backward = mine.wrapping_sub(other) & (ring - 1);
+        let distance = forward.min(backward) as f64;
+        let max_distance = (ring / 2).max(1) as f64;
+        (distance / max_distance).clamp(0.0, 1.0)
+    }
+
+    fn small_world_cell(&self, peer_id: PeerId) -> Option<u64> {
+        let small_world = self.config.small_world.as_ref()?;
+        if small_world.cell_bits == 0 || small_world.remote_cell_target == 0 {
+            return None;
+        }
+
+        let location_bits = self.small_world_location_bits();
+        let cell_bits = small_world.cell_bits.min(location_bits);
+        if cell_bits == 0 {
+            return None;
+        }
+
+        let location = self.small_world_location(peer_id);
+        Some(location >> location_bits.saturating_sub(cell_bits))
+    }
+
+    fn small_world_cell_counts(&self) -> Option<(u64, HashMap<u64, usize>)> {
+        let local_cell = self.small_world_cell(self.peer_id)?;
+        let mut counts = HashMap::new();
+        for peer_id in &self.active {
+            if let Some(cell) = self.small_world_cell(*peer_id) {
+                *counts.entry(cell).or_insert(0) += 1;
+            }
+        }
+        Some((local_cell, counts))
+    }
+
+    fn small_world_local_min(&self) -> Option<usize> {
+        let small_world = self.config.small_world.as_ref()?;
+        Some(
+            (small_world.peer_budget as f64 * small_world.min_local_fraction.clamp(0.0, 1.0)).ceil()
+                as usize,
+        )
+    }
+
+    fn small_world_remote_cell_target(&self, remote_cell_count: usize) -> Option<usize> {
+        let small_world = self.config.small_world.as_ref()?;
+        if small_world.cell_bits == 0 || small_world.remote_cell_target == 0 {
+            return None;
+        }
+
+        let local_min = self.small_world_local_min()?.min(small_world.peer_budget);
+        let remote_budget = small_world.peer_budget.saturating_sub(local_min);
+        if remote_budget == 0 {
+            return Some(0);
+        }
+
+        let budget_per_cell = (remote_budget / remote_cell_count.max(1)).max(1);
+        Some(small_world.remote_cell_target.min(budget_per_cell))
+    }
+
+    fn small_world_far_counts(&self) -> Option<(usize, usize)> {
+        let small_world = self.config.small_world.as_ref()?;
+        let far_threshold = small_world.far_distance_fraction.clamp(0.0, 1.0);
+        let connected_far = self
+            .active
+            .iter()
+            .filter(|peer_id| {
+                self.small_world_location_distance_fraction(**peer_id) >= far_threshold
+            })
+            .count();
+        let target_far = (small_world.peer_budget as f64 * small_world.far_fraction.clamp(0.0, 1.0))
+            .ceil() as usize;
+
+        Some((connected_far, target_far))
     }
 
     fn target_gradient_limits(&self) -> (usize, usize) {
@@ -1679,8 +1886,7 @@ impl EcPeers {
     fn connected_fade_fill_ratio(&self) -> (f64, f64) {
         let (core_limit, fade_limit) = self.target_gradient_limits();
         let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
-        sorted_known
-            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+        sorted_known.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
 
         // Fade band is ranks (core_limit+1) to fade_limit
         let fade_candidates: Vec<_> = sorted_known
@@ -1722,8 +1928,7 @@ impl EcPeers {
     fn far_band_excess(&self) -> (usize, usize) {
         let (_, fade_limit) = self.target_gradient_limits();
         let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
-        sorted_known
-            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+        sorted_known.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
 
         let far_candidates: Vec<_> = sorted_known
             .into_iter()
@@ -1753,8 +1958,7 @@ impl EcPeers {
     fn band_needs_discovery(&self) -> (bool, bool) {
         let (core_limit, fade_limit) = self.target_gradient_limits();
         let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
-        sorted_known
-            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+        sorted_known.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
 
         // Core band analysis
         let core_fill = self.connected_core_fill_ratio();
@@ -1780,7 +1984,8 @@ impl EcPeers {
             .filter(|peer_id| !self.is_active(peer_id))
             .filter(|peer_id| !self.active_elections.contains_key(peer_id))
             .count();
-        let fade_hole = ((fade_target - fade_fill).max(0.0) * fade_candidates.len() as f64).ceil() as usize;
+        let fade_hole =
+            ((fade_target - fade_fill).max(0.0) * fade_candidates.len() as f64).ceil() as usize;
         let fade_needs_discovery = fade_fill < fade_target * 0.9 && fade_disconnected < fade_hole;
 
         (core_needs_discovery, fade_needs_discovery)
@@ -1807,7 +2012,11 @@ impl EcPeers {
 
     /// Select challenge tokens for fade band refill.
     /// Only activates when core is healthy (>= 90%) and fade is underfilled.
-    fn fade_refill_challenge_tokens(&self, count: usize, already_selected: &[TokenId]) -> Vec<TokenId> {
+    fn fade_refill_challenge_tokens(
+        &self,
+        count: usize,
+        already_selected: &[TokenId],
+    ) -> Vec<TokenId> {
         if count == 0 {
             return Vec::new();
         }
@@ -1828,8 +2037,7 @@ impl EcPeers {
         let already_set: HashSet<_> = already_selected.iter().copied().collect();
 
         let mut sorted_known = self.peers.keys().copied().collect::<Vec<_>>();
-        sorted_known
-            .sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
+        sorted_known.sort_by_key(|peer_id| (Self::ring_distance(self.peer_id, *peer_id), *peer_id));
 
         // Select disconnected peers in fade band, prioritizing closer ones
         sorted_known
@@ -1875,8 +2083,12 @@ impl EcPeers {
             .into_iter()
             .filter(|peer_id| {
                 if let Some(info) = self.peers.get(peer_id) {
-                    if let PeerState::Connected { connected_since, .. } = info.state {
-                        return time.saturating_sub(connected_since) >= self.config.prune_protection_time;
+                    if let PeerState::Connected {
+                        connected_since, ..
+                    } = info.state
+                    {
+                        return time.saturating_sub(connected_since)
+                            >= self.config.prune_protection_time;
                     }
                 }
                 false
@@ -2025,6 +2237,68 @@ impl EcPeers {
         Some(weight.max(0.000_001))
     }
 
+    fn small_world_prune_weight(
+        &self,
+        peer_id: PeerId,
+        connected_since: EcTime,
+        time: EcTime,
+    ) -> Option<f64> {
+        let small_world = self.config.small_world.as_ref()?;
+        if time.saturating_sub(connected_since) < self.config.prune_protection_time {
+            return None;
+        }
+
+        let distance_fraction = self.small_world_location_distance_fraction(peer_id);
+        let far_threshold = small_world.far_distance_fraction.clamp(0.0, 1.0);
+        let exponent = small_world.distance_exponent.max(0.1);
+
+        if let Some(peer_cell) = self.small_world_cell(peer_id) {
+            if let Some((local_cell, counts)) = self.small_world_cell_counts() {
+                let local_count = *counts.get(&local_cell).unwrap_or(&0);
+                let local_min = self.small_world_local_min().unwrap_or(0);
+                if peer_cell == local_cell {
+                    if local_count <= local_min {
+                        return None;
+                    }
+
+                    let weight = 0.05 * distance_fraction.max(0.01).powf(exponent);
+                    return Some(weight.clamp(0.000_001, 0.25));
+                }
+
+                let remote_cell_count = counts.keys().filter(|cell| **cell != local_cell).count();
+                let target = self
+                    .small_world_remote_cell_target(remote_cell_count)
+                    .unwrap_or(0);
+                let cell_count = *counts.get(&peer_cell).unwrap_or(&0);
+                if target > 0 && cell_count <= target {
+                    return None;
+                }
+
+                let excess = if target == 0 {
+                    cell_count.max(1) as f64
+                } else {
+                    cell_count as f64 / target as f64
+                };
+                let weight = (0.25 + distance_fraction.max(0.01).powf(exponent)) * excess.powi(2);
+                return Some(weight.clamp(0.000_001, 25.0));
+            }
+        }
+
+        let (connected_far, target_far) = self.small_world_far_counts().unwrap_or((0, 0));
+
+        if distance_fraction >= far_threshold && connected_far <= target_far {
+            return Some(0.01);
+        }
+
+        let mut weight = distance_fraction.max(0.01).powf(exponent);
+        if distance_fraction >= far_threshold && connected_far > target_far {
+            let excess = connected_far as f64 / target_far.max(1) as f64;
+            weight *= (excess * excess).clamp(1.0, 100.0);
+        }
+
+        Some(weight.clamp(0.000_001, 10.0))
+    }
+
     /// Compute prune weight based on shape target and band fill levels.
     /// - Protects underfilled bands (core, fade)
     /// - Increases weight for overfilled bands (far)
@@ -2080,6 +2354,57 @@ impl EcPeers {
     }
 
     fn invitation_acceptance_probability(&self, sender_peer_id: PeerId) -> f64 {
+        if let Some(small_world) = &self.config.small_world {
+            if !self.is_above_connected_target() || self.active.is_empty() {
+                return 1.0;
+            }
+
+            let distance_fraction = self.small_world_location_distance_fraction(sender_peer_id);
+            if let Some(candidate_cell) = self.small_world_cell(sender_peer_id) {
+                if let Some((local_cell, counts)) = self.small_world_cell_counts() {
+                    let local_count = *counts.get(&local_cell).unwrap_or(&0);
+                    let local_min = self.small_world_local_min().unwrap_or(0);
+
+                    if candidate_cell == local_cell && local_count < local_min {
+                        return 1.0;
+                    }
+
+                    if candidate_cell != local_cell {
+                        let current_remote_cells =
+                            counts.keys().filter(|cell| **cell != local_cell).count();
+                        let remote_cell_count = if counts.contains_key(&candidate_cell) {
+                            current_remote_cells
+                        } else {
+                            current_remote_cells.saturating_add(1)
+                        };
+                        let target = self
+                            .small_world_remote_cell_target(remote_cell_count)
+                            .unwrap_or(0);
+                        let cell_count = *counts.get(&candidate_cell).unwrap_or(&0);
+
+                        if target > 0 && cell_count < target {
+                            return 1.0;
+                        }
+
+                        return 0.005;
+                    }
+                }
+            }
+
+            let far_threshold = small_world.far_distance_fraction.clamp(0.0, 1.0);
+            let (connected_far, target_far) = self.small_world_far_counts().unwrap_or((0, 0));
+            if distance_fraction >= far_threshold && connected_far < target_far {
+                return 1.0;
+            }
+
+            if distance_fraction >= far_threshold {
+                return 0.005;
+            }
+
+            let exponent = small_world.distance_exponent.max(0.1);
+            return (1.0 - distance_fraction).powf(exponent).clamp(0.02, 1.0);
+        }
+
         let ring_size = u64::MAX as f64 / 2.0;
         let distance = Self::ring_distance(self.peer_id, sender_peer_id) as f64;
         let distance_fraction = (distance / ring_size).clamp(0.0, 1.0);
@@ -2148,7 +2473,8 @@ impl EcPeers {
         // 2. Fade refill - when core is healthy and fade is underfilled
         let remaining_for_fade = elections_per_tick.saturating_sub(challenge_tokens.len());
         if remaining_for_fade > 0 {
-            let fade_tokens = self.fade_refill_challenge_tokens(remaining_for_fade, &challenge_tokens);
+            let fade_tokens =
+                self.fade_refill_challenge_tokens(remaining_for_fade, &challenge_tokens);
             challenge_tokens.extend(fade_tokens);
         }
 
@@ -2178,7 +2504,11 @@ impl EcPeers {
             // Use adaptive count based on need, or fall back to configured count
             let discovery_count = if needs_discovery && !legacy_discovery_enabled {
                 // Adaptive: 1-2 discovery elections when needed
-                if core_needs { 2 } else { 1 }
+                if core_needs {
+                    2
+                } else {
+                    1
+                }
             } else {
                 // Legacy: use configured count
                 self.config.random_discovery_elections_per_tick
@@ -3112,6 +3442,76 @@ mod tests {
     }
 
     #[test]
+    fn test_small_world_cell_quota_protects_underfilled_remote_cells() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(37);
+        let mut config = PeerManagerConfig::default();
+        config.prune_protection_time = 0;
+        config.small_world = Some(PeerSmallWorldConfig {
+            peer_budget: 10,
+            hysteresis: 0,
+            location_bits: 16,
+            cell_bits: 1,
+            remote_cell_target: 2,
+            min_local_fraction: 0.60,
+            far_fraction: 0.10,
+            far_distance_fraction: 0.25,
+            distance_exponent: 2.0,
+        });
+
+        let mut peers = EcPeers::with_config_and_rng(0x1_0000, config, rng);
+        for peer_id in [
+            0x1_0001, 0x1_0002, 0x1_0003, 0x1_0004, 0x1_0005, 0x1_0006, 0x1_8001, 0x1_8002,
+        ] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        assert_eq!(peers.small_world_remote_cell_target(1), Some(2));
+        assert!(peers.small_world_prune_weight(0x1_0001, 0, 100).is_none());
+        assert!(peers.small_world_prune_weight(0x1_8001, 0, 100).is_none());
+
+        peers.update_peer(&0x1_0007, 0);
+        peers.update_peer(&0x1_8003, 0);
+
+        let local = peers.small_world_prune_weight(0x1_0001, 0, 100).unwrap();
+        let remote = peers.small_world_prune_weight(0x1_8001, 0, 100).unwrap();
+        assert!(local < remote);
+    }
+
+    #[test]
+    fn test_small_world_invitation_acceptance_prefers_underfilled_remote_cell() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(41);
+        let mut config = PeerManagerConfig::default();
+        config.small_world = Some(PeerSmallWorldConfig {
+            peer_budget: 4,
+            hysteresis: 0,
+            location_bits: 16,
+            cell_bits: 1,
+            remote_cell_target: 2,
+            min_local_fraction: 0.50,
+            far_fraction: 0.10,
+            far_distance_fraction: 0.25,
+            distance_exponent: 2.0,
+        });
+
+        let mut peers = EcPeers::with_config_and_rng(0x1_0000, config, rng);
+        for peer_id in [0x1_0001, 0x1_0002, 0x1_0003, 0x1_0004, 0x1_0005] {
+            peers.update_peer(&peer_id, 0);
+        }
+
+        assert!(peers.is_above_connected_target());
+        assert_eq!(peers.invitation_acceptance_probability(0x1_8001), 1.0);
+
+        peers.update_peer(&0x1_8001, 0);
+        peers.update_peer(&0x1_8002, 0);
+
+        assert!(peers.invitation_acceptance_probability(0x1_8003) < 0.01);
+    }
+
+    #[test]
     fn test_invitation_acceptance_uses_plain_distance_when_not_above_target() {
         use rand::SeedableRng;
 
@@ -3156,6 +3556,7 @@ mod tests {
         assert_eq!(config.neighborhood_width, 4);
         assert_eq!(config.vote_target_count, 2);
         assert!(config.adaptive_neighborhood.is_none());
+        assert!(config.small_world.is_none());
         assert!(config.enable_request_batching);
         assert!(!config.batch_vote_replies);
         assert_eq!(config.vote_balance_threshold, VOTE_THRESHOLD);

@@ -9,6 +9,51 @@
 
 ---
 
+## 2026-05-11 Small-World Update
+
+The fixed-topology simulator now gives a sharper target for peer retention than
+the earlier single dense-linear ring shape. In the location-aware two-cell runs,
+a fully dense local cell plus a small quota of cross-cell links kept local commit
+latency low while still spreading committed information to the other cell. The
+important failure case was also clear: a cell with no cross links can look fast,
+but it is only fast because information is trapped locally.
+
+For `src/ec_peers.rs`, this means peer management should be read as two phases:
+
+- **Grow to budget first**: while below `peer_budget + hysteresis`, a node should
+  connect to useful peers it can discover. The current small-world mode already
+  follows this rule.
+- **Prune toward a cell-aware shape**: once above the budget band, pruning should
+  preserve dense same-cell connectivity and a nonzero quota of links into each
+  remote location cell. The current implementation has only one aggregate far
+  bucket (`far_fraction` beyond `far_distance_fraction`), which is not enough to
+  guarantee remote-cell coverage.
+
+The next target for election/admission/pruning is therefore:
+
+- define a coarse location cell from the low peer-id bits
+- protect same-cell peers unless the local cell is already dense
+- keep a small minimum count per discovered remote cell, subject to budget
+- accept invitations from underfilled remote cells even when they are distant
+- prefer pruning peers from overfilled remote cells before pruning local or
+  underfilled-cell peers
+
+The current `far_fraction` model remains useful as a compatibility and baseline
+mode, but the experimental small-world path should move toward explicit
+`cell_bits` and per-cell remote quotas. The two-cell fixed run suggests that, at
+300 peers per cell, roughly six cross-cell peers per node was enough to make
+cross-cell settlement reliable without giving up the fast local path.
+
+One practical consequence is that the peers forming the first local commit quorum
+should also have lower-than-average RTT. Election channels already record
+`sent_at` and response `received_at`, so successful `Answer` messages can update
+a responsiveness score for the responder and/or first-hop peer. That score should
+be used only after the topology constraints are met: it can choose between peers
+inside the same local or remote-cell bucket, but it should not replace storage
+proofs or remote-cell coverage.
+
+---
+
 ## 2026-04-27 Lifecycle Update
 
 The election protocol is still the same challenge/answer/referral mechanism, but

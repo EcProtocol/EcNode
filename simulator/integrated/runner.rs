@@ -18,15 +18,17 @@ use ec_rust::ec_proof_of_storage::TokenStorageBackend;
 use crate::integrated::{
     ConflictLineageSummary, ConflictWorkloadSummary, DistributionSummary, FloatDistributionSummary,
     IntegratedSimConfig, MempoolPressureSummary, MessageTypeBreakdown, NeighborhoodBucketSummary,
-    NeighborhoodSummary, OnboardingSummary, RecoverySummary, RoundMetrics, SimResult,
-    TransactionCategorySummary, TransactionSourcePolicy, TransactionSpreadSummary,
-    TransactionWorkloadSummary, VoteIngressSummary,
+    NeighborhoodSummary, OnboardingSummary, PeerIdLocationPatternConfig, RecoverySummary,
+    RoundMetrics, SimResult, TransactionCategorySummary, TransactionEntryLocationConfig,
+    TransactionSourcePolicy, TransactionSpreadSummary, TransactionWorkloadSummary,
+    VoteIngressSummary,
 };
 use crate::peer_lifecycle::stats::calculate_gradient_steepness;
 use crate::peer_lifecycle::token_allocation::GenesisTokenSet;
 use crate::peer_lifecycle::topology::{
-    build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
-    build_ring_core_tail_topology, build_ring_gradient_topology,
+    build_linear_probability_ring_topology, build_location_linear_probability_topology,
+    build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+    build_ring_gradient_topology,
 };
 use crate::peer_lifecycle::{
     BootstrapMethod, GlobalTokenMapping, NetworkEvent, PeerSelection, ScheduledEvent, TopologyMode,
@@ -54,6 +56,7 @@ struct TrackedBlock {
     ideal_coalesced_lower_bound_messages: usize,
     delivered_block_messages: usize,
     touched_peers: HashSet<PeerId>,
+    touched_locations: HashSet<u64>,
 }
 
 struct ConflictFamily {
@@ -116,6 +119,7 @@ struct TransactionSpreadAccumulator {
     ideal_role_sum_lower_bound_messages: Vec<usize>,
     ideal_coalesced_lower_bound_messages: Vec<usize>,
     settled_peer_spread: Vec<usize>,
+    settled_location_spread: Vec<usize>,
     settled_block_messages: Vec<usize>,
     actual_to_role_sum_ratio: Vec<f64>,
     actual_to_coalesced_ratio: Vec<f64>,
@@ -411,6 +415,7 @@ impl IntegratedRunner {
                 .expect("Failed to allocate peer ID for integrated simulation");
             peer_ids.push(peer_id);
         }
+        self.apply_peer_id_location_pattern(&mut peer_ids);
 
         for &peer_id in &peer_ids {
             let peer = self.create_peer(
@@ -446,6 +451,68 @@ impl IntegratedRunner {
             TokenSpace::Random(mapping) => mapping.peer_count(),
             TokenSpace::Genesis(set) => set.peer_count(),
         }
+    }
+
+    fn apply_peer_id_location_pattern(&mut self, peer_ids: &mut Vec<PeerId>) {
+        let Some(pattern) = self.config.peer_id_location_pattern.clone() else {
+            return;
+        };
+        let rewrites = Self::rewrite_peer_ids_for_location_pattern(peer_ids, &pattern);
+        if rewrites.is_empty() {
+            return;
+        }
+
+        let rewrite_map = rewrites.iter().copied().collect::<BTreeMap<_, _>>();
+        for peer_id in peer_ids {
+            if let Some(new_peer_id) = rewrite_map.get(peer_id) {
+                *peer_id = *new_peer_id;
+            }
+        }
+
+        match &mut self.token_space {
+            TokenSpace::Random(mapping) => mapping.rewrite_allocated_peer_ids(&rewrites),
+            TokenSpace::Genesis(set) => set.rewrite_allocated_peer_ids(&rewrites),
+        }
+    }
+
+    fn rewrite_peer_ids_for_location_pattern(
+        peer_ids: &[PeerId],
+        pattern: &PeerIdLocationPatternConfig,
+    ) -> Vec<(PeerId, PeerId)> {
+        if peer_ids.is_empty() || pattern.locations.is_empty() {
+            return Vec::new();
+        }
+
+        let bits = pattern.location_bits.clamp(1, 63);
+        let low_mask = if bits >= 63 {
+            u64::MAX >> 1
+        } else {
+            (1u64 << bits) - 1
+        };
+        let high_mask = !low_mask;
+        let mut sorted_peer_ids = peer_ids.to_vec();
+        sorted_peer_ids.sort_unstable();
+
+        let mut used = HashSet::with_capacity(sorted_peer_ids.len());
+        let mut rewrites = Vec::new();
+        for (idx, old_peer_id) in sorted_peer_ids.into_iter().enumerate() {
+            let location = pattern.locations[idx % pattern.locations.len()] & low_mask;
+            let mut candidate = (old_peer_id & high_mask) | location;
+            let mut attempts = 0u64;
+            while (candidate == 0 || used.contains(&candidate)) && attempts < 1024 {
+                attempts += 1;
+                let shifted = attempts.wrapping_shl(bits as u32);
+                let high = old_peer_id.wrapping_add(shifted) & high_mask;
+                candidate = high | location;
+            }
+
+            if candidate != old_peer_id {
+                rewrites.push((old_peer_id, candidate));
+            }
+            used.insert(candidate);
+        }
+
+        rewrites
     }
 
     fn view_width(&self, num_peers: usize) -> u64 {
@@ -617,6 +684,17 @@ impl IntegratedRunner {
                 *guaranteed_neighbors,
                 &mut self.rng,
             )),
+            TopologyMode::LocationLinearProbability {
+                location_bits,
+                center_prob,
+                far_prob,
+            } => Some(build_location_linear_probability_topology(
+                &sorted_peer_ids,
+                *location_bits,
+                *center_prob,
+                *far_prob,
+                &mut self.rng,
+            )),
             _ => None,
         };
 
@@ -640,7 +718,8 @@ impl IntegratedRunner {
                 TopologyMode::Ring { .. }
                 | TopologyMode::RingCoreTail { .. }
                 | TopologyMode::RingProbabilistic
-                | TopologyMode::RingLinearProbability { .. } => ring_adjacency
+                | TopologyMode::RingLinearProbability { .. }
+                | TopologyMode::LocationLinearProbability { .. } => ring_adjacency
                     .as_ref()
                     .and_then(|adjacency| adjacency.get(&peer_id))
                     .cloned()
@@ -975,6 +1054,9 @@ impl IntegratedRunner {
                     .settled_peer_spread
                     .push(tracked.touched_peers.len());
                 self.transaction_spread
+                    .settled_location_spread
+                    .push(tracked.touched_locations.len());
+                self.transaction_spread
                     .settled_block_messages
                     .push(tracked.delivered_block_messages);
                 self.transaction_spread
@@ -1025,7 +1107,45 @@ impl IntegratedRunner {
                     .is_some_and(|peer| peer.node.num_connected_peers() > 0)
             });
         }
-        sources
+        self.filter_transaction_sources_by_entry_location(sources)
+    }
+
+    fn filter_transaction_sources_by_entry_location(&self, sources: Vec<PeerId>) -> Vec<PeerId> {
+        let entry = &self.config.transactions.entry_locations;
+        if entry.locations == 0 || sources.is_empty() {
+            return sources;
+        }
+
+        let filtered = sources
+            .iter()
+            .copied()
+            .filter(|peer_id| Self::is_in_entry_location(*peer_id, entry))
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            sources
+        } else {
+            filtered
+        }
+    }
+
+    fn is_in_entry_location(peer_id: PeerId, entry: &TransactionEntryLocationConfig) -> bool {
+        let bits = entry.location_bits.clamp(1, 63);
+        let ring = if bits >= 63 { 1u64 << 63 } else { 1u64 << bits };
+        let mask = ring - 1;
+        let location = peer_id & mask;
+        let cell_width =
+            ((ring as f64) * entry.cell_width_fraction.clamp(0.000_001, 1.0)).ceil() as u64;
+
+        for idx in 0..entry.locations.max(1) {
+            let anchor = ((idx as u128 * ring as u128) / entry.locations.max(1) as u128) as u64;
+            let forward = location.wrapping_sub(anchor) & mask;
+            let backward = anchor.wrapping_sub(location) & mask;
+            if forward.min(backward) <= cell_width / 2 {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn entry_hop_bucket(entry_hops: usize) -> usize {
@@ -1235,6 +1355,8 @@ impl IntegratedRunner {
             return;
         }
 
+        let sender_location = self.peer_location(envelope.sender);
+        let receiver_location = self.peer_location(envelope.receiver);
         for block_id in block_ids {
             let Some(tracked) = self.tracked_blocks.get_mut(&block_id) else {
                 continue;
@@ -1243,7 +1365,24 @@ impl IntegratedRunner {
             tracked.delivered_block_messages += 1;
             tracked.touched_peers.insert(envelope.sender);
             tracked.touched_peers.insert(envelope.receiver);
+            tracked.touched_locations.insert(sender_location);
+            tracked.touched_locations.insert(receiver_location);
         }
+    }
+
+    fn peer_location(&self, peer_id: PeerId) -> u64 {
+        let bits = self
+            .config
+            .transactions
+            .entry_locations
+            .location_bits
+            .clamp(1, 63);
+        let mask = if bits >= 63 {
+            u64::MAX >> 1
+        } else {
+            (1u64 << bits) - 1
+        };
+        peer_id & mask
     }
 
     fn record_conflict_signal_delivery(&mut self, envelope: &MessageEnvelope) {
@@ -1571,6 +1710,8 @@ impl IntegratedRunner {
             peer.node.submit_local_block(&block, &mut local_outbound);
             let mut touched_peers = HashSet::new();
             touched_peers.insert(target);
+            let mut touched_locations = HashSet::new();
+            touched_locations.insert(self.peer_location(target));
             self.tracked_blocks.insert(
                 block.id,
                 TrackedBlock {
@@ -1583,6 +1724,7 @@ impl IntegratedRunner {
                     ideal_coalesced_lower_bound_messages,
                     delivered_block_messages: 0,
                     touched_peers,
+                    touched_locations,
                 },
             );
             self.transaction_categories
@@ -2979,6 +3121,9 @@ impl IntegratedRunner {
                 ),
                 settled_peer_spread: DistributionSummary::from_samples(
                     &self.transaction_spread.settled_peer_spread,
+                ),
+                settled_location_spread: DistributionSummary::from_samples(
+                    &self.transaction_spread.settled_location_spread,
                 ),
                 settled_block_messages: DistributionSummary::from_samples(
                     &self.transaction_spread.settled_block_messages,

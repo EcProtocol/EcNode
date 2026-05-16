@@ -140,6 +140,9 @@ pub struct NetworkHealth {
 
     /// Fixed dense-linear target metrics matching the strongest fixed-network reports.
     pub dense_linear_shape: Option<GradientShapeMetrics>,
+
+    /// Experimental low-bit-location small-world diagnostics.
+    pub small_world_shape: Option<SmallWorldShapeMetrics>,
 }
 
 /// Quality score metrics
@@ -262,6 +265,27 @@ pub struct GradientShapeMetrics {
 
     /// Fraction of peers beyond the target fade band that are connected.
     pub avg_far_coverage: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SmallWorldShapeMetrics {
+    /// Average connected peers that are also active.
+    pub avg_active_connected_peers: f64,
+
+    /// Average normalized low-bit location distance across connected peers.
+    pub avg_location_distance: f64,
+
+    /// Fraction of connected peers within the local cell.
+    pub avg_near_fraction: f64,
+
+    /// Fraction of connected peers in the middle-distance band.
+    pub avg_mid_fraction: f64,
+
+    /// Fraction of connected peers counted as far weak ties.
+    pub avg_far_fraction: f64,
+
+    /// Configured target far weak-tie fraction.
+    pub target_far_fraction: f64,
 }
 
 impl Default for GradientSteepnessDistribution {
@@ -393,6 +417,7 @@ impl RoundMetrics {
                 gradient_distribution: None,
                 gradient_shape: None,
                 dense_linear_shape: None,
+                small_world_shape: None,
             },
             quality_metrics: QualityMetrics {
                 min_quality: 0.0,
@@ -588,6 +613,22 @@ impl SimulationResult {
                 shape.avg_fade_coverage,
                 shape.avg_fade_target,
                 shape.avg_far_coverage
+            );
+            println!();
+        }
+
+        if let Some(ref shape) = self.final_metrics.network_health.small_world_shape {
+            println!("═══ Small-World Location Shape ═══");
+            println!(
+                "  Active Connected: avg={:.1}, avg location distance={:.3}",
+                shape.avg_active_connected_peers, shape.avg_location_distance
+            );
+            println!(
+                "  Bands: near={:.3}, mid={:.3}, far={:.3} (target {:.3})",
+                shape.avg_near_fraction,
+                shape.avg_mid_fraction,
+                shape.avg_far_fraction,
+                shape.target_far_fraction
             );
             println!();
         }

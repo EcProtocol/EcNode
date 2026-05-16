@@ -267,6 +267,7 @@ pub struct TransactionSpreadSummary {
     pub ideal_role_sum_lower_bound_messages: Option<DistributionSummary>,
     pub ideal_coalesced_lower_bound_messages: Option<DistributionSummary>,
     pub settled_peer_spread: Option<DistributionSummary>,
+    pub settled_location_spread: Option<DistributionSummary>,
     pub settled_block_messages: Option<DistributionSummary>,
     pub actual_to_role_sum_ratio: Option<FloatDistributionSummary>,
     pub actual_to_coalesced_ratio: Option<FloatDistributionSummary>,
@@ -847,6 +848,12 @@ impl SimResult {
         if let Some(spread) = &self.transaction_spread.settled_peer_spread {
             println!(
                 "Settled peer spread: avg {:.1} peers, p50 {}, p95 {}, min {}, max {}",
+                spread.avg, spread.p50, spread.p95, spread.min, spread.max,
+            );
+        }
+        if let Some(spread) = &self.transaction_spread.settled_location_spread {
+            println!(
+                "Settled location spread: avg {:.1} locations, p50 {}, p95 {}, min {}, max {}",
                 spread.avg, spread.p50, spread.p95, spread.min, spread.max,
             );
         }

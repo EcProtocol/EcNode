@@ -221,6 +221,20 @@ impl GlobalTokenMapping {
         &self.allocated_peer_ids
     }
 
+    /// Replace allocated peer IDs for synthetic simulator experiments.
+    ///
+    /// The rewritten IDs are inserted into the token mapping so they remain
+    /// discoverable peer-id tokens.
+    pub fn rewrite_allocated_peer_ids(&mut self, rewrites: &[(PeerId, PeerId)]) {
+        for (old_peer_id, new_peer_id) in rewrites {
+            self.allocated_peer_ids.remove(old_peer_id);
+            self.allocated_peer_ids.insert(*new_peer_id);
+            if !self.mappings.contains_key(new_peer_id) {
+                self.mappings.insert(*new_peer_id, self.rng.gen());
+            }
+        }
+    }
+
     /// Get count of allocated peer IDs
     pub fn peer_count(&self) -> usize {
         self.allocated_peer_ids.len()
@@ -543,6 +557,17 @@ impl GenesisTokenSet {
     /// Get all allocated peer IDs
     pub fn allocated_peer_ids(&self) -> &HashSet<PeerId> {
         &self.allocated_peer_ids
+    }
+
+    /// Replace allocated peer IDs for synthetic simulator experiments.
+    pub fn rewrite_allocated_peer_ids(&mut self, rewrites: &[(PeerId, PeerId)]) {
+        for (old_peer_id, new_peer_id) in rewrites {
+            self.allocated_peer_ids.remove(old_peer_id);
+            self.allocated_peer_ids.insert(*new_peer_id);
+            if !self.token_ids.contains(new_peer_id) {
+                self.token_ids.push(*new_peer_id);
+            }
+        }
     }
 
     /// Get count of all genesis tokens

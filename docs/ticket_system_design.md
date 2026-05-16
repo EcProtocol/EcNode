@@ -309,6 +309,28 @@ Production systems use full Blake3 output:
 
 Provides $2^{256}$ security against brute force attacks.
 
+### RTT Measurement
+
+Tickets also provide a clean request/response correlation point for measuring
+peer responsiveness. Because the requester generates the ticket and accepts only
+responses that return a valid ticket, a successful `Block` response can be
+matched to the time the request was sent.
+
+There are two implementation options:
+
+- **Simulation/current `u64` tickets**: keep a local pending-ticket table keyed
+  by ticket, with `sent_at`, requested block id, use case, and first-hop peer.
+  When `validate_ticket` succeeds, compute `now - sent_at` and update a peer
+  responsiveness score.
+- **Production full-width tickets**: keep the ticket externally opaque but
+  include an encrypted or MAC-protected issue timestamp in part of the ticket.
+  The issuer can recover the send time when the ticket returns, while other peers
+  learn nothing useful from the ticket contents.
+
+The RTT score is a service-quality signal. It should help rank otherwise valid
+peers and candidates, but it should not by itself make an invalid block,
+insufficient proof-of-storage answer, or under-covered topology bucket acceptable.
+
 ## Mathematical Summary
 
 | Property | Security Bound |

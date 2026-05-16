@@ -11,8 +11,8 @@ pub mod runner;
 pub mod stats;
 
 pub use config::{
-    ConflictWorkloadConfig, IntegratedSimConfig, NetworkConfig, TransactionFlowConfig,
-    TransactionSourcePolicy,
+    ConflictWorkloadConfig, IntegratedSimConfig, NetworkConfig, PeerIdLocationPatternConfig,
+    TransactionEntryLocationConfig, TransactionFlowConfig, TransactionSourcePolicy,
 };
 pub use runner::IntegratedRunner;
 pub use stats::{

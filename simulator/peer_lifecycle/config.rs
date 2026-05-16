@@ -95,6 +95,16 @@ pub enum TopologyMode {
         guaranteed_neighbors: usize,
     },
 
+    /// Symmetric location-gradient topology.
+    /// Connection probability is based on low peer-id bits rather than sorted
+    /// full-ring rank. This is useful for synthetic cell experiments where
+    /// the low bits are stamped to known locations.
+    LocationLinearProbability {
+        location_bits: u8,
+        center_prob: f64,
+        far_prob: f64,
+    },
+
     /// Symmetric ring topology with a dense local core and a small evenly spaced tail.
     /// The closest ±neighbors stay steep and local, while `tail_peers_per_side`
     /// adds a flat routing base across the rest of the ring.

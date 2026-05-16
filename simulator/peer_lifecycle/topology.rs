@@ -264,6 +264,69 @@ pub fn build_linear_probability_ring_topology(
         .collect()
 }
 
+/// Build a symmetric topology from low-bit location distance.
+///
+/// This is intentionally synthetic. It lets fixed-network experiments model
+/// multiple dense location cells even when the full peer-id ring is small.
+/// Peers with equal low-bit locations connect with `center_prob`; peers on the
+/// opposite side of the low-bit location ring connect with `far_prob`.
+pub fn build_location_linear_probability_topology(
+    peer_ids: &[PeerId],
+    location_bits: u8,
+    center_prob: f64,
+    far_prob: f64,
+    rng: &mut StdRng,
+) -> HashMap<PeerId, Vec<PeerId>> {
+    let mut adjacency: HashMap<PeerId, BTreeSet<PeerId>> = peer_ids
+        .iter()
+        .copied()
+        .map(|peer_id| (peer_id, BTreeSet::new()))
+        .collect();
+
+    if peer_ids.len() < 2 {
+        return adjacency
+            .into_iter()
+            .map(|(peer_id, peers)| (peer_id, peers.into_iter().collect()))
+            .collect();
+    }
+
+    let bits = location_bits.clamp(1, 63);
+    let ring = if bits >= 63 { 1u64 << 63 } else { 1u64 << bits };
+    let mask = ring - 1;
+    let center_prob = center_prob.clamp(0.0, 1.0);
+    let far_prob = far_prob.clamp(0.0, center_prob);
+
+    for i in 0..peer_ids.len() {
+        for j in (i + 1)..peer_ids.len() {
+            let left = peer_ids[i] & mask;
+            let right = peer_ids[j] & mask;
+            let forward = right.wrapping_sub(left) & mask;
+            let backward = left.wrapping_sub(right) & mask;
+            let distance = forward.min(backward) as f64;
+            let max_distance = (ring / 2).max(1) as f64;
+            let distance_fraction = (distance / max_distance).clamp(0.0, 1.0);
+            let probability =
+                (center_prob + ((far_prob - center_prob) * distance_fraction)).clamp(0.0, 1.0);
+
+            if rng.gen_bool(probability) {
+                adjacency
+                    .get_mut(&peer_ids[i])
+                    .expect("peer should exist")
+                    .insert(peer_ids[j]);
+                adjacency
+                    .get_mut(&peer_ids[j])
+                    .expect("peer should exist")
+                    .insert(peer_ids[i]);
+            }
+        }
+    }
+
+    adjacency
+        .into_iter()
+        .map(|(peer_id, peers)| (peer_id, peers.into_iter().collect()))
+        .collect()
+}
+
 fn evenly_spaced_tail_offsets(
     fade_steps: usize,
     max_step: usize,
@@ -292,8 +355,9 @@ mod tests {
     use rand::SeedableRng;
 
     use super::{
-        build_linear_probability_ring_topology, build_probabilistic_ring_gradient_topology,
-        build_ring_core_tail_topology, build_ring_gradient_topology,
+        build_linear_probability_ring_topology, build_location_linear_probability_topology,
+        build_probabilistic_ring_gradient_topology, build_ring_core_tail_topology,
+        build_ring_gradient_topology,
     };
 
     #[test]
@@ -420,5 +484,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn location_linear_probability_topology_groups_low_bit_cells() {
+        let peer_ids = vec![0x1000_0000, 0x2000_0000, 0x3000_8000, 0x4000_8000];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(29);
+        let adjacency =
+            build_location_linear_probability_topology(&peer_ids, 16, 1.0, 0.0, &mut rng);
+
+        assert!(adjacency[&0x1000_0000].contains(&0x2000_0000));
+        assert!(adjacency[&0x3000_8000].contains(&0x4000_8000));
+        assert!(!adjacency[&0x1000_0000].contains(&0x3000_8000));
+        assert!(!adjacency[&0x2000_0000].contains(&0x4000_8000));
     }
 }
