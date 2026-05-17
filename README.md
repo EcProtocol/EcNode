@@ -2,6 +2,11 @@
 
 **EC Protocol** is an experimental distributed coordination protocol for shared state — without crypto tokens, without global consensus, with a bounded retention horizon, and with locality-driven scaling.
 
+Think of a limited Distributed Hash Table you can trust. Providing basically 3 globally available operations:
+- Bind a public key to a 256 bit opaque `token`. And if the `token` already exist - provide a signature by the current public key to change it.
+- Lookup the last `transaction` to change a `token`.
+- Lookup a `transaction`.
+
 This repository contains the **reference node implementation** (`EcNode`), written in Rust, together with the protocol design documents and a simulator used to validate behaviour under realistic network conditions.
 
 > *Many independent operators coordinate shared records. Each token lives in a local neighbourhood, not on a global ledger. Safety comes from user signatures. Conflicts stay publicly visible. Rewriting history is cryptographically self-incriminating. All state has a known expiry.*
@@ -284,7 +289,7 @@ Contributing:
 
 ---
 
-## Why no token?
+## Why no crypto-token?
 
 Deliberate. EC Protocol assumes:
 
