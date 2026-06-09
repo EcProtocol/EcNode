@@ -12,6 +12,7 @@ A repo-local draft exists at [skills/ec-doc-maintainer/SKILL.md](../../skills/ec
 
 - The draft has not yet been exercised after a substantive code change.
 - The topic-development workflow should be validated with a real session where the agent source-maps first, interviews the requester, and only then edits.
+- New-topic work must stay in interview mode until the requester explicitly says to proceed.
 - Need to decide whether the skill should include scripts for link checking or freshness checks.
 
 ## Primary Files
@@ -31,6 +32,8 @@ Responsibilities:
 
 - Inspect touched files and identify related agent docs.
 - For topic-development sessions, build a source map and interview the requester before drafting substantive content.
+- Present evidence from highest abstraction downward and ask whether the requester sees it the same way.
+- Keep asking for supporting documents, comments, and corrections until the requester says to proceed.
 - Treat existing unstaged doc edits as unconfirmed draft material until the requester accepts the assumptions.
 - Check whether protocol goal, current status, and known gaps still match the change.
 - Update source-material links when new docs or reports are created.

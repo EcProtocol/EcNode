@@ -8,7 +8,7 @@ Keep repository knowledge current enough that agents can work from the repo with
 
 `agent-docs/` is the primary agent knowledge base. Older docs remain source material until distilled, moved, or deleted.
 
-Topic-development sessions should be requester-driven: source-map relevant code/docs/reports first, interview the requester about intent and source trust, then draft or edit after scope is clear.
+Topic-development sessions should be requester-driven: source-map relevant code/docs/reports first, present evidence from highest abstraction downward, interview the requester about intent and source trust, and keep asking for supporting documents or corrections until the requester explicitly says to proceed.
 
 ## Known Gaps
 
@@ -29,4 +29,4 @@ Topic-development sessions should be requester-driven: source-map relevant code/
 
 After changing an area, check the matching `agent-docs/` topic and update `OPEN_ISSUES.md` when implementation and goals diverge.
 
-When filling a topic from scratch, avoid writing what merely sounds right. Label proposed design text as proposed until the requester confirms it.
+When filling a topic from scratch, avoid writing what merely sounds right. Do not edit topic docs before the requester says to proceed. Label proposed design text as proposed until the requester confirms it.

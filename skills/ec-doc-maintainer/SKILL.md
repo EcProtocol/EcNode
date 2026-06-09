@@ -1,6 +1,6 @@
 ---
 name: ec-doc-maintainer
-description: Use when maintaining echo-consent agent docs or after changing protocol, simulator, API, security, architecture, or docs. The workflow is requester-driven: source-map first, interview before drafting, then update repo-local agent docs, evidence notes, and open issues.
+description: Use when maintaining echo-consent agent docs or after changing protocol, simulator, API, security, architecture, or docs. For new topics this is a hard-gated requester-driven workflow: gather evidence, present it from highest abstraction downward, ask for requester confirmation and more sources, and do not edit topic docs until the requester explicitly says to proceed.
 ---
 
 # ec-doc-maintainer
@@ -11,6 +11,36 @@ Use this skill for two modes:
 - **Topic-development mode**: when asked to flesh out an `agent-docs/` topic or resolve an `OPEN_ISSUES.md` item.
 
 Topic-development mode is requester-driven. Do not start by filling pages with plausible protocol text. Start by finding source material, interviewing the requester, and agreeing on scope.
+
+## Hard Gate For New Topics
+
+When working on a new topic, unresolved `OPEN_ISSUES.md` item, or underdeveloped `agent-docs/` page, you MUST stay in interview mode until the requester explicitly says to proceed.
+
+Do not treat any of these as permission to draft topic docs:
+
+- "start"
+- "look at"
+- "work on"
+- "flesh out"
+- "use the skill"
+- "take the first open issue"
+
+Only proceed to substantive edits when the requester says something clearly equivalent to:
+
+- "proceed"
+- "write it"
+- "make the edits"
+- "apply that structure"
+- "yes, capture this"
+
+Before that explicit proceed signal, the allowed output is:
+
+1. A source map.
+2. An evidence summary from highest abstraction to lowest.
+3. Questions asking whether the requester sees it the same way.
+4. Requests for additional supporting documents, comments, or corrections.
+
+Do not edit topic docs, `OPEN_ISSUES.md`, or design summaries while still in interview mode. The only exception is when the user is explicitly asking to change this skill or the documentation process itself.
 
 ## Workflow
 
@@ -28,30 +58,39 @@ Topic-development mode is requester-driven. Do not start by filling pages with p
    - Existing `agent-docs/` pages.
    - Relevant `docs/`, `Design/`, simulator reports, scenarios, tests, and notes.
    - Known stale or conflicting sources.
-5. Interview the requester before substantive writing. Ask concise questions about goals, non-goals, source trust, terminology, and unresolved design choices.
-6. Stop after the source map and interview unless the requester has clearly asked you to proceed with edits in the same turn.
-7. When editing, mark claims by status where needed:
+5. Present evidence from highest abstraction downward:
+   - Protocol pillar or user goal.
+   - Current top-level docs and source-of-truth status.
+   - Existing agent-doc topic state.
+   - Current implementation files and tests.
+   - Simulator evidence and reports.
+   - Notes and open questions.
+6. Interview the requester before substantive writing. Ask whether they see the abstraction/evidence stack the same way and whether they have other supporting documents, comments, or corrections.
+7. Continue asking and refining the source map until the requester explicitly says to proceed. Do not collapse silence, partial answers, or agreement with one point into permission to edit.
+8. When editing, mark claims by status where needed:
    - Protocol goal
    - Current implementation
    - Requester-confirmed design
    - Inference from code/reports
    - Open question
-8. For each affected topic doc, check whether these sections still match:
+9. When the requester has explicitly said to proceed, edit only within the agreed scope.
+10. For each affected topic doc, check whether these sections still match:
    - Protocol Goal
    - Current Status
    - Known Gaps
    - Primary Files
    - Source Material
    - Agent Notes
-9. Update `OPEN_ISSUES.md` when a known gap is closed, newly discovered, or clarified.
-10. For simulator changes, update `agent-docs/simulator/evidence-index.md` or `operations-development.md` when evidence, commands, scenarios, or reproducibility expectations change.
-11. For security-relevant changes, update `SECURITY.md` and the matching topic doc.
-12. Preserve distinctions between protocol goals, current implementation, empirical reports, and historical source material.
+11. Update `OPEN_ISSUES.md` when a known gap is closed, newly discovered, or clarified.
+12. For simulator changes, update `agent-docs/simulator/evidence-index.md` or `operations-development.md` when evidence, commands, scenarios, or reproducibility expectations change.
+13. For security-relevant changes, update `SECURITY.md` and the matching topic doc.
+14. Preserve distinctions between protocol goals, current implementation, empirical reports, and historical source material.
 
 ## Rules
 
 - Keep docs short and current.
 - Keep the requester in control of protocol/design meaning.
+- In topic-development mode, asking questions is not optional. Keep asking until the requester says to proceed.
 - Do not invent API names, status categories, threat properties, or protocol guarantees as facts.
 - When proposing text, label it as proposed until the requester confirms it.
 - Do not add schedules, rollout plans, or date-based roadmaps to design docs.
