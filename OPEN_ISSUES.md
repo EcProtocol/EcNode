@@ -4,9 +4,11 @@ This file collects open design questions, implementation gaps, smaller engineeri
 
 ## Protocol/API Surface
 
-- Design the future client/node API surface for bind, update, lookup, and verification.
-- Design encrypted UDP packets using X25519 plus AEAD, inspired by WireGuard.
-- Decide packet framing, AEAD/library choice, replay protection, and session lifecycle.
+- Implement the UDP packet API: plaintext version/sender public key/nonce header, header as AEAD AAD, ChaCha20Poly1305 payload, and X25519-derived shared secrets.
+- Decide compact wire serialization and exact packet byte layout, keeping packets under MTU where possible.
+- Connect `MessageEnvelope` to network-layer packet metadata and short-lived reply context without breaking simulator usage.
+- Design client-ticket issuance, validation, and economics for write-like client messages.
+- Investigate rate limiting for client-heavy UDP traffic; prior eBPF-layer ideas are WIP.
 - Clarify how tickets compose with encrypted transport.
 - Consider a future orchestrator module that owns tick/message scheduling, gathers outbound messages, and packages them for network transport.
 - Clarify whether submodules should emit neighborhood/intention targets rather than final destinations so an orchestrator can optimize multi-message network packages.
