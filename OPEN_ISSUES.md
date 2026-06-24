@@ -28,8 +28,13 @@ This file collects open design questions, implementation gaps, smaller engineeri
 
 ## Peer Lifecycle And Topology
 
+- Use [agent-docs/peers/peer-shape-target.md](agent-docs/peers/peer-shape-target.md) as the current evidence map for target peer-set shape: dense local coverage, controlled fade/remote coverage, protocol-shaped routing progress, bounded message cost, and enough probabilistic selection to avoid fully predictable active sets.
+- Test the candidate simpler peer lifecycle model in [agent-docs/peers/peer-lifecycle-structure.md](agent-docs/peers/peer-lifecycle-structure.md): raw gap scanning over known and connected layers, caller-owned target-gap/ranking policy, known-peer maintenance with stale cleanup/invite retry/commit-chain RTT probes/referral discovery, connected-repair token walks from known peer IDs, separate invite-triggered elections, requester-bound signature answers, bounded repair frontier, liveness pruning of stalled peers, election-gated promotion, and weighted pruning of overfilled windows.
+- Add current simulator metrics for scanner steering: core/fade/remote coverage, largest known/connected gap vs target gap, first-stage distance reduction toward role coverers, time to first covering-neighborhood contact, and peer-set overlap/entropy inside eligible shape bands.
 - Clarify whether pending and connected peers should both participate in active-ring peer selection.
 - Clarify whether pending peers should mark the organic range for client-side libraries where peers may never reach `Connected`.
+- Define how future client libraries use node-initiated token walks to build peer knowledge without local token storage or `Connected` promotion.
+- Define commit-chain RTT probe tickets, cursor advancement to `previous`, and requested-answer vs invite head update rules so quality probes do not enter normal chain tracking or hammer one head.
 - Add or document a `my-range` style helper for local active-ring range.
 - Preserve 2-above/2-below style balance when changing peers, if still part of the current design.
 - Refresh ALIVE state on received blocks if that remains desired.

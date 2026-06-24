@@ -2,6 +2,9 @@ use crate::ec_interface::{
     CommitBlockId, EcTime, Message, MessageEnvelope, MessageTicket, PeerId, TokenId, TokenMapping,
     TOKENS_SIGNATURE_SIZE, VOTE_THRESHOLD,
 };
+use crate::ec_peer_lifecycle_v2::{
+    decide_answer_repair, AnswerOrigin, AnswerRepairConfig, AnswerRepairDecision,
+};
 use crate::ec_proof_of_storage::{
     ElectionConfig, PeerElection, ProofOfStorage, TokenStorageBackend,
 };
@@ -203,6 +206,14 @@ pub struct PeerManagerConfig {
     /// plus a reserved set of far weak ties.
     pub small_world: Option<PeerSmallWorldConfig>,
 
+    /// Candidate lifecycle simplification: treat invite `Answer` proof spans as
+    /// density-gated election triggers instead of using distance probability.
+    pub enable_answer_density_repair: bool,
+
+    /// Minimum connected peers required inside an Answer proof span before the
+    /// span is considered filled.
+    pub answer_span_min_connected: usize,
+
     // ===== Election Configuration =====
     /// Configuration for PeerElection
     pub election_config: ElectionConfig,
@@ -247,6 +258,8 @@ impl Default for PeerManagerConfig {
             elections_per_tick_above_target: None,
             shape_target: None,
             small_world: None,
+            enable_answer_density_repair: false,
+            answer_span_min_connected: 1,
 
             // Election configuration
             election_config: ElectionConfig::default(),
@@ -797,8 +810,17 @@ impl EcPeers {
                 }
             }
         }
-        if self.active_discovery_probes.remove(&ticket).is_some() {
+        if let Some(probe) = self.active_discovery_probes.remove(&ticket) {
             self.add_identified_peer(peer_id, time);
+            if self.config.enable_answer_density_repair
+                && self.answer_repair_starts_election(
+                    answer,
+                    signature,
+                    AnswerOrigin::DiscoveryProbe { token: probe.token },
+                )
+            {
+                return self.start_election_from_invite(answer, signature, peer_id, time);
+            }
         }
         // If no election or discovery probe found, ignore the answer.
         Vec::new()
@@ -853,6 +875,14 @@ impl EcPeers {
         }
 
         if trigger_election {
+            if self.config.enable_answer_density_repair {
+                if !self.answer_repair_starts_election(answer, signature, AnswerOrigin::Invite) {
+                    return Vec::new();
+                }
+
+                return self.start_election_from_invite(answer, signature, sender_peer_id, time);
+            }
+
             let accept_prob = self.invitation_acceptance_probability(sender_peer_id);
 
             // Decide whether to respond to this Invitation
@@ -865,6 +895,30 @@ impl EcPeers {
         }
 
         return Vec::new();
+    }
+
+    fn answer_repair_config(&self) -> AnswerRepairConfig {
+        AnswerRepairConfig {
+            min_connected_per_span: self.config.answer_span_min_connected,
+        }
+    }
+
+    fn answer_repair_starts_election(
+        &self,
+        answer: &TokenMapping,
+        signature: &[TokenMapping; TOKENS_SIGNATURE_SIZE],
+        origin: AnswerOrigin,
+    ) -> bool {
+        matches!(
+            decide_answer_repair(
+                answer,
+                signature,
+                self.active.iter().copied(),
+                origin,
+                self.answer_repair_config(),
+            ),
+            AnswerRepairDecision::StartElection { .. }
+        )
     }
 
     /// Handle a Referral message (peer suggestions)
@@ -3031,6 +3085,8 @@ impl EcPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec_interface::BlockId;
+    use crate::ec_peer_lifecycle_v2::answer_span;
 
     #[test]
     fn test_ring_distance_calculation() {
@@ -3511,6 +3567,165 @@ mod tests {
         assert!(peers.invitation_acceptance_probability(0x1_8003) < 0.01);
     }
 
+    fn synthetic_signature(
+        challenge_token: TokenId,
+        block_id: BlockId,
+        verifier_peer_id: PeerId,
+        low_base: TokenId,
+        high_base: TokenId,
+    ) -> [TokenMapping; TOKENS_SIGNATURE_SIZE] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&verifier_peer_id.to_le_bytes());
+        hasher.update(&challenge_token.to_le_bytes());
+        hasher.update(&block_id.to_le_bytes());
+        let hash = hasher.finalize();
+        let chunks =
+            crate::ec_proof_of_storage::extract_signature_chunks_from_256bit_hash(hash.as_bytes());
+
+        let mut signature = [TokenMapping { id: 0, block: 0 }; TOKENS_SIGNATURE_SIZE];
+        for i in 0..TOKENS_SIGNATURE_SIZE {
+            let base = if i < 5 {
+                high_base + (i as TokenId * 2_048)
+            } else {
+                low_base + ((TOKENS_SIGNATURE_SIZE - 1 - i) as TokenId * 2_048)
+            };
+            signature[i] = TokenMapping {
+                id: (base & !0x3ff) | chunks[i] as TokenId,
+                block: block_id,
+            };
+        }
+        signature
+    }
+
+    struct EmptyTokenStorage;
+
+    impl TokenStorageBackend for EmptyTokenStorage {
+        fn lookup(&self, _token: &TokenId) -> Option<crate::ec_interface::BlockTime> {
+            None
+        }
+
+        fn set(&mut self, _token: &TokenId, _block: &BlockId, _parent: &BlockId, _time: EcTime) {}
+
+        fn search_signature(
+            &self,
+            _lookup_token: &TokenId,
+            _signature_chunks: &[u16; crate::ec_proof_of_storage::SIGNATURE_CHUNKS],
+        ) -> crate::ec_proof_of_storage::SignatureSearchResult {
+            crate::ec_proof_of_storage::SignatureSearchResult {
+                tokens: Vec::new(),
+                steps: 0,
+                complete: false,
+            }
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn test_density_repair_invite_stops_when_answer_span_is_filled() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(44);
+        let mut config = PeerManagerConfig::default();
+        config.enable_answer_density_repair = true;
+        config.answer_span_min_connected = 1;
+
+        let answer = TokenMapping { id: 7, block: 99 };
+        let signature = synthetic_signature(answer.id, answer.block, 123, 1 << 10, 10 << 10);
+        let mut peers = EcPeers::with_config_and_rng(123, config, rng);
+        let span = answer_span(&signature).unwrap();
+        let inside_span = span.low + ((span.high - span.low) / 2);
+        peers.update_peer(&inside_span, 0);
+
+        let actions = peers.handle_answer(&answer, &signature, 0, 500, 100, &EmptyTokenStorage, 0);
+
+        assert!(actions.is_empty());
+        assert_eq!(peers.num_active_elections(), 0);
+        assert!(!peers.peers.contains_key(&500));
+    }
+
+    #[test]
+    fn test_density_repair_invite_starts_election_when_answer_span_is_underfilled() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(45);
+        let mut config = PeerManagerConfig::default();
+        config.enable_answer_density_repair = true;
+        config.answer_span_min_connected = 1;
+
+        let answer = TokenMapping { id: 7, block: 99 };
+        let signature = synthetic_signature(answer.id, answer.block, 123, 1 << 10, 10 << 10);
+        let mut peers = EcPeers::with_config_and_rng(123, config, rng);
+
+        let _actions = peers.handle_answer(&answer, &signature, 0, 500, 100, &EmptyTokenStorage, 0);
+
+        assert_eq!(peers.num_active_elections(), 1);
+        assert!(peers.peers.contains_key(&500));
+    }
+
+    #[test]
+    fn test_density_repair_discovery_answer_stops_when_answer_span_is_filled() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(46);
+        let mut config = PeerManagerConfig::default();
+        config.enable_answer_density_repair = true;
+        config.answer_span_min_connected = 1;
+
+        let answer = TokenMapping { id: 7, block: 99 };
+        let signature = synthetic_signature(answer.id, answer.block, 123, 1 << 10, 10 << 10);
+        let mut peers = EcPeers::with_config_and_rng(123, config, rng);
+        let span = answer_span(&signature).unwrap();
+        let inside_span = span.low + ((span.high - span.low) / 2);
+        peers.update_peer(&inside_span, 0);
+        peers.active_discovery_probes.insert(
+            77,
+            DiscoveryProbe {
+                token: answer.id,
+                remaining_hops: 0,
+                started_at: 0,
+            },
+        );
+
+        let actions = peers.handle_answer(&answer, &signature, 77, 500, 100, &EmptyTokenStorage, 0);
+
+        assert!(actions.is_empty());
+        assert_eq!(peers.num_active_elections(), 0);
+        assert!(peers.peers.contains_key(&500));
+        assert!(!peers.active_discovery_probes.contains_key(&77));
+    }
+
+    #[test]
+    fn test_density_repair_discovery_answer_starts_election_when_answer_span_is_underfilled() {
+        use rand::SeedableRng;
+
+        let rng = rand::rngs::StdRng::seed_from_u64(47);
+        let mut config = PeerManagerConfig::default();
+        config.enable_answer_density_repair = true;
+        config.answer_span_min_connected = 1;
+
+        let answer = TokenMapping { id: 7, block: 99 };
+        let signature = synthetic_signature(answer.id, answer.block, 123, 1 << 10, 10 << 10);
+        let mut peers = EcPeers::with_config_and_rng(123, config, rng);
+        peers.active_discovery_probes.insert(
+            77,
+            DiscoveryProbe {
+                token: answer.id,
+                remaining_hops: 0,
+                started_at: 0,
+            },
+        );
+
+        let _actions =
+            peers.handle_answer(&answer, &signature, 77, 500, 100, &EmptyTokenStorage, 0);
+
+        assert_eq!(peers.num_active_elections(), 1);
+        assert!(peers.peers.contains_key(&500));
+        assert!(!peers.active_discovery_probes.contains_key(&77));
+    }
+
     #[test]
     fn test_invitation_acceptance_uses_plain_distance_when_not_above_target() {
         use rand::SeedableRng;
@@ -3557,6 +3772,8 @@ mod tests {
         assert_eq!(config.vote_target_count, 2);
         assert!(config.adaptive_neighborhood.is_none());
         assert!(config.small_world.is_none());
+        assert!(!config.enable_answer_density_repair);
+        assert_eq!(config.answer_span_min_connected, 1);
         assert!(config.enable_request_batching);
         assert!(!config.batch_vote_replies);
         assert_eq!(config.vote_balance_threshold, VOTE_THRESHOLD);

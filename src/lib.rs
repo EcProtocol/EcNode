@@ -58,6 +58,7 @@ pub mod ec_identity;
 pub mod ec_interface;
 pub mod ec_mempool;
 pub mod ec_node;
+pub mod ec_peer_lifecycle_v2;
 pub mod ec_peers;
 pub mod ec_proof_of_storage;
 pub mod ec_ticket_manager;

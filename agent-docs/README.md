@@ -47,3 +47,12 @@ Rules of thumb, danger zones, and invariants.
 - `implementation/`: Module boundaries, storage backends, and dangerous change areas.
 - `simulator/`: Simulator entry points, reproducibility expectations, and evidence index.
 - `maintenance/`: Documentation policy, templates, and the future doc-maintenance skill design.
+
+Current peer lifecycle structure note:
+
+- [peers/peer-lifecycle-structure.md](peers/peer-lifecycle-structure.md): Candidate simpler peer lifecycle model based on known-peer maintenance, connected token walks, separate invite-triggered elections, election-gated promotion, opaque tickets, and focused tests.
+- [peers/peer-shape-target.md](peers/peer-shape-target.md): Current target-shape evidence map for dense local coverage, controlled fade/remote coverage, scanner steering, and simulator verification.
+
+Current API/deployment notes:
+
+- [api/deployment-models.md](api/deployment-models.md): Requester-confirmed deployment models for backend writers, wallet/direct-client writers, and gateway/watchtower/evidence adjacent services.

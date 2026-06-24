@@ -2,6 +2,17 @@
 
 These pillars are the foundation agents should preserve when changing protocol, simulator, or documentation behavior.
 
+## Overarching Goal
+
+EC aims to enable transaction commit at human timescale in an open, global network without a fixed global validator set. That is the project-level differentiator from global-gossip blockchains and many distributed-ledger-like systems: useful base-layer responsiveness should come from locality-driven routing, local hosting neighborhoods, peer elections, and bounded repair, not from assuming closed membership or pushing fast user experience to a second layer.
+
+When evaluating protocol, simulator, or peer-topology changes, preserve this comparison frame:
+
+- open participation and churn tolerance
+- local token/witness neighborhoods instead of global validation for every transaction
+- commit latency and message overhead low enough for interactive use
+- conflict visibility and safety despite not having a fixed committee
+
 ## 1. Protocol/API Surface
 
 The protocol needs a clear external surface for future clients and nodes. This includes message semantics, identity linkage, shared-secret derivation, and an encrypted UDP packet design based on X25519 plus AEAD, inspired by WireGuard. The exact library and packet format are not decided.
@@ -80,4 +91,3 @@ Primary docs:
 - [simulator/evidence-index.md](simulator/evidence-index.md)
 - [simulator/reproducibility.md](simulator/reproducibility.md)
 - [../simulator/STEADY_STATE_REPORT.md](../simulator/STEADY_STATE_REPORT.md)
-
